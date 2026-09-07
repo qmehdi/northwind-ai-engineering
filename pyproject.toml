@@ -1,0 +1,49 @@
+[project]
+name = "nw"
+version = "0.1.0"
+description = "Northwind Cloud support-ticket intelligence: the AI Engineering course repository"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "httpx>=0.27",
+    "anthropic[bedrock,vertex]>=1.4",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+    "pre-commit>=3.7",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["nw"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "session01: Session 1, the shared service layer",
+    "session02: Session 2, Project 1 ticket triage",
+    "session03: Session 3, Project 2 semantic understanding",
+    "session04: Session 4, Project 3 policy-grounded responses",
+    "session05: Session 5, Project 4 multi-agent resolution",
+    "session06: Session 6, Capstone and deployment",
+    "live: needs cloud credentials and spends money",
+]

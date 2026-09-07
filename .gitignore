@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.env
+*.egg-info/
+dist/
+artifacts/
+data/generated/
+.ipynb_checkpoints/
+cdk.out/
+.terraform/
+*.tfstate*
