@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Northwind AI Engineering</title><style>:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #1c2330; --muted: #5b6573; --line: #e3e6eb;
+  --accent: #0f6fff; --accent-ink: #ffffff; --ok: #1a8f4b; --warn: #b7791f; --code-bg: #f1f3f6;
+  --aws: #c7741a; --gcp: #2b7de9; --side: 300px; --radius: 10px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0f1318; --panel: #171c23; --ink: #e6e9ee; --muted: #9aa4b1; --line: #2a3140;
+          --accent: #5b9dff; --accent-ink: #0b1220; --code-bg: #10151c; }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--ink); font-size: 16px; line-height: 1.55; }
+a { color: var(--accent); }
+.app { display: grid; grid-template-columns: var(--side) 1fr; min-height: 100vh; }
+.side { background: var(--panel); border-right: 1px solid var(--line); padding: 20px 18px; position: sticky; top: 0; height: 100vh; overflow: auto; }
+.brand { font-weight: 700; font-size: 18px; letter-spacing: .2px; }
+.brand small { display: block; color: var(--muted); font-weight: 500; font-size: 12.5px; margin-top: 2px; }
+.role { font-size: 13px; color: var(--muted); margin: 14px 0 18px; border-left: 3px solid var(--accent); padding-left: 10px; }
+.track { display: flex; gap: 6px; margin: 8px 0 18px; }
+.track button { flex: 1; border: 1px solid var(--line); background: transparent; color: var(--ink); padding: 8px; border-radius: 8px; cursor: pointer; font-weight: 600; }
+.track button.on.aws { background: var(--aws); border-color: var(--aws); color: #fff; }
+.track button.on.gcp { background: var(--gcp); border-color: var(--gcp); color: #fff; }
+.label { font-size: 11.5px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 12px 0 6px; }
+.sessions { list-style: none; margin: 0; padding: 0; }
+.sessions li { padding: 9px 10px; border-radius: 8px; cursor: pointer; display: grid; grid-template-columns: 30px 1fr auto; gap: 8px; align-items: center; font-size: 14px; }
+.sessions li:hover { background: var(--bg); }
+.sessions li.on { background: var(--accent); color: var(--accent-ink); }
+.sessions li .n { font-weight: 700; }
+.sessions li .pct { font-size: 12px; opacity: .8; }
+.progress { height: 6px; background: var(--line); border-radius: 3px; margin: 10px 0 4px; overflow: hidden; }
+.progress i { display: block; height: 100%; background: var(--ok); width: 0; transition: width .3s; }
+.main { padding: 28px 40px 80px; max-width: 980px; }
+.eyebrow { color: var(--muted); font-size: 13px; font-weight: 600; letter-spacing: .04em; }
+h1 { font-size: 30px; margin: 4px 0 6px; line-height: 1.2; }
+.builds { color: var(--muted); margin-bottom: 18px; }
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin: 10px 0 22px; }
+.tabs button { background: none; border: 0; border-bottom: 3px solid transparent; padding: 10px 14px; font-size: 15px; font-weight: 600; color: var(--muted); cursor: pointer; }
+.tabs button.on { color: var(--ink); border-bottom-color: var(--accent); }
+.steps { list-style: none; margin: 0 0 24px; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.steps li { padding: 6px 10px; border: 1px solid var(--line); border-radius: 999px; font-size: 13px; cursor: pointer; background: var(--panel); }
+.steps li.on { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+.steps li.done { border-color: var(--ok); color: var(--ok); }
+.steps li.done::before { content: "\2713  "; }
+.step h2 { font-size: 24px; margin: 0 0 4px; }
+.step .optional { color: var(--warn); font-size: 13px; font-weight: 600; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px 24px; }
+.card h3 { margin-top: 24px; font-size: 18px; }
+.card h3:first-child { margin-top: 0; }
+pre { position: relative; padding-right: 72px; background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; overflow-x: auto; font-size: 13.5px; line-height: 1.5; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+p code, li code, td code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; font-size: 90%; }
+.copy { position: absolute; top: 6px; right: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--muted); font-size: 12px; padding: 3px 8px; border-radius: 6px; cursor: pointer; }
+.copy:hover { color: var(--ink); }
+.admonition { border-left: 4px solid var(--accent); background: var(--bg); padding: 10px 14px; border-radius: 6px; margin: 14px 0; }
+.admonition-title { font-weight: 700; margin: 0 0 4px; font-size: 14px; }
+.admonition.expect { border-color: var(--ok); }
+.admonition.warning { border-color: var(--warn); }
+.admonition.agent { border-color: #8b5cf6; }
+.track-aws, .track-gcp { display: none; border: 1px dashed var(--line); border-radius: 8px; padding: 4px 14px; margin: 12px 0; }
+.track-aws::before, .track-gcp::before { display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: .06em; padding: 2px 8px; border-radius: 999px; color: #fff; margin: 8px 0 2px; }
+.track-aws::before { content: "AWS TRACK"; background: var(--aws); }
+.track-gcp::before { content: "GCP TRACK"; background: var(--gcp); }
+body[data-track="aws"] .track-aws, body[data-track="gcp"] .track-gcp { display: block; }
+.check { margin-top: 22px; padding: 14px 16px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); display: flex; gap: 12px; align-items: flex-start; }
+.check input { margin-top: 5px; transform: scale(1.2); }
+.check b { display: block; font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.nav { display: flex; justify-content: space-between; margin-top: 22px; }
+.nav button { border: 1px solid var(--line); background: var(--panel); color: var(--ink); padding: 10px 16px; border-radius: 8px; cursor: pointer; font-weight: 600; }
+.nav button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.nav button:disabled { opacity: .4; cursor: default; }
+.complete { margin: 0 0 18px; padding: 14px 18px; border-radius: var(--radius); background: var(--ok); color: #fff; font-weight: 600; }
+table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 14.5px; }
+th, td { border: 1px solid var(--line); padding: 8px 10px; text-align: left; vertical-align: top; }
+th { background: var(--bg); }
+.tablewrap { overflow-x: auto; }
+@media (max-width: 860px) { .app { grid-template-columns: 1fr; } .side { position: static; height: auto; } .main { padding: 20px; } }
+
+pre { line-height: 125%; }
+td.linenos .normal { color: #666666; background-color: transparent; padding-left: 5px; padding-right: 5px; }
+span.linenos { color: #666666; background-color: transparent; padding-left: 5px; padding-right: 5px; }
+td.linenos .special { color: #000000; background-color: #ffffc0; padding-left: 5px; padding-right: 5px; }
+span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 5px; padding-right: 5px; }
+.hl .hll { background-color: #ffffcc }
+.hl { background: #f0f0f0; }
+.hl .c { color: #60A0B0; font-style: italic } /* Comment */
+.hl .err { border: 1px solid #F00 } /* Error */
+.hl .k { color: #007020; font-weight: bold } /* Keyword */
+.hl .o { color: #666 } /* Operator */
+.hl .ch { color: #60A0B0; font-style: italic } /* Comment.Hashbang */
+.hl .cm { color: #60A0B0; font-style: italic } /* Comment.Multiline */
+.hl .cp { color: #007020 } /* Comment.Preproc */
+.hl .cpf { color: #60A0B0; font-style: italic } /* Comment.PreprocFile */
+.hl .c1 { color: #60A0B0; font-style: italic } /* Comment.Single */
+.hl .cs { color: #60A0B0; background-color: #FFF0F0 } /* Comment.Special */
+.hl .gd { color: #A00000 } /* Generic.Deleted */
+.hl .ge { font-style: italic } /* Generic.Emph */
+.hl .ges { font-weight: bold; font-style: italic } /* Generic.EmphStrong */
+.hl .gr { color: #F00 } /* Generic.Error */
+.hl .gh { color: #000080; font-weight: bold } /* Generic.Heading */
+.hl .gi { color: #00A000 } /* Generic.Inserted */
+.hl .go { color: #888 } /* Generic.Output */
+.hl .gp { color: #C65D09; font-weight: bold } /* Generic.Prompt */
+.hl .gs { font-weight: bold } /* Generic.Strong */
+.hl .gu { color: #800080; font-weight: bold } /* Generic.Subheading */
+.hl .gt { color: #04D } /* Generic.Traceback */
+.hl .kc { color: #007020; font-weight: bold } /* Keyword.Constant */
+.hl .kd { color: #007020; font-weight: bold } /* Keyword.Declaration */
+.hl .kn { color: #007020; font-weight: bold } /* Keyword.Namespace */
+.hl .kp { color: #007020 } /* Keyword.Pseudo */
+.hl .kr { color: #007020; font-weight: bold } /* Keyword.Reserved */
+.hl .kt { color: #902000 } /* Keyword.Type */
+.hl .m { color: #40A070 } /* Literal.Number */
+.hl .s { color: #4070A0 } /* Literal.String */
+.hl .na { color: #4070A0 } /* Name.Attribute */
+.hl .nb { color: #007020 } /* Name.Builtin */
+.hl .nc { color: #0E84B5; font-weight: bold } /* Name.Class */
+.hl .no { color: #60ADD5 } /* Name.Constant */
+.hl .nd { color: #555; font-weight: bold } /* Name.Decorator */
+.hl .ni { color: #D55537; font-weight: bold } /* Name.Entity */
+.hl .ne { color: #007020 } /* Name.Exception */
+.hl .nf { color: #06287E } /* Name.Function */
+.hl .nl { color: #002070; font-weight: bold } /* Name.Label */
+.hl .nn { color: #0E84B5; font-weight: bold } /* Name.Namespace */
+.hl .nt { color: #062873; font-weight: bold } /* Name.Tag */
+.hl .nv { color: #BB60D5 } /* Name.Variable */
+.hl .ow { color: #007020; font-weight: bold } /* Operator.Word */
+.hl .w { color: #BBB } /* Text.Whitespace */
+.hl .mb { color: #40A070 } /* Literal.Number.Bin */
+.hl .mf { color: #40A070 } /* Literal.Number.Float */
+.hl .mh { color: #40A070 } /* Literal.Number.Hex */
+.hl .mi { color: #40A070 } /* Literal.Number.Integer */
+.hl .mo { color: #40A070 } /* Literal.Number.Oct */
+.hl .sa { color: #4070A0 } /* Literal.String.Affix */
+.hl .sb { color: #4070A0 } /* Literal.String.Backtick */
+.hl .sc { color: #4070A0 } /* Literal.String.Char */
+.hl .dl { color: #4070A0 } /* Literal.String.Delimiter */
+.hl .sd { color: #4070A0; font-style: italic } /* Literal.String.Doc */
+.hl .s2 { color: #4070A0 } /* Literal.String.Double */
+.hl .se { color: #4070A0; font-weight: bold } /* Literal.String.Escape */
+.hl .sh { color: #4070A0 } /* Literal.String.Heredoc */
+.hl .si { color: #70A0D0; font-style: italic } /* Literal.String.Interpol */
+.hl .sx { color: #C65D09 } /* Literal.String.Other */
+.hl .sr { color: #235388 } /* Literal.String.Regex */
+.hl .s1 { color: #4070A0 } /* Literal.String.Single */
+.hl .ss { color: #517918 } /* Literal.String.Symbol */
+.hl .bp { color: #007020 } /* Name.Builtin.Pseudo */
+.hl .fm { color: #06287E } /* Name.Function.Magic */
+.hl .vc { color: #BB60D5 } /* Name.Variable.Class */
+.hl .vg { color: #BB60D5 } /* Name.Variable.Global */
+.hl .vi { color: #BB60D5 } /* Name.Variable.Instance */
+.hl .vm { color: #BB60D5 } /* Name.Variable.Magic */
+.hl .il { color: #40A070 } /* Literal.Number.Integer.Long */
+@media (prefers-color-scheme: dark) {pre { line-height: 125%; }
+td.linenos .normal { color: inherit; background-color: transparent; padding-left: 5px; padding-right: 5px; }
+span.linenos { color: inherit; background-color: transparent; padding-left: 5px; padding-right: 5px; }
+td.linenos .special { color: #000000; background-color: #ffffc0; padding-left: 5px; padding-right: 5px; }
+span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 5px; padding-right: 5px; }
+.hl .hll { background-color: #49483e }
+.hl { background: #272822; color: #F8F8F2 }
+.hl .c { color: #959077 } /* Comment */
+.hl .err { color: #ED007E; background-color: #1E0010 } /* Error */
+.hl .esc { color: #F8F8F2 } /* Escape */
+.hl .g { color: #F8F8F2 } /* Generic */
+.hl .k { color: #66D9EF } /* Keyword */
+.hl .l { color: #AE81FF } /* Literal */
+.hl .n { color: #F8F8F2 } /* Name */
+.hl .o { color: #FF4689 } /* Operator */
+.hl .x { color: #F8F8F2 } /* Other */
+.hl .p { color: #F8F8F2 } /* Punctuation */
+.hl .ch { color: #959077 } /* Comment.Hashbang */
+.hl .cm { color: #959077 } /* Comment.Multiline */
+.hl .cp { color: #959077 } /* Comment.Preproc */
+.hl .cpf { color: #959077 } /* Comment.PreprocFile */
+.hl .c1 { color: #959077 } /* Comment.Single */
+.hl .cs { color: #959077 } /* Comment.Special */
+.hl .gd { color: #FF4689 } /* Generic.Deleted */
+.hl .ge { color: #F8F8F2; font-style: italic } /* Generic.Emph */
+.hl .ges { color: #F8F8F2; font-weight: bold; font-style: italic } /* Generic.EmphStrong */
+.hl .gr { color: #FF4689 } /* Generic.Error */
+.hl .gh { color: #F8F8F2 } /* Generic.Heading */
+.hl .gi { color: #A6E22E } /* Generic.Inserted */
+.hl .go { color: #66D9EF } /* Generic.Output */
+.hl .gp { color: #FF4689; font-weight: bold } /* Generic.Prompt */
+.hl .gs { color: #F8F8F2; font-weight: bold } /* Generic.Strong */
+.hl .gu { color: #959077 } /* Generic.Subheading */
+.hl .gt { color: #66D9EF } /* Generic.Traceback */
+.hl .kc { color: #66D9EF } /* Keyword.Constant */
+.hl .kd { color: #66D9EF } /* Keyword.Declaration */
+.hl .kn { color: #FF4689 } /* Keyword.Namespace */
+.hl .kp { color: #66D9EF } /* Keyword.Pseudo */
+.hl .kr { color: #66D9EF } /* Keyword.Reserved */
+.hl .kt { color: #66D9EF } /* Keyword.Type */
+.hl .ld { color: #E6DB74 } /* Literal.Date */
+.hl .m { color: #AE81FF } /* Literal.Number */
+.hl .s { color: #E6DB74 } /* Literal.String */
+.hl .na { color: #A6E22E } /* Name.Attribute */
+.hl .nb { color: #A6E22E } /* Name.Builtin */
+.hl .nc { color: #A6E22E } /* Name.Class */
+.hl .no { color: #66D9EF } /* Name.Constant */
+.hl .nd { color: #A6E22E } /* Name.Decorator */
+.hl .ni { color: #F8F8F2 } /* Name.Entity */
+.hl .ne { color: #A6E22E } /* Name.Exception */
+.hl .nf { color: #A6E22E } /* Name.Function */
+.hl .nl { color: #F8F8F2 } /* Name.Label */
+.hl .nn { color: #F8F8F2 } /* Name.Namespace */
+.hl .nx { color: #A6E22E } /* Name.Other */
+.hl .py { color: #F8F8F2 } /* Name.Property */
+.hl .nt { color: #FF4689 } /* Name.Tag */
+.hl .nv { color: #F8F8F2 } /* Name.Variable */
+.hl .ow { color: #FF4689 } /* Operator.Word */
+.hl .pm { color: #F8F8F2 } /* Punctuation.Marker */
+.hl .w { color: #F8F8F2 } /* Text.Whitespace */
+.hl .mb { color: #AE81FF } /* Literal.Number.Bin */
+.hl .mf { color: #AE81FF } /* Literal.Number.Float */
+.hl .mh { color: #AE81FF } /* Literal.Number.Hex */
+.hl .mi { color: #AE81FF } /* Literal.Number.Integer */
+.hl .mo { color: #AE81FF } /* Literal.Number.Oct */
+.hl .sa { color: #E6DB74 } /* Literal.String.Affix */
+.hl .sb { color: #E6DB74 } /* Literal.String.Backtick */
+.hl .sc { color: #E6DB74 } /* Literal.String.Char */
+.hl .dl { color: #E6DB74 } /* Literal.String.Delimiter */
+.hl .sd { color: #E6DB74 } /* Literal.String.Doc */
+.hl .s2 { color: #E6DB74 } /* Literal.String.Double */
+.hl .se { color: #AE81FF } /* Literal.String.Escape */
+.hl .sh { color: #E6DB74 } /* Literal.String.Heredoc */
+.hl .si { color: #E6DB74 } /* Literal.String.Interpol */
+.hl .sx { color: #E6DB74 } /* Literal.String.Other */
+.hl .sr { color: #E6DB74 } /* Literal.String.Regex */
+.hl .s1 { color: #E6DB74 } /* Literal.String.Single */
+.hl .ss { color: #E6DB74 } /* Literal.String.Symbol */
+.hl .bp { color: #A6E22E } /* Name.Builtin.Pseudo */
+.hl .fm { color: #A6E22E } /* Name.Function.Magic */
+.hl .vc { color: #F8F8F2 } /* Name.Variable.Class */
+.hl .vg { color: #F8F8F2 } /* Name.Variable.Global */
+.hl .vi { color: #F8F8F2 } /* Name.Variable.Instance */
+.hl .vm { color: #F8F8F2 } /* Name.Variable.Magic */
+.hl .il { color: #AE81FF } /* Literal.Number.Integer.Long */}</style></head>
+<body data-track="aws">
+<div class="app">
+  <aside class="side">
+    <div class="brand">Northwind AI Engineering<small>AI Engineering: GenAI and Agentic Systems</small></div>
+    <div class="role">You are the AI engineer Northwind Cloud hired to make the support desk faster without making it dangerous.</div>
+    <div class="label">Your track</div>
+    <div class="track"><button class="aws" data-track="aws">AWS</button><button class="gcp" data-track="gcp">GCP</button></div>
+    <div class="label">Sessions</div>
+    <ul class="sessions"></ul>
+    <div class="progress"><i></i></div>
+    <div class="progress-label" style="font-size:12px;color:var(--muted)"></div>
+    <div class="label" style="margin-top:22px">Repository</div>
+    <a href="https://github.com/techwithshadab/northwind-ai-engineering" style="font-size:13px">github.com/techwithshadab/northwind-ai-engineering</a>
+  </aside>
+  <main class="main">
+    <div class="eyebrow"></div>
+    <h1></h1>
+    <div class="builds"></div>
+    <div class="tabs"><button data-tab="instructions">Instructions</button><button data-tab="reference">Reference</button></div>
+    <section id="instructions"></section>
+    <section id="reference" class="card" hidden></section>
+  </main>
+</div>
+<script>window.COURSE = {"title": "Northwind AI Engineering", "subtitle": "AI Engineering: GenAI and Agentic Systems", "role": "You are the AI engineer Northwind Cloud hired to make the support desk faster without making it dangerous.", "repo_url": "https://github.com/techwithshadab/northwind-ai-engineering", "sessions": [{"n": 1, "title": "Foundations and the AI service layer", "builds": "Shared service layer", "reference_html": "<h2 id=\"situation\">Situation<\/h2>\n<p>Northwind Cloud's support desk answers about eight thousand tickets a quarter. Every project in this course calls a model, and every one of them will hit the same three walls: fan-out that opens too many connections, a provider that rate-limits or fails mid-batch, and model output that is almost, but not quite, valid JSON. Session 1 solves those once, in <code>nw/llm<\/code>, so Sessions 2 to 6 never solve them again.<\/p>\n<h2 id=\"where-time-goes-in-an-ai-service\">Where time goes in an AI service<\/h2>\n<p>A model call is network I/O. A laptop waits on the provider for hundreds of milliseconds to several seconds per call and does almost no work of its own. That decides the concurrency model: <code>asyncio<\/code> with one shared <code>httpx<\/code> connection pool per process, and a semaphore to keep the number of calls in flight below the provider's rate limit. Threads would work; processes would waste memory on idle interpreters.<\/p>\n<table>\n<thead>\n<tr>\n<th>Symptom<\/th>\n<th>Cause<\/th>\n<th>Fix in this session<\/th>\n<\/tr>\n<\/thead>\n<tbody>\n<tr>\n<td>500 prompts, 500 open connections, then 429s<\/td>\n<td>unbounded <code>asyncio.gather<\/code><\/td>\n<td>the semaphore in <code>LLMClient.complete<\/code><\/td>\n<\/tr>\n<tr>\n<td>Batch fails at prompt 312 and everything is lost<\/td>\n<td>no retry, no partial results<\/td>\n<td><code>_with_retries<\/code>, <code>map(return_exceptions=True)<\/code><\/td>\n<\/tr>\n<tr>\n<td><code>json.loads<\/code> raises on a reply that starts with \"Sure, here is\"<\/td>\n<td>trusting the model's formatting<\/td>\n<td><code>structured<\/code> with one repair round trip<\/td>\n<\/tr>\n<tr>\n<td>The bill is a surprise at month end<\/td>\n<td>nobody counted tokens<\/td>\n<td>the cost meter and the spend cap<\/td>\n<\/tr>\n<\/tbody>\n<\/table>\n<h2 id=\"retryable-and-terminal-are-different-failures\">Retryable and terminal are different failures<\/h2>\n<p>The provider tells you which is which. Retrying a 400 wastes money and time; not retrying a 429 fails work that would have succeeded a second later.<\/p>\n<table>\n<thead>\n<tr>\n<th>Status or error<\/th>\n<th>Family<\/th>\n<th>Why<\/th>\n<\/tr>\n<\/thead>\n<tbody>\n<tr>\n<td>429 rate limit<\/td>\n<td>retryable<\/td>\n<td>back off, honour <code>Retry-After<\/code><\/td>\n<\/tr>\n<tr>\n<td>529 overloaded, 500, 502, 503<\/td>\n<td>retryable<\/td>\n<td>the provider's problem, transient<\/td>\n<\/tr>\n<tr>\n<td>timeout, connection reset<\/td>\n<td>retryable<\/td>\n<td>network, transient<\/td>\n<\/tr>\n<tr>\n<td>400 bad request<\/td>\n<td>terminal<\/td>\n<td>your request is wrong; it will be wrong again<\/td>\n<\/tr>\n<tr>\n<td>401, 403<\/td>\n<td>terminal<\/td>\n<td>credentials<\/td>\n<\/tr>\n<tr>\n<td>404 model not found<\/td>\n<td>terminal<\/td>\n<td>wrong ID or region<\/td>\n<\/tr>\n<tr>\n<td>refusal stop reason<\/td>\n<td>terminal<\/td>\n<td>the content, not the call<\/td>\n<\/tr>\n<\/tbody>\n<\/table>\n<p>Backoff uses full jitter: a uniform random delay between zero and a ceiling that doubles per attempt. Without jitter, every client that failed at the same instant retries at the same instant, and the provider sees the same spike again.<\/p>\n<h2 id=\"structured-output-is-a-contract-not-a-hope\">Structured output is a contract, not a hope<\/h2>\n<p>The client tells the model the JSON Schema of the Pydantic class it wants, parses the reply, and validates it. When validation fails, the error message goes back to the model once, with the original reply, and the model corrects itself. After the second failure the client raises. A loop that keeps asking is a budget leak; a single repair fixes the large majority of malformed replies in practice.<\/p>\n<p>Nothing outside <code>nw/llm/providers/<\/code> sees a vendor object. Provider-specific structured output features exist and are faster on some vendors, but the validation in your own code is what survives a vendor change.<\/p>\n<h2 id=\"cost-is-a-first-class-output\">Cost is a first-class output<\/h2>\n<p>Every completion is priced from a table in <code>nw/llm/prices.py<\/code> and recorded with its correlation ID. The meter reserves an estimate before each call, so a burst of concurrent calls cannot all squeeze under the cap at once, and replaces the reservation with the real cost afterwards. In Session 6 the same numbers become the cost per resolved ticket on a dashboard.<\/p>\n<p>The price table is a list price snapshot. Bedrock and Vertex bill at their own rates, so treat every figure as an estimate until the cloud bill confirms it.<\/p>\n<h2 id=\"questions-worth-asking\">Questions worth asking<\/h2>\n<ul>\n<li>What is the right <code>max_concurrency<\/code> for a provider that allows 50 requests per minute? What if two services share the account?<\/li>\n<li>The repair round trip costs a second call. When is it cheaper to fail fast?<\/li>\n<li>Which of this session's failures would have reached production in your current setup?<\/li>\n<\/ul>\n<h2 id=\"what-you-built\">What you built<\/h2>\n<p><code>LLMClient<\/code> in front of any provider: bounded concurrency, provider-aware retries, validated structured output with one repair, ordered fan-out, cost metering with a hard cap, and a correlation ID on every log line. Sessions 2 to 6 import it and never open a connection to a model any other way.<\/p>", "steps": [{"title": "Set up and run preflight", "check": "<code>make preflight<\/code> prints READY", "optional": false, "html": "<p>Clone the repository, create the environment, and prove the machine is ready. Pick your track now and keep it for all six sessions.<\/p>\n<div class=\"hl\"><pre><span><\/span><code>git<span class=\"w\"> <\/span>clone<span class=\"w\"> <\/span>https://github.com/techwithshadab/northwind-ai-engineering.git\n<span class=\"nb\">cd<\/span><span class=\"w\"> <\/span>northwind-ai-engineering\nmake<span class=\"w\"> <\/span>setup\ncp<span class=\"w\"> <\/span>.env.example<span class=\"w\"> <\/span>.env\n<\/code><\/pre><\/div>\n\n<p>Edit <code>.env<\/code> for your track.<\/p>\n<div class=\"track-aws\">\n<div class=\"hl\"><pre><span><\/span><code><span class=\"c1\"># .env<\/span>\n<span class=\"nv\">NW_TRACK<\/span><span class=\"o\">=<\/span>aws\n<span class=\"nv\">NW_AWS_REGION<\/span><span class=\"o\">=<\/span>us-east-1\n<span class=\"nv\">NW_AWS_PROFILE<\/span><span class=\"o\">=<\/span>default\n<\/code><\/pre><\/div>\n\n<p>Your AWS profile needs Bedrock model access for the three model roles in the chosen region. Model access is per region and per account; enable it in the Bedrock console before running preflight.<\/p>\n<\/div>\n<div class=\"track-gcp\">\n<div class=\"hl\"><pre><span><\/span><code><span class=\"c1\"># .env<\/span>\n<span class=\"nv\">NW_TRACK<\/span><span class=\"o\">=<\/span>gcp\n<span class=\"nv\">NW_GCP_PROJECT<\/span><span class=\"o\">=<\/span>your-project-id\n<span class=\"nv\">NW_GCP_REGION<\/span><span class=\"o\">=<\/span>global\n<\/code><\/pre><\/div>\n\n<p>Authenticate once with <code>gcloud auth application-default login<\/code>, and enable the Vertex AI API on the project.<\/p>\n<\/div>\n<p>Then run preflight. On the aws and gcp tracks it makes one real round trip per model role, which costs a fraction of a cent.<\/p>\n<div class=\"hl\"><pre><span><\/span><code>make<span class=\"w\"> <\/span>preflight\n<\/code><\/pre><\/div>\n\n<div class=\"admonition expect\">\n<p class=\"admonition-title\">What to expect<\/p>\n<p>A table of PASS, WARN and FAIL lines and a final <code>READY<\/code>. WARN on <code>accelerator<\/code> is fine; Session 3 has a fallback. Any FAIL must be fixed before Session 1 starts: paste the table into the cohort channel.<\/p>\n<\/div>\n<p>If you have no cloud account yet, set <code>NW_TRACK=local<\/code>. Every exercise in this session runs against the fake provider and needs no network.<\/p>"}, {"title": "Read the contract and see the tests fail", "check": "<code>make session01<\/code> reports 19 failed, 5 passed", "optional": false, "html": "<p>Session 1 builds <code>nw/llm<\/code>. Before writing anything, read the contract you are implementing against. Three files, ten minutes.<\/p>\n<table>\n<thead>\n<tr>\n<th>File<\/th>\n<th>What it fixes<\/th>\n<\/tr>\n<\/thead>\n<tbody>\n<tr>\n<td><code>nw/llm/types.py<\/code><\/td>\n<td><code>Message<\/code>, <code>Completion<\/code>, <code>Usage<\/code>, <code>ToolCall<\/code>: the course's own shapes, never a vendor's<\/td>\n<\/tr>\n<tr>\n<td><code>nw/llm/provider.py<\/code><\/td>\n<td><code>LLMProvider.complete<\/code>: one round trip, raising only <code>RetryableError<\/code> or <code>TerminalError<\/code><\/td>\n<\/tr>\n<tr>\n<td><code>nw/llm/errors.py<\/code><\/td>\n<td>The two error families and the three terminal specialisations<\/td>\n<\/tr>\n<\/tbody>\n<\/table>\n<p>Then look at how a real provider translates to and from those shapes in <code>nw/llm/providers/anthropic_base.py<\/code>, and how the fake in <code>nw/llm/providers/fake.py<\/code> lets tests script outcomes and count in-flight calls.<\/p>\n<p>Now run the acceptance tests.<\/p>\n<div class=\"hl\"><pre><span><\/span><code>make<span class=\"w\"> <\/span>session01\n<\/code><\/pre><\/div>\n\n<div class=\"admonition expect\">\n<p class=\"admonition-title\">What to expect<\/p>\n<p>19 failed, 5 passed. The five that pass cover the provider translation layer, which is given. The 19 that fail are your work: <code>retry.py<\/code> and four methods in <code>client.py<\/code>, each raising <code>NotImplementedError<\/code> with the step that fills it in.<\/p>\n<\/div>\n<div class=\"admonition note\">\n<p class=\"admonition-title\">Note<\/p>\n<p>The skeleton's imports were trimmed to what the stubs use. As you implement each method, add back the imports you need; <code>ruff<\/code> will tell you about any you left unused.<\/p>\n<\/div>"}, {"title": "Backoff with jitter, honouring Retry-After", "check": "<code>uv run pytest -q tests/session01/test_retry.py -k 'backoff or capped'<\/code> passes", "optional": false, "html": "<p>Open <code>nw/llm/retry.py<\/code> and implement <code>RetryPolicy.delay_for(attempt, retry_after_s)<\/code>.<\/p>\n<p>Rules, in order:<\/p>\n<ol>\n<li>If the provider sent <code>Retry-After<\/code>, wait that long, capped at <code>retry_after_cap_s<\/code>. Ignoring it is how you get banned.<\/li>\n<li>Otherwise, exponential backoff with full jitter: a uniform random delay between 0 and <code>min(max_delay_s, base_delay_s * 2 ** (attempt - 1))<\/code>.<\/li>\n<\/ol>\n<div class=\"hl\"><pre><span><\/span><code><span class=\"c1\"># nw/llm/retry.py<\/span>\n<span class=\"kn\">import<\/span><span class=\"w\"> <\/span><span class=\"nn\">random<\/span>\n\n<span class=\"k\">def<\/span><span class=\"w\"> <\/span><span class=\"nf\">delay_for<\/span><span class=\"p\">(<\/span><span class=\"bp\">self<\/span><span class=\"p\">,<\/span> <span class=\"n\">attempt<\/span><span class=\"p\">:<\/span> <span class=\"nb\">int<\/span><span class=\"p\">,<\/span> <span class=\"n\">retry_after_s<\/span><span class=\"p\">:<\/span> <span class=\"nb\">float<\/span> <span class=\"o\">|<\/span> <span class=\"kc\">None<\/span> <span class=\"o\">=<\/span> <span class=\"kc\">None<\/span><span class=\"p\">)<\/span> <span class=\"o\">-&gt;<\/span> <span class=\"nb\">float<\/span><span class=\"p\">:<\/span>\n    <span class=\"o\">...<\/span>\n<\/code><\/pre><\/div>\n\n<p>Run the two pure tests:<\/p>\n<div class=\"hl\"><pre><span><\/span><code>uv<span class=\"w\"> <\/span>run<span class=\"w\"> <\/span>pytest<span class=\"w\"> <\/span>-q<span class=\"w\"> <\/span>tests/session01/test_retry.py<span class=\"w\"> <\/span>-k<span class=\"w\"> <\/span><span class=\"s2\">\"backoff or capped\"<\/span>\n<\/code><\/pre><\/div>\n\n<div class=\"admonition expect\">\n<p class=\"admonition-title\">What to expect<\/p>\n<p>Both pass. The backoff test samples two hundred delays per attempt and checks they stay under the ceiling and are not all the same. If it reports \"no jitter\", you returned the ceiling instead of a random value under it.<\/p>\n<\/div>\n<div class=\"admonition warning\">\n<p class=\"admonition-title\">Warning<\/p>\n<p>Do not add jitter to the <code>Retry-After<\/code> path. The provider chose that number.<\/p>\n<\/div>"}, {"title": "Complete with a semaphore, retries and metering", "check": "<code>uv run pytest -q tests/session01/test_retry.py tests/session01/test_concurrency.py tests/session01/test_cost.py<\/code> passes", "optional": false, "html": "<p>Open <code>nw/llm/client.py<\/code>. Two methods this step: <code>_with_retries<\/code> first, then <code>complete<\/code>.<\/p>\n<p><strong><code>_with_retries(request_id, call)<\/code><\/strong> runs <code>call()<\/code> under the policy:<\/p>\n<ul>\n<li><code>TerminalError<\/code>: raise at once. No sleep, no second attempt.<\/li>\n<li><code>RetryableError<\/code>: if this was the last allowed attempt, log and raise. Otherwise compute the delay with <code>self._retry.delay_for(attempt, exc.retry_after_s)<\/code>, log it, and <code>await self._sleep(delay)<\/code>. Use <code>self._sleep<\/code>, not <code>asyncio.sleep<\/code>, so the tests can record delays instead of waiting.<\/li>\n<\/ul>\n<p><strong><code>complete(prompt, ...)<\/code><\/strong> is the order of operations that matters:<\/p>\n<ol>\n<li>Build <code>messages<\/code> (a string becomes one user <code>Message<\/code>), resolve the model from the role, make a short <code>request_id<\/code>.<\/li>\n<li>Estimate the cost and <code>self.meter.reserve(estimate)<\/code>. This raises <code>SpendCapExceeded<\/code> before any network happens.<\/li>\n<li>Under <code>async with self._sem:<\/code> call the provider through <code>_with_retries<\/code>.<\/li>\n<li>In a <code>finally<\/code>, <code>self.meter.release(estimate)<\/code>.<\/li>\n<li><code>self.meter.record(...)<\/code> the real usage with <code>correlation_id()<\/code>, and log one line with <code>log_fields(...)<\/code>: request ID, model, role, tokens, latency, cost, spend so far, stop reason.<\/li>\n<\/ol>\n<div class=\"hl\"><pre><span><\/span><code>uv<span class=\"w\"> <\/span>run<span class=\"w\"> <\/span>pytest<span class=\"w\"> <\/span>-q<span class=\"w\"> <\/span>tests/session01/test_retry.py<span class=\"w\"> <\/span>tests/session01/test_concurrency.py<span class=\"w\"> <\/span>tests/session01/test_cost.py\n<\/code><\/pre><\/div>\n\n<div class=\"admonition expect\">\n<p class=\"admonition-title\">What to expect<\/p>\n<p>All pass. If <code>test_semaphore_bounds_in_flight_requests<\/code> fails with a high-water mark above 8, the semaphore is not around the provider call. If <code>test_spend_cap_stops_calls_before_they_are_made<\/code> fails, the reservation happens after the call or is never released.<\/p>\n<\/div>\n<div class=\"admonition agent\">\n<p class=\"admonition-title\">With the agent<\/p>\n<p>Ask your coding agent to review <code>complete<\/code> against the five steps above before you run the tests, using <code>/code-review<\/code>. Accept nothing it changes that the tests do not cover.<\/p>\n<\/div>"}, {"title": "Structured output with one repair round trip", "check": "<code>uv run pytest -q tests/session01/test_structured.py<\/code> passes", "optional": false, "html": "<p>Implement <code>LLMClient.structured(prompt, schema, ...)<\/code>. The helper <code>_parse_as(text, schema)<\/code> is given: it strips a code fence, finds the outermost braces, parses JSON and validates against the Pydantic class, raising <code>ValueError<\/code> or <code>ValidationError<\/code>.<\/p>\n<ol>\n<li>Build the system prompt: the caller's <code>system<\/code> if any, then an instruction to reply with a single JSON object and nothing else, then the schema from <code>schema.model_json_schema()<\/code>.<\/li>\n<li>Call <code>self.complete(messages, role=role, system=instructions, max_tokens=max_tokens)<\/code> and try <code>_parse_as<\/code>.<\/li>\n<li>On failure, append the model's reply as an assistant turn and a user turn that says it was not valid, includes the error, and asks for the corrected JSON only. Try once more.<\/li>\n<li>After the second failure raise <code>StructuredOutputError<\/code>.<\/li>\n<\/ol>\n<div class=\"hl\"><pre><span><\/span><code>uv<span class=\"w\"> <\/span>run<span class=\"w\"> <\/span>pytest<span class=\"w\"> <\/span>-q<span class=\"w\"> <\/span>tests/session01/test_structured.py\n<\/code><\/pre><\/div>\n\n<div class=\"admonition expect\">\n<p class=\"admonition-title\">What to expect<\/p>\n<p>Five pass. <code>test_one_repair_round_trip<\/code> inspects the second call and expects the phrase \"not valid\" in the last user turn. <code>test_fails_after_second_bad_reply<\/code> expects exactly two provider calls, not three.<\/p>\n<\/div>\n<p>This is the pattern that transfers most directly to production work: the schema is the contract, the model's formatting is not trusted, and the retry is bounded.<\/p>"}, {"title": "Fan out and keep the order", "check": "<code>make session01<\/code> reports 24 passed", "optional": false, "html": "<p>Implement <code>LLMClient.map(prompts, ...)<\/code>: one <code>complete<\/code> per prompt, run concurrently, results in input order.<\/p>\n<p>Most people reach for <code>asyncio.as_completed<\/code> here because it feels natural. It yields results in completion order and silently scrambles them. <code>asyncio.gather(*tasks, return_exceptions=True)<\/code> preserves order. With <code>return_exceptions=False<\/code>, the default, raise the first exception found in the results; otherwise return them in place.<\/p>\n<div class=\"hl\"><pre><span><\/span><code>uv<span class=\"w\"> <\/span>run<span class=\"w\"> <\/span>pytest<span class=\"w\"> <\/span>-q<span class=\"w\"> <\/span>tests/session01/test_map.py\nmake<span class=\"w\"> <\/span>session01\n<\/code><\/pre><\/div>\n\n<div class=\"admonition expect\">\n<p class=\"admonition-title\">What to expect<\/p>\n<p>24 passed. <code>test_order_is_preserved_when_replies_return_out_of_order<\/code> makes the first prompt answer last; if your results come back reversed, you used completion order.<\/p>\n<\/div>\n<p>Run the whole check that CI runs, then commit.<\/p>\n<div class=\"hl\"><pre><span><\/span><code>make<span class=\"w\"> <\/span>check\ngit<span class=\"w\"> <\/span>add<span class=\"w\"> <\/span>-A<span class=\"w\"> <\/span><span class=\"o\">&amp;&amp;<\/span><span class=\"w\"> <\/span>git<span class=\"w\"> <\/span>commit<span class=\"w\"> <\/span>-m<span class=\"w\"> <\/span><span class=\"s2\">\"Session 1: shared service layer\"<\/span>\n<\/code><\/pre><\/div>"}, {"title": "Install the skill set and set the review convention", "check": "<code>/session-check 1<\/code> reports every Session 1 criterion met", "optional": false, "html": "<p>The rest of the course is built with a coding agent alongside you. The rule from here on: agent-written code is held to the same bar as anything else. It passes the tests or it does not go in.<\/p>\n<p>Install the course skill set as a Claude Code plugin, pinned to the cohort's tag.<\/p>\n<div class=\"hl\"><pre><span><\/span><code>npx<span class=\"w\"> <\/span>skills@latest<span class=\"w\"> <\/span>add<span class=\"w\"> <\/span>techwithshadab/skills\n<\/code><\/pre><\/div>\n\n<p>Then, in your agent, run the session check.<\/p>\n<div class=\"hl\"><pre><span><\/span><code>/session-check 1\n<\/code><\/pre><\/div>\n\n<div class=\"admonition expect\">\n<p class=\"admonition-title\">What to expect<\/p>\n<p>The skill runs <code>make session01<\/code> and <code>make lint<\/code>, reads the acceptance criteria for Session 1, and reports each one as met or not with the evidence. If it reports something the tests did not catch, that is a finding to fix, not a reason to argue with the skill.<\/p>\n<\/div>\n<p>The convention for every later session:<\/p>\n<table>\n<thead>\n<tr>\n<th>When<\/th>\n<th>Skill<\/th>\n<th>What you do with the output<\/th>\n<\/tr>\n<\/thead>\n<tbody>\n<tr>\n<td>Starting an exercise<\/td>\n<td><code>/tdd<\/code><\/td>\n<td>Let it write the failing test first; keep only tests you would have written<\/td>\n<\/tr>\n<tr>\n<td>Before running acceptance tests<\/td>\n<td><code>/code-review<\/code><\/td>\n<td>Read every finding; accept changes only where a test covers them<\/td>\n<\/tr>\n<tr>\n<td>Something spins or hangs<\/td>\n<td><code>/diagnosing-bugs<\/code><\/td>\n<td>Follow its loop; do not patch on a guess<\/td>\n<\/tr>\n<tr>\n<td>Ending a session<\/td>\n<td><code>/session-check N<\/code><\/td>\n<td>Nothing is done until it reports every criterion met<\/td>\n<\/tr>\n<\/tbody>\n<\/table>"}, {"title": "One live call on your track", "check": "A JSON log line shows a real model, its latency, and a non-zero cost", "optional": true, "html": "<p>Everything so far ran against the fake provider. Make one real call on your track and read the log line.<\/p>\n<div class=\"hl\"><pre><span><\/span><code>uv<span class=\"w\"> <\/span>run<span class=\"w\"> <\/span>python<span class=\"w\"> <\/span>scripts/live_check.py\n<\/code><\/pre><\/div>\n\n<p>The script is short enough to read first:<\/p>\n<div class=\"hl\"><pre><span><\/span><code><span class=\"c1\"># scripts/live_check.py<\/span>\n<span class=\"kn\">import<\/span><span class=\"w\"> <\/span><span class=\"nn\">asyncio<\/span>\n<span class=\"kn\">from<\/span><span class=\"w\"> <\/span><span class=\"nn\">nw.config<\/span><span class=\"w\"> <\/span><span class=\"kn\">import<\/span> <span class=\"n\">settings<\/span>\n<span class=\"kn\">from<\/span><span class=\"w\"> <\/span><span class=\"nn\">nw.llm<\/span><span class=\"w\"> <\/span><span class=\"kn\">import<\/span> <span class=\"n\">LLMClient<\/span>\n<span class=\"kn\">from<\/span><span class=\"w\"> <\/span><span class=\"nn\">nw.llm.providers<\/span><span class=\"w\"> <\/span><span class=\"kn\">import<\/span> <span class=\"n\">make_provider<\/span>\n<span class=\"kn\">from<\/span><span class=\"w\"> <\/span><span class=\"nn\">nw.logging<\/span><span class=\"w\"> <\/span><span class=\"kn\">import<\/span> <span class=\"n\">bind_correlation_id<\/span><span class=\"p\">,<\/span> <span class=\"n\">configure_logging<\/span>\n\n<span class=\"n\">configure_logging<\/span><span class=\"p\">(<\/span><span class=\"s2\">\"json\"<\/span><span class=\"p\">)<\/span>\n<span class=\"n\">s<\/span> <span class=\"o\">=<\/span> <span class=\"n\">settings<\/span><span class=\"p\">()<\/span>\n<span class=\"n\">client<\/span> <span class=\"o\">=<\/span> <span class=\"n\">LLMClient<\/span><span class=\"p\">(<\/span><span class=\"n\">make_provider<\/span><span class=\"p\">(<\/span><span class=\"n\">s<\/span><span class=\"p\">),<\/span> <span class=\"n\">settings<\/span><span class=\"o\">=<\/span><span class=\"n\">s<\/span><span class=\"p\">)<\/span>\n\n<span class=\"k\">async<\/span> <span class=\"k\">def<\/span><span class=\"w\"> <\/span><span class=\"nf\">main<\/span><span class=\"p\">()<\/span> <span class=\"o\">-&gt;<\/span> <span class=\"kc\">None<\/span><span class=\"p\">:<\/span>\n    <span class=\"k\">with<\/span> <span class=\"n\">bind_correlation_id<\/span><span class=\"p\">(<\/span><span class=\"s2\">\"live-check\"<\/span><span class=\"p\">):<\/span>\n        <span class=\"n\">c<\/span> <span class=\"o\">=<\/span> <span class=\"k\">await<\/span> <span class=\"n\">client<\/span><span class=\"o\">.<\/span><span class=\"n\">complete<\/span><span class=\"p\">(<\/span>\n            <span class=\"s2\">\"Name one thing a support ticket should always include.\"<\/span><span class=\"p\">,<\/span> <span class=\"n\">max_tokens<\/span><span class=\"o\">=<\/span><span class=\"mi\">60<\/span>\n        <span class=\"p\">)<\/span>\n    <span class=\"nb\">print<\/span><span class=\"p\">(<\/span><span class=\"n\">c<\/span><span class=\"o\">.<\/span><span class=\"n\">text<\/span><span class=\"p\">)<\/span>\n    <span class=\"nb\">print<\/span><span class=\"p\">(<\/span><span class=\"sa\">f<\/span><span class=\"s2\">\"spend so far: <\/span><span class=\"si\">{<\/span><span class=\"n\">client<\/span><span class=\"o\">.<\/span><span class=\"n\">spend_usd<\/span><span class=\"si\">:<\/span><span class=\"s2\">.6f<\/span><span class=\"si\">}<\/span><span class=\"s2\"> USD\"<\/span><span class=\"p\">)<\/span>\n\n<span class=\"n\">asyncio<\/span><span class=\"o\">.<\/span><span class=\"n\">run<\/span><span class=\"p\">(<\/span><span class=\"n\">main<\/span><span class=\"p\">())<\/span>\n<\/code><\/pre><\/div>\n\n<div class=\"track-aws\">\n<p>The log line shows <code>model: anthropic.claude-sonnet-5<\/code> and the provider request ID. A 403 here means Bedrock model access is not enabled for that model in <code>NW_AWS_REGION<\/code>.<\/p>\n<\/div>\n<div class=\"track-gcp\">\n<p>The log line shows <code>model: claude-sonnet-5<\/code> and the provider request ID. A 403 here means the Vertex AI API is not enabled or your credentials lack <code>roles/aiplatform.user<\/code> on the project.<\/p>\n<\/div>\n<div class=\"admonition expect\">\n<p class=\"admonition-title\">What to expect<\/p>\n<p>One line of JSON on stderr with <code>correlation_id: live-check<\/code>, <code>latency_ms<\/code>, token counts and <code>cost_usd<\/code>, then the answer and the spend. Compare <code>cost_usd<\/code> with the price table in <code>nw/llm/prices.py<\/code>, and remember the table is a list-price snapshot.<\/p>\n<\/div>"}]}, {"n": 2, "title": "Machine learning in production", "builds": "Project 1: Ticket triage scoring service", "reference_html": "", "steps": []}, {"n": 3, "title": "Deep learning and representation", "builds": "Project 2: Semantic understanding engine", "reference_html": "", "steps": []}, {"n": 4, "title": "Generative AI: retrieval and evaluation", "builds": "Project 3: Policy-grounded response service", "reference_html": "", "steps": []}, {"n": 5, "title": "Agentic AI systems", "builds": "Project 4: Multi-agent resolution system", "reference_html": "", "steps": []}, {"n": 6, "title": "Deployment, observability and capstone", "builds": "Capstone: Unified deployed system", "reference_html": "", "steps": []}]};</script>
+<script>(function () {
+  const C = window.COURSE;
+  const KEY = "nw-guide-v1";
+  let state = load();
+  const $ = (s, el) => (el || document).querySelector(s);
+  const $$ = (s, el) => Array.from((el || document).querySelectorAll(s));
+
+  function load() {
+    let st = { track: "aws", session: 1, step: {}, done: {}, tab: "instructions" };
+    try { st = Object.assign(st, JSON.parse(localStorage.getItem(KEY) || "{}")); } catch (e) {}
+    // Deep links: #session-3/step-2, #session-3/reference, #track-gcp
+    const h = location.hash.slice(1);
+    const m = h.match(/^session-(\d+)(?:\/(reference|step-(\d+)))?/);
+    if (m) { st.session = +m[1]; st.tab = m[2] === "reference" ? "reference" : "instructions"; if (m[3]) st.step[st.session] = +m[3] - 1; }
+    const t = h.match(/track-(aws|gcp)/); if (t) st.track = t[1];
+    return st;
+  }
+  function syncHash() {
+    const s = session();
+    const part = state.tab === "reference" ? "reference" : "step-" + ((state.step[s.n] || 0) + 1);
+    const next = "#session-" + s.n + "/" + part;
+    if (location.hash !== next) history.replaceState(null, "", next);
+  }
+  function save() { try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {} }
+  function session() { return C.sessions.find(s => s.n === state.session) || C.sessions[0]; }
+  function stepIndex(s) { return state.step[s.n] || 0; }
+  function isDone(s, i) { return !!state.done[s.n + ":" + i]; }
+  function required(s) { return s.steps.filter(st => !st.optional); }
+  function pct(s) {
+    const req = required(s); if (!req.length) return 0;
+    const done = s.steps.filter((st, i) => !st.optional && isDone(s, i)).length;
+    return Math.round(100 * done / req.length);
+  }
+  function total() {
+    const all = C.sessions.reduce((a, s) => a + required(s).length, 0);
+    const done = C.sessions.reduce((a, s) => a + s.steps.filter((st, i) => !st.optional && isDone(s, i)).length, 0);
+    return all ? Math.round(100 * done / all) : 0;
+  }
+
+  function renderSide() {
+    document.body.dataset.track = state.track;
+    $$(".track button").forEach(b => b.classList.toggle("on", b.dataset.track === state.track));
+    const ul = $(".sessions"); ul.innerHTML = "";
+    C.sessions.forEach(s => {
+      const li = document.createElement("li");
+      li.className = s.n === state.session ? "on" : "";
+      li.innerHTML = `<span class="n">${s.n}</span><span>${s.title}</span><span class="pct">${s.steps.length ? pct(s) + "%" : ""}</span>`;
+      li.onclick = () => { state.session = s.n; save(); render(); };
+      ul.appendChild(li);
+    });
+    $(".progress i").style.width = total() + "%";
+    $(".progress-label").textContent = "Course progress " + total() + "%";
+  }
+
+  function renderMain() {
+    const s = session();
+    $(".eyebrow").textContent = "Session " + s.n + " of " + C.sessions.length;
+    $("h1").textContent = s.title;
+    $(".builds").textContent = "You build: " + s.builds;
+    $$(".tabs button").forEach(b => b.classList.toggle("on", b.dataset.tab === state.tab));
+    const ins = $("#instructions"), ref = $("#reference");
+    ins.hidden = state.tab !== "instructions"; ref.hidden = state.tab !== "reference";
+    ref.innerHTML = s.reference_html || "<p>Reference material for this session is not written yet.</p>";
+    if (!s.steps.length) { ins.innerHTML = "<div class='card'><p>The steps for this session are not published yet.</p></div>"; return; }
+    const i = Math.min(stepIndex(s), s.steps.length - 1);
+    const st = s.steps[i];
+    const chips = s.steps.map((x, k) => `<li class="${k === i ? "on" : ""} ${isDone(s, k) ? "done" : ""}" data-i="${k}">${k + 1}. ${x.title}</li>`).join("");
+    const complete = pct(s) === 100 ? `<div class="complete">Session ${s.n} complete. Every step check is done.</div>` : "";
+    ins.innerHTML = `${complete}<ul class="steps">${chips}</ul>
+      <div class="step">
+        ${st.optional ? '<div class="optional">Try this too, optional</div>' : ""}
+        <h2>Step ${i + 1}. ${st.title}</h2>
+        <div class="card">${st.html}</div>
+        <label class="check"><input type="checkbox" ${isDone(s, i) ? "checked" : ""}><span><b>Step check</b>${st.check}</span></label>
+        <div class="nav">
+          <button class="prev" ${i === 0 ? "disabled" : ""}>Previous</button>
+          <button class="next primary" ${i === s.steps.length - 1 ? "disabled" : ""}>Next: ${s.steps[i + 1] ? s.steps[i + 1].title : "done"}</button>
+        </div>
+      </div>`;
+    $$(".steps li", ins).forEach(li => li.onclick = () => { state.step[s.n] = +li.dataset.i; save(); render(); window.scrollTo(0, 0); });
+    $(".check input", ins).onchange = e => { state.done[s.n + ":" + i] = e.target.checked; save(); render(); };
+    $(".prev", ins).onclick = () => { state.step[s.n] = i - 1; save(); render(); window.scrollTo(0, 0); };
+    $(".next", ins).onclick = () => { state.step[s.n] = i + 1; save(); render(); window.scrollTo(0, 0); };
+    $$("pre", document).forEach(pre => {
+      if (pre.querySelector(".copy")) return;
+      const b = document.createElement("button"); b.className = "copy"; b.textContent = "Copy";
+      b.onclick = () => { navigator.clipboard.writeText(pre.innerText.replace(/^Copy\n?/, "")).then(() => { b.textContent = "Copied"; setTimeout(() => b.textContent = "Copy", 1200); }); };
+      pre.appendChild(b);
+    });
+    $$("table").forEach(t => { if (!t.parentElement.classList.contains("tablewrap")) { const w = document.createElement("div"); w.className = "tablewrap"; t.parentNode.insertBefore(w, t); w.appendChild(t); } });
+  }
+
+  function render() { renderSide(); renderMain(); syncHash(); }
+  $$(".track button").forEach(b => b.onclick = () => { state.track = b.dataset.track; save(); render(); });
+  $$(".tabs button").forEach(b => b.onclick = () => { state.tab = b.dataset.tab; save(); render(); });
+  render();
+})();
+</script>
+</body></html>
