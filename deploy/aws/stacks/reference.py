@@ -111,6 +111,7 @@ class ReferenceStack(Stack):
         runtime_role = iam.Role(
             self,
             "RuntimeExecutionRole",
+            role_name=f"NorthwindBedrockAgentCoreRuntime-{self.region}",
             assumed_by=iam.ServicePrincipal(
                 "bedrock-agentcore.amazonaws.com",
                 conditions={

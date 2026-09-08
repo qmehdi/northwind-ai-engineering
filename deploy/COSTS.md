@@ -1,19 +1,19 @@
 # Cost sheet
 
-Every figure is an estimate from vendor list prices fetched on 2026-09-08 (see the instructor research notes for sources) and must be replaced by the measured figure after the validation run. Model prices are first-party list prices; Bedrock and Vertex bill at their own rates, which the fetched Bedrock page did not yet list for the Claude 5 models. Assumptions: cohort of 25, six sessions, us-east-1 and us-central1, participants run in their own accounts.
+Every figure is an estimate from vendor list prices fetched on 2026-09-08 (see the instructor research notes for sources) and must be replaced by the measured figure after the validation run. Model prices: Bedrock global endpoint prices for the AWS track (Sonnet 5 is 3.00 and 15.00 USD per million tokens since 2026-09-01, when launch pricing ended; Opus 5 at 5.00 and 25.00; Haiku 4.5 at 1.00 and 5.00) and first-party list prices for Vertex. The AWS figures below are about 40 percent higher than the same runs on the launch price. Assumptions: cohort of 25, six sessions, us-east-1 and us-central1, participants run in their own accounts.
 
 ## Model spend, both tracks
 
 | Item | Tokens per unit | Cost per unit | Per participant per cohort |
 | --- | --- | --- | --- |
 | Session 1 preflight and live check | under 1k | under 0.01 USD | 0.01 |
-| Session 4 judged harness run (77 cases, Opus judge) | about 60 judgements at 4k in, 0.2k out | about 6 USD | 6 |
+| Session 4 judged harness run (77 cases, Opus judge) | about 60 judgements at 4k in, 0.2k out | about 6 USD (measured 6.08 on AWS) | 6 |
 | Session 4 unjudged experiments, 3 runs | 77 answers at 3k in, 0.3k out each | under 1 USD each | 2.5 |
-| Session 5 adversarial set, hand-built loop | 15 runs at about 4 steps | under 1 USD | 1 |
+| Session 5 adversarial set, hand-built loop | 15 runs at about 5 steps | 1.6 USD measured on AWS at launch pricing, about 2.4 at the current Sonnet 5 price | 2.5 |
 | Session 5 framework port | same | under 1 USD | 1 |
 | Session 6 capstone runs and demos | 50 tickets routed | about 2 USD | 2 |
 | Headroom for reruns and mistakes | | | 5 |
-| **Model spend per participant** | | | **about 18 USD** |
+| **Model spend per participant** | | | **about 20 USD** |
 
 The Session 1 spend cap of 10 USD per session is set in `.env`; the Session 4 judged run is the only step that approaches it.
 
@@ -33,7 +33,7 @@ The Session 1 spend cap of 10 USD per session is set in `.env`; the Session 4 ju
 | After `make stop` (services deleted, images kept) | | | 0.40 USD per month |
 | After `make destroy` | | | 0 |
 
-Credit to request per participant for the AWS track: 18 USD of model spend plus 10 USD of App Runner headroom, **30 USD**, assuming they destroy after the session. Say that in the pre-session message.
+Credit to request per participant for the AWS track: 20 USD of model spend plus 10 USD of App Runner headroom, **30 USD**, assuming they destroy after the session. Say that in the pre-session message.
 
 ### Reference stack (deployed once, shown by the instructor)
 
@@ -71,18 +71,18 @@ Argus, the reference project this course borrows from, cost about 400 USD a mont
 | Cold start | | first request after idle, measured in Step 5 | 20 to 40 seconds for the agent image |
 | After `make destroy` | | | 0 |
 
-Credit to request per participant for the GCP track: 18 USD of model spend plus 5 USD headroom, **25 USD**.
+Credit to request per participant for the GCP track: 20 USD of model spend plus 5 USD headroom, **25 USD**.
 
 ### Reference stack
 
 | Item | Rate | Assumption | Cost |
 | --- | --- | --- | --- |
-| Agent Engine runtime | billed while serving; Google's overview page did not state the unit, verify on the pricing page before deploy | 1 hour of demos a day | estimate 0.30 USD per day |
-| Model Armor | per token in prompts and responses; rate not on the overview page | 1,000 requests per day | estimate 0.50 USD per day |
+| Agent Engine runtime | 0.0864 USD per vCPU-hour, 0.0090 per GB-hour, free tier 50 vCPU-hours and 100 GB-hours a month | 1 hour of demos a day at 2 vCPU and 4 GB | 0.21 USD per day, inside the free tier for a demo month |
+| Model Armor | 0.10 USD per million tokens, 2 million free per month | 1,000 requests per day at 1,000 tokens | free within the allowance, 0.10 USD per day beyond |
 | MCP server on Cloud Run | request-based | 1,000 calls per day | under 0.05 USD per day |
 | Cloud SQL with pgvector, optional | db-custom-1-3840 Enterprise zonal | only when `enable_pgvector` | about 50 USD per month |
 | **One end-to-end validation run** | | deploy, adversarial set, demo, destroy same day | **about 2 USD plus model spend, about 5 USD** |
-| **Per month, demos only, no Cloud SQL** | | | **about 25 USD** |
+| **Per month, demos only, no Cloud SQL** | | | **under 10 USD**, most of it Cloud Run for the MCP server and the session services |
 | After `make destroy` | | | 0 |
 
 Vertex AI Vector Search was rejected as the managed retriever because it bills per serving node-hour with a floor of several hundred USD a month for a modest index.
