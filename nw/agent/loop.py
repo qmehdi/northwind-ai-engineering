@@ -14,8 +14,9 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from nw.agent.screen import Screener
 from nw.agent.tools import ToolRegistry, untrusted
-from nw.agent.trace import Trajectory
+from nw.agent.trace import Step, Termination, Trajectory
 from nw.config import ModelRole
 from nw.llm import LLMClient
 from nw.llm.types import Completion, StopReason, ToolCall
@@ -53,10 +54,29 @@ async def run_agent(
     approval: ApprovalPolicy = never_approve,
     agent_name: str = "resolver",
     max_tokens: int = 1024,
+    screener: Screener | None = None,
 ) -> Trajectory:
     run_id = uuid.uuid4().hex[:10]
     t = Trajectory(run_id=run_id, agent=agent_name, task=task, correlation_id=correlation_id())
     spent_before = client.spend_usd
+    if screener is not None:
+        verdict = screener.screen(task)
+        t.steps.append(
+            Step(
+                index=0,
+                tool=f"screen:{verdict.screener}",
+                observation=verdict.reason or "allowed",
+                ok=verdict.allowed,
+            )
+        )
+        if not verdict.allowed:
+            t.final = f"Blocked before the model by {verdict.screener}: {verdict.reason}"
+            t.terminated = Termination.ANSWER
+            log.warning(
+                "screened",
+                extra=log_fields(run_id=run_id, screener=verdict.screener, reason=verdict.reason),
+            )
+            return t
 
     raise NotImplementedError("Step 3: the loop, the caps, the approval gate, the trace")
 

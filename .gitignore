@@ -12,3 +12,10 @@ data/generated/
 cdk.out/
 .terraform/
 *.tfstate*
+deploy/aws/.venv/
+deploy/aws/cdk.out/
+deploy/aws/cdk.out.test/
+deploy/aws/outputs.json
+deploy/gcp/**/.terraform/
+deploy/gcp/**/tfplan
+deploy/gcp/**/.terraform.lock.hcl

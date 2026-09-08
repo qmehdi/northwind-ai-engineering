@@ -1,6 +1,7 @@
 """One FastAPI app for any agent role: a specialist (`NW_AGENT_ROLE=triage|policy|resolution`)
 or the orchestrator (`NW_AGENT_ROLE=orchestrator`, with the specialists' URLs).
 
+    NW_AGENT_ROLE=resolver uv run uvicorn nw.agent.service:app --port 8010   # the Session path
     NW_AGENT_ROLE=triage uv run uvicorn nw.agent.service:app --port 8011
     NW_AGENT_ROLE=policy uv run uvicorn nw.agent.service:app --port 8012
     NW_AGENT_ROLE=resolution uv run uvicorn nw.agent.service:app --port 8013
@@ -48,6 +49,7 @@ READY = Gauge("nw_agent_ready", "1 when ready", ["role"])
 
 
 class State:
+    screener = None
     role: str = "triage"
     registry: ToolRegistry | None = None
     client: LLMClient | None = None
@@ -67,6 +69,9 @@ async def lifespan(app: FastAPI):
     try:
         s = settings()
         state.client = LLMClient(make_provider(s), settings=s)
+        from nw.agent.screen import from_env
+
+        state.screener = from_env()
         if state.role == "orchestrator":
             state.urls = {r: os.environ[f"NW_{r.upper()}_AGENT_URL"] for r in SPECIALISTS}
         else:
@@ -135,6 +140,41 @@ async def run(req: SpecialistRequest) -> SpecialistResponse:
     for p in resp.proposed_actions:
         PROPOSALS.labels(role=state.role, tool=p["tool"]).inc()
     return resp
+
+
+def _response(t) -> SpecialistResponse:
+    return SpecialistResponse(
+        run_id=t.run_id,
+        final=t.final,
+        terminated=t.terminated.value,
+        steps=t.n_steps,
+        cost_usd=t.cost_usd,
+        proposed_actions=[p.model_dump() for p in t.proposed_actions],
+    )
+
+
+class RouteRequest(SpecialistRequest):
+    ticket_id: str = "T-000000"
+    account_id: str = "NW-00000"
+    subject: str = ""
+
+
+@app.post("/route", response_model=SpecialistResponse)
+async def route_ticket(req: RouteRequest) -> SpecialistResponse:
+    """Capstone endpoint: Project 1 first, then the cheapest loop that will do."""
+    if not state.ready or state.client is None or state.registry is None:
+        raise HTTPException(503, "agent not ready")
+    from nw.agent.router import route
+
+    t = await route(
+        req.ticket_id, req.account_id, req.subject, req.task, state.registry, state.client
+    )
+    t.save(state.trace_dir)
+    RUNS.labels(role=t.agent, terminated=t.terminated.value).inc()
+    COST.labels(role=t.agent).inc(t.cost_usd)
+    for p in t.proposed_actions:
+        PROPOSALS.labels(role=t.agent, tool=p.tool).inc()
+    return _response(t)
 
 
 @app.get("/metrics")

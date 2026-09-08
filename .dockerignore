@@ -3,8 +3,14 @@
 .pytest_cache
 .ruff_cache
 __pycache__
-data/
+data/tickets.jsonl
+data/policies/
+data/golden/
 docs/
 notebooks/
 tests/
 deploy/
+artifacts/traces*
+artifacts/*/model.onnx
+artifacts/*/checkpoint.pt
+artifacts/escalations.jsonl

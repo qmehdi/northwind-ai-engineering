@@ -1,0 +1,92 @@
+# Cost sheet
+
+Every figure is an estimate from vendor list prices fetched on 2026-09-08 (see the instructor research notes for sources) and must be replaced by the measured figure after the validation run. Model prices are first-party list prices; Bedrock and Vertex bill at their own rates, which the fetched Bedrock page did not yet list for the Claude 5 models. Assumptions: cohort of 25, six sessions, us-east-1 and us-central1, participants run in their own accounts.
+
+## Model spend, both tracks
+
+| Item | Tokens per unit | Cost per unit | Per participant per cohort |
+| --- | --- | --- | --- |
+| Session 1 preflight and live check | under 1k | under 0.01 USD | 0.01 |
+| Session 4 judged harness run (77 cases, Opus judge) | about 60 judgements at 4k in, 0.2k out | about 6 USD | 6 |
+| Session 4 unjudged experiments, 3 runs | 77 answers at 3k in, 0.3k out each | under 1 USD each | 2.5 |
+| Session 5 adversarial set, hand-built loop | 15 runs at about 4 steps | under 1 USD | 1 |
+| Session 5 framework port | same | under 1 USD | 1 |
+| Session 6 capstone runs and demos | 50 tickets routed | about 2 USD | 2 |
+| Headroom for reruns and mistakes | | | 5 |
+| **Model spend per participant** | | | **about 18 USD** |
+
+The Session 1 spend cap of 10 USD per session is set in `.env`; the Session 4 judged run is the only step that approaches it.
+
+## AWS track
+
+### Session path (each participant, Session 6)
+
+| Item | Rate | Assumption | Cost |
+| --- | --- | --- | --- |
+| App Runner, 4 services, provisioned memory | 0.007 USD per GB-hour | 2, 3, 3, 4 GB, always provisioned | 0.084 USD per hour |
+| App Runner, active compute during the session | 0.064 USD per vCPU-hour | 5 vCPU active 2 hours | 0.64 USD |
+| ECR storage | 0.10 USD per GB-month | about 4 GB of images | 0.40 USD per month |
+| CloudWatch, X-Ray, SNS, Budgets | free tier | | 0 |
+| **During the 2-hour session** | | | **about 0.85 USD** |
+| **Idle per day if left running** | | | **2.0 USD** |
+| **Idle per month if left running** | | | **61 USD** |
+| After `make stop` (services deleted, images kept) | | | 0.40 USD per month |
+| After `make destroy` | | | 0 |
+
+Credit to request per participant for the AWS track: 18 USD of model spend plus 10 USD of App Runner headroom, **30 USD**, assuming they destroy after the session. Say that in the pre-session message.
+
+### Reference stack (deployed once, shown by the instructor)
+
+| Item | Rate | Assumption | Cost |
+| --- | --- | --- | --- |
+| Session path services | as above | | 2.0 USD per day idle |
+| AgentCore Runtime, 2 runtimes | 0.0895 USD per vCPU-hour active, 0.00945 per GB-hour | billed per second only while a session is active; 1 hour of demos a day at 1 vCPU 2 GB each | 0.22 USD per day |
+| AgentCore Gateway | 0.005 USD per 1,000 invocations, 0.02 USD per 100 tools per month | 1,000 calls per day, 7 tools | 0.005 USD per day plus 0.02 USD per month |
+| Policy engine | 0.000025 USD per authorization | 1,000 per day | 0.025 USD per day |
+| Bedrock Guardrails | 0.15 USD per 1,000 text units for prompt attack, 0.10 for PII and grounding | 1,000 requests per day, 2 units each | 0.70 USD per day |
+| S3 Vectors | 0.06 USD per GB-month, 2.50 USD per million queries | 212 chunks, 1,000 queries per day | under 0.01 USD per day |
+| CloudWatch Logs with Transaction Search | 0.50 USD per GB ingested | 200 MB per day | 0.10 USD per day |
+| **Upfront** | | ECR push, guardrail version | 0 |
+| **One end-to-end validation run** | | deploy, 15 adversarial tickets through the gateway, demo, destroy same day | **about 3 USD plus model spend, about 5 USD** |
+| **Per day, demos only** | | | **about 3 USD** |
+| **Per month if left running** | | | **about 95 USD**, of which 61 is the App Runner provisioned memory |
+| After `make stop` | App Runner services deleted, runtimes idle bill nothing | | under 1 USD per month |
+| After `make destroy` | | | 0 |
+
+Argus, the reference project this course borrows from, cost about 400 USD a month idle because of an always-on Fargate observability stack and Aurora. This stack has neither: observability is native and retrieval is S3 Vectors.
+
+## GCP track
+
+### Session path (each participant, Session 6)
+
+| Item | Rate | Assumption | Cost |
+| --- | --- | --- | --- |
+| Cloud Run, request-based billing | 0.000024 USD per vCPU-second, 0.0000025 per GiB-second while serving | 5 vCPU serving 20 minutes of the session | 0.15 USD |
+| Cloud Run idle, min instances 0 | 0 | | 0 |
+| Cloud Run free tier | 2M requests, 180k vCPU-seconds per month | covers the session | 0 |
+| Artifact Registry | 0.10 USD per GB-month | about 4 GB | 0.40 USD per month |
+| Cloud Monitoring, Trace, Logging | free tier | | 0 |
+| **During the 2-hour session** | | | **under 0.20 USD** |
+| **Idle per day** | | min instances 0 | **0** |
+| Cold start | | first request after idle, measured in Step 5 | 20 to 40 seconds for the agent image |
+| After `make destroy` | | | 0 |
+
+Credit to request per participant for the GCP track: 18 USD of model spend plus 5 USD headroom, **25 USD**.
+
+### Reference stack
+
+| Item | Rate | Assumption | Cost |
+| --- | --- | --- | --- |
+| Agent Engine runtime | billed while serving; Google's overview page did not state the unit, verify on the pricing page before deploy | 1 hour of demos a day | estimate 0.30 USD per day |
+| Model Armor | per token in prompts and responses; rate not on the overview page | 1,000 requests per day | estimate 0.50 USD per day |
+| MCP server on Cloud Run | request-based | 1,000 calls per day | under 0.05 USD per day |
+| Cloud SQL with pgvector, optional | db-custom-1-3840 Enterprise zonal | only when `enable_pgvector` | about 50 USD per month |
+| **One end-to-end validation run** | | deploy, adversarial set, demo, destroy same day | **about 2 USD plus model spend, about 5 USD** |
+| **Per month, demos only, no Cloud SQL** | | | **about 25 USD** |
+| After `make destroy` | | | 0 |
+
+Vertex AI Vector Search was rejected as the managed retriever because it bills per serving node-hour with a floor of several hundred USD a month for a modest index.
+
+## Validation run budget
+
+One end-to-end run per track, deploy to destroy on the same day: about 5 USD each on the cloud side plus about 5 USD of model spend each, **about 20 USD total**, with a budget alarm at 50 USD on each account.

@@ -1,4 +1,4 @@
-.PHONY: setup check test lint fmt preflight session01 session02 train-triage serve-triage image-triage session03 train-semantic export-semantic benchmark index serve-semantic session04 index-policy eval-policy serve-policy session05 agent-eval replay specialists agent-eval-strands agent-eval-adk mcp
+.PHONY: setup check test lint fmt preflight session01 session02 train-triage serve-triage image-triage images up up-observability down session03 train-semantic export-semantic benchmark index serve-semantic session04 index-policy eval-policy serve-policy session05 agent-eval replay specialists agent-eval-strands agent-eval-adk mcp
 
 setup:            ## Create the virtualenv and install everything, deep learning and agents included
 	uv sync --extra dev --extra dl --extra agents --extra agents-aws --extra agents-gcp
@@ -33,7 +33,19 @@ serve-triage:     ## Run the Project 1 service on :8001
 	NW_TRIAGE_MODEL=artifacts/triage/latest uv run uvicorn nw.triage.service:app --port 8001
 
 image-triage:     ## Build the Project 1 container
-	docker build --build-arg APP=nw.triage.service:app --build-arg MODEL=artifacts/triage/latest -t nw-triage .
+	docker build --build-arg APP=nw.triage.service:app --build-arg ARTIFACTS="triage" -t nw-triage .
+
+images:           ## Build every service image
+	docker compose build
+
+up:               ## Local stack: all services on :8001 to :8020
+	docker compose up --build -d
+
+up-observability: ## Local stack plus the OpenTelemetry collector and Jaeger on :16686
+	docker compose --profile observability up --build -d
+
+down:             ## Stop the local stack
+	docker compose --profile observability down
 
 session03:        ## Session 3 acceptance tests (tiny model, CPU, no download)
 	uv run pytest -q -m session03
@@ -85,3 +97,43 @@ agent-eval-adk:   ## GCP track: same evaluation through ADK
 
 mcp:              ## The tool registry as an MCP server on :8020
 	uv run python -m nw.agent.mcp_server
+
+# ----- Session 6: deployment. Read deploy/COSTS.md before any of these. -----
+TIER ?= session
+
+session06:        ## Session 6 acceptance tests (router, plus the CDK synth review on the aws track)
+	uv run pytest -q -m session06
+	cd deploy/aws && .venv/bin/python -m pytest -q tests
+
+deploy-aws:       ## AWS: synth test, then cdk deploy. TIER=session|reference
+	TIER=$(TIER) scripts/deploy_aws.sh deploy
+
+synth-aws:        ## AWS: synth and the review test only
+	TIER=$(TIER) scripts/deploy_aws.sh synth
+
+stop-aws:         ## AWS: pause every northwind App Runner service
+	scripts/deploy_aws.sh stop
+
+start-aws:        ## AWS: resume them
+	scripts/deploy_aws.sh start
+
+destroy-aws:      ## AWS: delete the tier's stack
+	TIER=$(TIER) scripts/deploy_aws.sh destroy
+
+images-gcp:       ## GCP: build and push every image to Artifact Registry
+	scripts/images_gcp.sh
+
+deploy-gcp:       ## GCP: validate, plan, apply. TIER=session|reference
+	TIER=$(TIER) scripts/deploy_gcp.sh deploy
+
+plan-gcp:         ## GCP: plan only
+	TIER=$(TIER) scripts/deploy_gcp.sh plan
+
+stop-gcp:         ## GCP: scale every northwind Cloud Run service to zero
+	scripts/deploy_gcp.sh stop
+
+start-gcp:        ## GCP: restore instance limits
+	scripts/deploy_gcp.sh start
+
+destroy-gcp:      ## GCP: terraform destroy the tier
+	TIER=$(TIER) scripts/deploy_gcp.sh destroy

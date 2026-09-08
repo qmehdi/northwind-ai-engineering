@@ -61,13 +61,14 @@ packages = ["nw"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-extend-exclude = ["notebooks"]
+extend-exclude = ["notebooks", "deploy/aws/.venv", "deploy/aws/cdk.out", "deploy/aws/cdk.out.test"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "ASYNC"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["E501"]
+"deploy/**" = ["E501"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

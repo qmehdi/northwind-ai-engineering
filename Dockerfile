@@ -1,27 +1,50 @@
-# Multi-stage image for any nw service. Build with a target module, for example:
-#   docker build --build-arg APP=nw.triage.service:app --build-arg MODEL=artifacts/triage/latest -t nw-triage .
+# One image recipe for every Northwind service. The APP build argument picks the
+# ASGI app; the ARTIFACTS argument picks which artifact directories are baked in.
+#
+#   docker build --build-arg APP=nw.triage.service:app   --build-arg ARTIFACTS="triage"          -t nw-triage .
+#   docker build --build-arg APP=nw.semantic.service:app --build-arg ARTIFACTS="semantic index"  -t nw-semantic .
+#   docker build --build-arg APP=nw.policy.service:app   --build-arg ARTIFACTS="policy" --build-arg HF_MODELS=1 -t nw-policy .
+#   docker build --build-arg APP=nw.agent.service:app    --build-arg ARTIFACTS="triage semantic index policy" --build-arg HF_MODELS=1 -t nw-agent .
+#   docker build --build-arg APP=mcp --build-arg ARTIFACTS="triage semantic index policy" --build-arg HF_MODELS=1 -t nw-mcp .
+#
+# Weights and indexes are loaded once at startup, never per request. Nothing in
+# the image reaches the Hub at runtime: HF_MODELS=1 pre-downloads the embedder and
+# reranker at build time into /app/hf.
 FROM python:3.12-slim AS builder
 COPY --from=ghcr.io/astral-sh/uv:0.6.9 /uv /bin/uv
 WORKDIR /app
-ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
-COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never
+COPY pyproject.toml uv.lock .python-version ./
+RUN uv sync --frozen --no-dev --no-install-project --extra dl --extra agents
 COPY nw ./nw
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev --extra dl --extra agents
 
 FROM python:3.12-slim AS runtime
 ARG APP=nw.triage.service:app
-ARG MODEL=artifacts/triage/latest
+ARG ARTIFACTS="triage"
+ARG HF_MODELS=0
 ARG PORT=8000
 RUN useradd --create-home --uid 10001 nw
 WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/nw /app/nw
-# Model weights are baked at build time and loaded once at startup, not per request.
-COPY ${MODEL}/ /app/model/
-ENV PATH="/app/.venv/bin:$PATH" NW_TRIAGE_MODEL=/app/model NW_APP=${APP} PORT=${PORT} NW_LOG_FORMAT=json
+COPY data/accounts.json /app/data/accounts.json
+COPY artifacts/ /tmp/artifacts/
+RUN mkdir -p /app/artifacts && for a in $ARTIFACTS; do \
+      cp -r /tmp/artifacts/$a /app/artifacts/$a; done \
+    && rm -rf /tmp/artifacts /app/artifacts/*/model.onnx /app/artifacts/*/checkpoint.pt
+ENV PATH="/app/.venv/bin:$PATH" HF_HOME=/app/hf HF_HUB_OFFLINE=0 \
+    NW_TRIAGE_MODEL=/app/artifacts/triage/latest NW_SEMANTIC_ARTIFACT=/app/artifacts/semantic \
+    NW_INDEX=/app/artifacts/index NW_POLICY_INDEX=/app/artifacts/policy \
+    NW_APP=${APP} PORT=${PORT} NW_LOG_FORMAT=json NW_TRACE_DIR=/tmp/traces
+RUN if [ "$HF_MODELS" = "1" ]; then python -c "\
+from sentence_transformers import SentenceTransformer, CrossEncoder; \
+SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2'); \
+CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')" ; fi
+ENV HF_HUB_OFFLINE=1
+RUN chown -R nw:nw /app
 USER nw
 EXPOSE ${PORT}
-HEALTHCHECK --interval=15s --timeout=3s --start-period=20s CMD python -c "import urllib.request,os;urllib.request.urlopen(f'http://127.0.0.1:{os.environ[\"PORT\"]}/readyz')" || exit 1
-# exec form through sh so the env vars expand; uvicorn handles SIGTERM for graceful shutdown.
-CMD ["sh", "-c", "exec uvicorn ${NW_APP} --host 0.0.0.0 --port ${PORT} --timeout-graceful-shutdown 20"]
+HEALTHCHECK --interval=15s --timeout=3s --start-period=60s CMD python -c "import urllib.request,os;urllib.request.urlopen(f'http://127.0.0.1:{os.environ[\"PORT\"]}/readyz')" || exit 1
+# The MCP image runs the server directly; every other image runs uvicorn.
+CMD ["sh", "-c", "if [ \"$NW_APP\" = mcp ]; then exec python -m nw.agent.mcp_server; else exec uvicorn ${NW_APP} --host 0.0.0.0 --port ${PORT} --timeout-graceful-shutdown 20; fi"]

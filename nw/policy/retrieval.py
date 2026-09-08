@@ -181,3 +181,83 @@ def real_embeddings() -> Any:
     from nw.semantic.embed import Embedder
 
     return Embedder()
+
+
+class S3VectorsDense:
+    """The managed dense retriever on the AWS Reference stack: Amazon S3 Vectors.
+
+    Shapes verified against the installed botocore model (s3vectors 2025-07-15):
+    `query_vectors(vectorBucketName, indexName, topK, queryVector={"float32": [...]},
+    returnMetadata=True, returnDistance=True)` returns `vectors[].key` and `distance`.
+    Cosine distance is 1 minus similarity, so the score returned here is 1 - distance,
+    the same scale as the in-process retriever.
+    """
+
+    def __init__(
+        self, bucket: str, index: str, region: str, embeddings: Embeddings, *, client: Any = None
+    ) -> None:
+        import boto3
+
+        self.bucket, self.index, self.embeddings = bucket, index, embeddings
+        self.client = client or boto3.client("s3vectors", region_name=region)
+
+    def publish(self, chunks: list[Chunk], batch: int = 100) -> int:
+        vectors = self.embeddings.encode([c.text for c in chunks])
+        for i in range(0, len(chunks), batch):
+            self.client.put_vectors(
+                vectorBucketName=self.bucket,
+                indexName=self.index,
+                vectors=[
+                    {
+                        "key": c.id,
+                        "data": {"float32": [float(x) for x in vectors[j]]},
+                        "metadata": {
+                            "doc_id": c.doc_id,
+                            "section": c.section,
+                            "effective": c.effective,
+                            "audience": c.audience,
+                            "current": c.current,
+                        },
+                    }
+                    for j, c in enumerate(chunks[i : i + batch], start=i)
+                ],
+            )
+        return len(chunks)
+
+    def query(self, text: str, k: int) -> list[tuple[str, float]]:
+        q = self.embeddings.encode([text])[0]
+        r = self.client.query_vectors(
+            vectorBucketName=self.bucket,
+            indexName=self.index,
+            topK=k,
+            queryVector={"float32": [float(x) for x in q]},
+            returnMetadata=False,
+            returnDistance=True,
+        )
+        return [(v["key"], 1.0 - float(v.get("distance", 0.0))) for v in r.get("vectors", [])]
+
+
+class ManagedPolicyIndex(PolicyIndex):
+    """PolicyIndex whose dense stage is a managed service. BM25, fusion, filters and the
+    reranker are unchanged, so everything Session 4 taught still applies; only the
+    vector store moved."""
+
+    def __init__(
+        self, chunks: list[Chunk], dense: S3VectorsDense, *, reranker: Reranker | None = None
+    ) -> None:
+        from rank_bm25 import BM25Okapi
+
+        self.chunks = chunks
+        self.by_id = {c.id: c for c in chunks}
+        self.embeddings = dense.embeddings
+        self.reranker = reranker
+        self.vectors = None  # never materialised locally
+        self.bm25 = BM25Okapi([tokenize(c.text) for c in chunks])
+        self._dense = dense
+
+    def dense(self, query: str, k: int) -> list[Retrieved]:
+        return [
+            Retrieved(self.by_id[cid], score, "dense")
+            for cid, score in self._dense.query(query, k)
+            if cid in self.by_id
+        ]

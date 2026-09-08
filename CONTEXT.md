@@ -81,3 +81,15 @@ The participant repository for the AI Engineering course. One domain, support-ti
 **Orchestrator**: The agent whose tools are the specialists. _Avoid_: Supervisor, Router (that is Session 6's cheap-model-first routing), Planner
 
 **Adversarial set**: The fifteen tickets with expectations written as data, including injection, that every agent implementation must pass. _Avoid_: Red team set, Attack suite
+
+### Session 6, deployment
+
+**Session path**: What each participant deploys: the four services on App Runner or Cloud Run with least-privilege identity, readiness, metrics, alarms, a budget. _Avoid_: Lite stack, Dev deploy
+
+**Reference stack**: The instructor's deployment: the agent on the managed agent runtime, the tool registry behind a gateway with a policy, a native guardrail, a managed vector index. _Avoid_: Prod stack, Full stack
+
+**Screener**: The native service that inspects customer text before the loop: Bedrock Guardrails on AWS, Model Armor on GCP. _Avoid_: Filter, Firewall
+
+**Router**: The capstone's cheap-model-first policy: Project 1 first, then the cheapest loop that will do. _Avoid_: Orchestrator (that is Session 5's agent), Dispatcher
+
+**Cost sheet**: `deploy/COSTS.md`: rates, assumptions, idle cost, what stop and destroy leave behind, credit per participant. _Avoid_: Pricing, Estimate
