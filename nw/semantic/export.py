@@ -41,6 +41,7 @@ class ExportWrapper(torch.nn.Module):
 def load_finetuned(
     artifact: Path, *, config: Any = None, tokenizer: Any = None
 ) -> tuple[TicketEncoder, Any, dict[str, Any]]:
+    artifact = Path(artifact)
     meta = json.loads((artifact / "metadata.json").read_text())
     spec = ModelSpec(
         base=meta["base"],
