@@ -9,7 +9,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
       - run: uv python install 3.12
-      - run: uv sync --extra dev
+      - run: uv sync --extra dev --extra dl --extra agents --extra agents-aws --extra agents-gcp
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run pytest -q -m "not live"

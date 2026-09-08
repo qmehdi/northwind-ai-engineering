@@ -118,7 +118,7 @@ def run(
             "p50_ms": p50,
             "p95_ms": p95,
             "bytes": (semantic_dir / "best.pt").stat().st_size
-            + dir_size(Path(torch.hub.get_dir())) * 0,
+            + 4 * sum(p.numel() for p in model.parameters()),
         }
     )
 
@@ -151,7 +151,7 @@ def run(
         )
 
     for r in results:
-        r["usd_per_1k_tickets"] = round(r["p50_ms"] / 1000 / 3600 * CPU_USD_PER_HOUR * 1000, 5)
+        r["usd_per_1k_tickets"] = round(r["p50_ms"] / 1000 / 3600 * CPU_USD_PER_HOUR * 1000, 6)
     return results
 
 
@@ -166,7 +166,7 @@ def format_table(results: list[dict[str, Any]]) -> str:
         lines.append(
             f"| {r['model']} | {r['priority_macro_f1']:.3f} | {r['p0_recall']:.3f} | {tag} "
             f"| {r['p50_ms']:.1f} | {r['p95_ms']:.1f} | {r['bytes'] / 1e6:.1f} "
-            f"| {r['usd_per_1k_tickets']:.4f} |"
+            f"| {r['usd_per_1k_tickets']:.5f} |"
         )
     return "\n".join(lines)
 
