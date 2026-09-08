@@ -18,7 +18,7 @@ from nw.agent.tools import ToolRegistry, untrusted
 from nw.agent.trace import Trajectory
 from nw.config import ModelRole
 from nw.llm import LLMClient
-from nw.llm.types import Completion, Message, StopReason, ToolCall
+from nw.llm.types import Completion, StopReason, ToolCall
 from nw.logging import correlation_id, get_logger, log_fields
 
 log = get_logger("nw.agent.loop")
@@ -56,9 +56,7 @@ async def run_agent(
 ) -> Trajectory:
     run_id = uuid.uuid4().hex[:10]
     t = Trajectory(run_id=run_id, agent=agent_name, task=task, correlation_id=correlation_id())
-    messages: list[Message] = [Message.user(untrusted(task))]
     spent_before = client.spend_usd
-    specs = registry.specs()
 
     raise NotImplementedError("Step 3: the loop, the caps, the approval gate, the trace")
 

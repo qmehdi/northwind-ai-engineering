@@ -111,11 +111,8 @@ def orchestrator_registry(
 ) -> ToolRegistry:
     """One tool per specialist. The tool's implementation is an HTTP call to `/run`."""
     reg = ToolRegistry()
-    client = http or httpx.AsyncClient(timeout=120)
 
     def make(role: str) -> None:
-        url = urls[role]
-
         raise NotImplementedError("Step 6: a specialist is a tool that makes an HTTP call")
 
     for role in urls:

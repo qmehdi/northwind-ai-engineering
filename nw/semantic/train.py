@@ -175,13 +175,6 @@ def train(
         rows_val, tokenizer, batch_size=batch_size * 2, max_length=spec.max_length
     )
 
-    counts = np.bincount(
-        [PRIORITIES.index(r["priority"]) for r in rows_train], minlength=len(PRIORITIES)
-    ).astype(np.float32)
-    prio_weight = torch.tensor(
-        counts.sum() / np.maximum(counts, 1) / len(PRIORITIES), dtype=torch.float32
-    ).to(device)
-
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=0.01)
     steps_per_epoch = math.ceil(len(train_loader) / accumulate)
@@ -193,8 +186,6 @@ def train(
             min(1.0, (s + 1) / warmup) * max(0.0, (total_steps - s) / max(1, total_steps - warmup))
         ),
     )
-    use_amp = device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     out.mkdir(parents=True, exist_ok=True)
     ckpt_path = out / "checkpoint.pt"
@@ -210,15 +201,7 @@ def train(
     started = time.perf_counter()
     for epoch in range(start_epoch, epochs):
         model.train()
-        running = 0.0
-        for i, batch in enumerate(train_loader):
-            ids, mask = batch["input_ids"].to(device), batch["attention_mask"].to(device)
-            target = {k: batch[k].to(device) for k in ("tags", "priority")}
-            raise NotImplementedError("Step 4: forward, loss, backward, clip, step")
-            if not math.isfinite(loss.item()):
-                raise RuntimeError(
-                    f"loss is {loss.item()} at step {step}: lower the learning rate or check data"
-                )
+        raise NotImplementedError("Step 4: class weights, scaler, the batch loop")
         tag_p, prio_p, tag_y, prio_y = predict(model, val_loader, device)
         thresholds = tune_tag_thresholds(tag_p, tag_y)
         m = metrics(tag_p, prio_p, tag_y, prio_y, thresholds)
