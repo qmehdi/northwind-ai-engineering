@@ -79,8 +79,8 @@ TAGS: list[str] = [
 TAG_INDEX = {t: i for i, t in enumerate(TAGS)}
 
 
-def load_rows(path: Path, split: str | None = None) -> list[dict[str, Any]]:
-    with path.open(encoding="utf-8") as f:
+def load_rows(path: Path | str, split: str | None = None) -> list[dict[str, Any]]:
+    with Path(path).open(encoding="utf-8") as f:
         rows = [json.loads(line) for line in f if line.strip()]
     if split:
         rows = [r for r in rows if r.get("split") == split]

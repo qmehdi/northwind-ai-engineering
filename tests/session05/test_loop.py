@@ -132,3 +132,16 @@ async def test_approval_policy_can_allow(registry, make_client, escalation_file)
         TICKET, registry, client, approval=lambda tool, args: args["tier"] == "security"
     )
     assert not t.proposed_actions and escalation_file.exists()
+
+
+async def test_final_answer_never_echoes_customer_pii(registry, make_client):
+    provider = FakeProvider(
+        [
+            scripted_completion(
+                "Reset requested for jane.doe@quill-labs.example, card ending 4111 1111 1111 1111."
+            )
+        ]
+    )
+    client = make_client(provider)
+    t = await run_agent("Reset MFA for jane.doe@quill-labs.example", registry, client)
+    assert "jane.doe" not in t.final and "4111" not in t.final and "[EMAIL_1]" in t.final
