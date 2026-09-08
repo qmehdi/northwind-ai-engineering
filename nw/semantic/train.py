@@ -1,0 +1,285 @@
+"""Fine-tune the encoder with LoRA: mixed precision, gradient accumulation,
+clipping, resumable checkpoints, per-label thresholds, and a versioned artifact.
+
+    uv run python -m nw.semantic.train --data data/tickets.jsonl --out artifacts/semantic \
+        --subset 2000 --epochs 6 --lr 1e-3
+
+The loop is written out rather than hidden behind a Trainer so a NaN, a
+deadlocked dataloader or an out-of-memory can be read off the code.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import math
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+from sklearn.metrics import f1_score, recall_score
+from torch.utils.data import DataLoader
+
+from nw.semantic.data import TAGS, load_rows, make_loader, stratified_subset
+from nw.semantic.model import (
+    ModelSpec,
+    TicketEncoder,
+    apply_lora,
+    build_encoder,
+    count_parameters,
+    pick_device,
+)
+from nw.triage.features import PRIORITIES
+
+
+def loss_fn(
+    tag_logits: torch.Tensor,
+    prio_logits: torch.Tensor,
+    batch: dict[str, torch.Tensor],
+    prio_weight: torch.Tensor | None,
+) -> torch.Tensor:
+    """Multi-label BCE on tags plus weighted cross-entropy on priority. BCE treats each
+    tag as its own yes/no question, which is what multi-label means; softmax would
+    force the tags to compete."""
+    raise NotImplementedError("Session 3, Step 4: BCE for tags, weighted CE for priority")
+
+
+@torch.no_grad()
+def predict(
+    model: TicketEncoder, loader: DataLoader, device: torch.device
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    model.eval()
+    tag_p, prio_p, tag_y, prio_y = [], [], [], []
+    for batch in loader:
+        ids, mask = batch["input_ids"].to(device), batch["attention_mask"].to(device)
+        tl, pl = model(ids, mask)
+        tag_p.append(torch.sigmoid(tl).float().cpu().numpy())
+        prio_p.append(torch.softmax(pl, -1).float().cpu().numpy())
+        tag_y.append(batch["tags"].numpy())
+        prio_y.append(batch["priority"].numpy())
+    return (
+        np.concatenate(tag_p),
+        np.concatenate(prio_p),
+        np.concatenate(tag_y),
+        np.concatenate(prio_y),
+    )
+
+
+def tune_tag_thresholds(prob: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """One threshold per tag, chosen on validation for F1. A global 0.5 under-predicts
+    rare tags; the per-label threshold is the cheapest large win in multi-label work."""
+    return np.full(prob.shape[1], 0.5, dtype=np.float32)  # Step 5: one threshold per tag
+
+
+def metrics(
+    tag_p: np.ndarray,
+    prio_p: np.ndarray,
+    tag_y: np.ndarray,
+    prio_y: np.ndarray,
+    thresholds: np.ndarray,
+) -> dict[str, Any]:
+    tag_pred = tag_p >= thresholds
+    prio_pred = prio_p.argmax(1)
+    labelled = prio_y >= 0
+    return {
+        "tag_micro_f1": float(f1_score(tag_y, tag_pred, average="micro", zero_division=0)),
+        "tag_macro_f1": float(f1_score(tag_y, tag_pred, average="macro", zero_division=0)),
+        "priority_macro_f1": float(
+            f1_score(
+                prio_y[labelled],
+                prio_pred[labelled],
+                average="macro",
+                labels=list(range(len(PRIORITIES))),
+                zero_division=0,
+            )
+        ),
+        "p0_recall": float(
+            recall_score(prio_y[labelled] == 0, prio_pred[labelled] == 0, zero_division=0)
+        ),
+    }
+
+
+def save_checkpoint(
+    path: Path,
+    model: TicketEncoder,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any,
+    epoch: int,
+    step: int,
+    best: float,
+) -> None:
+    """Everything needed to resume: adapter and head weights, optimiser moments,
+    scheduler position, where we were, and the best score so far."""
+    torch.save({"model": model.state_dict()}, path)  # Step 6: what else does resume need?
+
+
+def load_checkpoint(
+    path: Path,
+    model: TicketEncoder,
+    optimizer: torch.optim.Optimizer | None = None,
+    scheduler: Any = None,
+) -> dict[str, Any]:
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+    if unexpected:
+        raise ValueError(f"checkpoint has unexpected keys: {unexpected[:3]}")
+    if optimizer is not None and "optimizer" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer"])
+    if scheduler is not None and "scheduler" in ckpt:
+        scheduler.load_state_dict(ckpt["scheduler"])
+    return ckpt
+
+
+def train(
+    data: Path,
+    out: Path,
+    *,
+    spec: ModelSpec | None = None,
+    epochs: int = 2,
+    batch_size: int = 16,
+    accumulate: int = 2,
+    lr: float = 3e-4,
+    subset: int | None = None,
+    resume: Path | None = None,
+    device: torch.device | None = None,
+    config: Any = None,
+    tokenizer: Any = None,
+    max_steps: int | None = None,
+    log_every: int = 20,
+    seed: int = 0,
+) -> tuple[Path, dict[str, Any]]:
+    spec = spec or ModelSpec()
+    device = device or pick_device()
+    # Seed everything the loop touches: adapter init, dropout, shuffling. A run that
+    # cannot be repeated cannot be debugged.
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    rows_train = load_rows(data, "train")
+    rows_val = load_rows(data, "val")
+    if subset:
+        rows_train = stratified_subset(rows_train, subset)
+    model, tok = build_encoder(spec, config=config)
+    tokenizer = tokenizer or tok
+    model = apply_lora(model, spec).to(device)
+    total, trainable = count_parameters(model)
+    print(f"parameters: {total:,} total, {trainable:,} trainable ({100 * trainable / total:.2f}%)")
+
+    train_loader = make_loader(
+        rows_train, tokenizer, batch_size=batch_size, shuffle=True, max_length=spec.max_length
+    )
+    val_loader = make_loader(
+        rows_val, tokenizer, batch_size=batch_size * 2, max_length=spec.max_length
+    )
+
+    counts = np.bincount(
+        [PRIORITIES.index(r["priority"]) for r in rows_train], minlength=len(PRIORITIES)
+    ).astype(np.float32)
+    prio_weight = torch.tensor(
+        counts.sum() / np.maximum(counts, 1) / len(PRIORITIES), dtype=torch.float32
+    ).to(device)
+
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=0.01)
+    steps_per_epoch = math.ceil(len(train_loader) / accumulate)
+    total_steps = steps_per_epoch * epochs
+    warmup = max(1, int(0.06 * total_steps))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lambda s: (
+            min(1.0, (s + 1) / warmup) * max(0.0, (total_steps - s) / max(1, total_steps - warmup))
+        ),
+    )
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+    out.mkdir(parents=True, exist_ok=True)
+    ckpt_path = out / "checkpoint.pt"
+    start_epoch, step, best = 0, 0, -1.0
+    if resume and resume.exists():
+        ck = load_checkpoint(resume, model, optimizer, scheduler)
+        start_epoch, step = ck["epoch"], ck["step"]
+        # Best is per output directory: resuming into a fresh directory starts the
+        # best-checkpoint race again, so the new directory always gets a best.pt.
+        best = ck["best"] if (out / "best_metrics.json").exists() else -1.0
+        print(f"resumed from {resume}: epoch {start_epoch}, step {step}, best {best:.4f}")
+
+    started = time.perf_counter()
+    for epoch in range(start_epoch, epochs):
+        model.train()
+        running = 0.0
+        for i, batch in enumerate(train_loader):
+            ids, mask = batch["input_ids"].to(device), batch["attention_mask"].to(device)
+            target = {k: batch[k].to(device) for k in ("tags", "priority")}
+            raise NotImplementedError("Step 4: forward, loss, backward, clip, step")
+            if not math.isfinite(loss.item()):
+                raise RuntimeError(
+                    f"loss is {loss.item()} at step {step}: lower the learning rate or check data"
+                )
+        tag_p, prio_p, tag_y, prio_y = predict(model, val_loader, device)
+        thresholds = tune_tag_thresholds(tag_p, tag_y)
+        m = metrics(tag_p, prio_p, tag_y, prio_y, thresholds)
+        score = m["tag_micro_f1"] + m["priority_macro_f1"]
+        print(f"epoch {epoch} val: {json.dumps({k: round(v, 4) for k, v in m.items()})}")
+        if score > best:
+            best = score
+            save_checkpoint(out / "best.pt", model, optimizer, scheduler, epoch + 1, step, best)
+            np.save(out / "tag_thresholds.npy", thresholds)
+            (out / "best_metrics.json").write_text(json.dumps({"epoch": epoch, **m}, indent=1))
+        save_checkpoint(ckpt_path, model, optimizer, scheduler, epoch + 1, step, best)
+        if max_steps and step >= max_steps:
+            break
+
+    meta = {
+        "version": f"{dt.datetime.now(dt.UTC).strftime('%Y%m%d%H%M')}-lora",
+        "base": spec.base,
+        "lora": {"r": spec.lora_r, "alpha": spec.lora_alpha, "targets": list(spec.target_modules)},
+        "max_length": spec.max_length,
+        "tags": TAGS,
+        "priorities": PRIORITIES,
+        "parameters_total": total,
+        "parameters_trainable": trainable,
+        "n_train": len(rows_train),
+        "n_val": len(rows_val),
+        "epochs": epochs,
+        "device": device.type,
+        "seed": seed,
+        "seconds": round(time.perf_counter() - started, 1),
+        "best_metrics": json.loads((out / "best_metrics.json").read_text())
+        if (out / "best_metrics.json").exists()
+        else None,
+    }
+    (out / "metadata.json").write_text(json.dumps(meta, indent=1))
+    return out, meta
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", type=Path, default=Path("data/tickets.jsonl"))
+    ap.add_argument("--out", type=Path, default=Path("artifacts/semantic"))
+    ap.add_argument("--epochs", type=int, default=6)
+    ap.add_argument("--batch-size", type=int, default=16)
+    ap.add_argument(
+        "--subset", type=int, default=None, help="stratified training subset for laptops"
+    )
+    ap.add_argument("--resume", type=Path, default=None)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    args = ap.parse_args()
+    out, meta = train(
+        args.data,
+        args.out,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        subset=args.subset,
+        resume=args.resume,
+        lr=args.lr,
+    )
+    print(json.dumps(meta, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,254 @@
+[
+ {
+  "doc_id": "sla-2025",
+  "title": "Service Level Agreement",
+  "audience": "customer",
+  "effective": "2025-03-01",
+  "supersedes": "sla-2023",
+  "superseded_by": null,
+  "words": 853
+ },
+ {
+  "doc_id": "sla-2023",
+  "title": "Service Level Agreement",
+  "audience": "customer",
+  "effective": "2023-01-15",
+  "supersedes": null,
+  "superseded_by": "sla-2025",
+  "words": 662
+ },
+ {
+  "doc_id": "refunds-2025",
+  "title": "Refunds and Billing Disputes",
+  "audience": "customer",
+  "effective": "2025-06-01",
+  "supersedes": "refunds-2024",
+  "superseded_by": null,
+  "words": 814
+ },
+ {
+  "doc_id": "refunds-2024",
+  "title": "Refunds and Billing Disputes",
+  "audience": "customer",
+  "effective": "2024-02-01",
+  "supersedes": null,
+  "superseded_by": "refunds-2025",
+  "words": 816
+ },
+ {
+  "doc_id": "data-retention",
+  "title": "Data Retention and Deletion",
+  "audience": "customer",
+  "effective": "2025-01-10",
+  "supersedes": null,
+  "superseded_by": null,
+  "words": 811
+ },
+ {
+  "doc_id": "security-incident-response",
+  "title": "Security Incident Response",
+  "audience": "internal",
+  "effective": "2025-04-15",
+  "supersedes": null,
+  "superseded_by": null,
+  "words": 915
+ },
+ {
+  "doc_id": "customer-security-commitments",
+  "title": "Security and Compliance Commitments",
+  "audience": "customer",
+  "effective": "2025-04-15",
+  "supersedes": null,
+  "superseded_by": null,
+  "words": 731
+ },
+ {
+  "doc_id": "sso-setup",
+  "title": "Single Sign-On Setup and Troubleshooting",
+  "audience": "customer",
+  "effective": "2025-02-20",
+  "supersedes": null,
+  "superseded_by": null,
+  "words": 929
+ },
+ {
+  "doc_id": "mfa-policy",
+  "title": "Multi-Factor Authentication",
+  "audience": "customer",
+  "effective": "2024-11-01",
+  "supersedes": null,
+  "superseded_by": null,
+  "words": 867
+ },
+ {
+  "doc_id": "api-rate-limits",
+  "title": "API Rate Limits and Fair Use",
+  "audience": "customer",
+  "effective": "2025-05-05",
+  "supersedes": "api-rate-limits-2024",
+  "superseded_by": null,
+  "words": 839
+ },
+ {
+  "doc_id": "api-rate-limits-2024",
+  "title": "API Rate Limits and Fair Use",
+  "audience": "customer",
+  "effective": "2024-03-01",
+  "supersedes": null,
+  "superseded_by": "api-rate-limits",
+  "words": 715
+ },
+ {
+  "doc_id": "escalation-matrix",
+  "title": "Support Escalation Matrix",
+  "audience": "internal",
+  "effective": "2025-03-01",
+  "supersedes": null,
+  "superseded_by": null,
+  "words": 923
+ },
+ {
+  "doc_id": "maintenance-windows",
+  "title": "Scheduled Maintenance",
+  "audience": "customer",
+  "effective": "2024-09-01",
+  "supersedes": null,
+  "superseded_by": null,
+  "words": 808
+ },
+ {
+  "doc_id": "plans-and-entitlements",
+  "title": "Plans, Seats and Entitlements",
+  "audience": "customer",
+  "effective": "2025-06-01",
+  "supersedes": null,
+  "superseded_by": null,
+  "words": 1003
+ },
+ {
+  "doc_id": "integrations-slack-jira",
+  "title": "Slack and Jira Integrations",
+  "audience": "customer",
+  "effective": "2025-01-20",
+  "supersedes": null,
+  "superseded_by": null,
+  "words": 881
+ },
+ {
+  "doc_id": "data-pipelines-ops",
+  "title": "Data Pipelines: Scheduling, Failures and Retention",
+  "audience": "customer",
+  "effective": "2025-03-10",
+  "supersedes": null,
+  "superseded_by": null,
+  "words": 867
+ },
+ {
+  "doc_id": "dashboards-performance",
+  "title": "Dashboard Performance and Limits",
+  "audience": "customer",
+  "effective": "2024-12-05",
+  "supersedes": null,
+  "superseded_by": null,
+  "words": 896
+ },
+ {
+  "doc_id": "storage-quotas",
+  "title": "Storage Quotas and Backups",
+  "audience": "customer",
+  "effective": "2025-02-01",
+  "supersedes": null,
+  "superseded_by": null,
+  "words": 657
+ },
+ {
+  "doc_id": "notifications-alerting",
+  "title": "Notifications and Alert Routing",
+  "audience": "customer",
+  "effective": "2024-10-15",
+  "supersedes": null,
+  "superseded_by": null,
+  "words": 873
+ },
+ {
+  "doc_id": "admin-console",
+  "title": "Admin Console: Users, Audit Log and Allowlists",
+  "audience": "customer",
+  "effective": "2025-04-01",
+  "supersedes": null,
+  "superseded_by": null,
+  "words": 812
+ },
+ {
+  "doc_id": "mobile-app-support",
+  "title": "Mobile App Support",
+  "audience": "customer",
+  "effective": "2024-08-20",
+  "supersedes": null,
+  "superseded_by": null,
+  "words": 899
+ },
+ {
+  "doc_id": "gdpr-data-residency",
+  "title": "GDPR, Data Residency and Subprocessors",
+  "audience": "customer",
+  "effective": "2025-05-20",
+  "supersedes": null,
+  "superseded_by": null,
+  "words": 889
+ },
+ {
+  "doc_id": "support-hours-channels",
+  "title": "Support Hours and Channels",
+  "audience": "customer",
+  "effective": "2025-01-05",
+  "supersedes": null,
+  "superseded_by": null,
+  "words": 698
+ },
+ {
+  "doc_id": "refund-approval-internal",
+  "title": "Refund and Credit Approval Limits",
+  "audience": "internal",
+  "effective": "2025-06-01",
+  "supersedes": null,
+  "superseded_by": null,
+  "words": 806
+ },
+ {
+  "doc_id": "account-verification-internal",
+  "title": "Customer Identity Verification",
+  "audience": "internal",
+  "effective": "2025-02-15",
+  "supersedes": null,
+  "superseded_by": null,
+  "words": 827
+ },
+ {
+  "doc_id": "outage-communication",
+  "title": "Outage Communication Standards",
+  "audience": "customer",
+  "effective": "2025-03-01",
+  "supersedes": null,
+  "superseded_by": null,
+  "words": 793
+ },
+ {
+  "doc_id": "deprecations-2025",
+  "title": "Product and API Deprecations",
+  "audience": "customer",
+  "effective": "2025-07-01",
+  "supersedes": null,
+  "superseded_by": null,
+  "words": 740
+ },
+ {
+  "doc_id": "acceptable-use",
+  "title": "Acceptable Use Policy",
+  "audience": "customer",
+  "effective": "2024-06-01",
+  "supersedes": null,
+  "superseded_by": null,
+  "words": 899
+ }
+]

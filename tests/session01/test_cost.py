@@ -42,3 +42,17 @@ async def test_correlation_id_is_recorded_on_every_call(make_client):
     with bind_correlation_id("req-abc"):
         await client.complete("hello")
     assert client.meter.records[0].correlation_id == "req-abc"
+
+
+async def test_queued_calls_do_not_reserve_before_the_semaphore(make_client):
+    """800 queued calls must not hold 800 reservations. Only in-flight calls hold budget.
+    Found the hard way: the data generator queued 800 batches and the cap tripped at zero spend."""
+    provider = FakeProvider(delay_s=0.001, tokens_per_call=(10, 10))
+    # Cap allows about 15 in-flight reservations at max_tokens=1024 but far fewer than 800.
+    meter = CostMeter(cap_usd=15 * 0.0143)
+    client = make_client(provider, meter=meter, max_concurrency=4)
+
+    results = await client.map([f"q{i}" for i in range(800)])
+
+    assert len(results) == 800
+    assert provider.high_water <= 4

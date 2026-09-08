@@ -1,0 +1,1163 @@
+{
+ "aggregate": {
+  "n": 77,
+  "recall_at_k": 1.0,
+  "mrr": 0.9632034632034632,
+  "faithfulness": 0.975,
+  "faithfulness_n": 60,
+  "citation_validity": 1.0,
+  "refusal_correct": 0.974025974025974,
+  "must_refuse_caught": 16,
+  "latency_p50_ms": 2968.7992921099067,
+  "latency_p95_ms": 5057.654292322695,
+  "cost_usd_total": 6.110837,
+  "cost_usd_per_case": 0.07936151948051948
+ },
+ "results": [
+  {
+   "id": "a-admin-console#c2c790626a57",
+   "recall_at_k": 1.0,
+   "mrr": 0.3333333333333333,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 4211.537333205342,
+   "cost_usd": 0.054085,
+   "answer": "Audit log retention is 90 days on the Business plan and 400 days on the Enterprise plan.",
+   "citations": [
+    "admin-console#850513bc7ef1",
+    "admin-console#c2c790626a57"
+   ]
+  },
+  {
+   "id": "a-storage-quotas#50a53881f3b3",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 4192.216416820884,
+   "cost_usd": 0.096576,
+   "answer": "No, they will not lose access to existing files. When an account reaches 100 percent of its storage quota: (1) new file uploads are refused until storage is freed or the quota is increased, (2) scheduled backups are paused, with no new backup snapshots created while the account remains at capacity, and (3) existing data remains fully readable and accessible \u2014 customers can view, download, and export all stored files without interruption. Once usage falls back below 100 percent, either through deletion of data or a quota increase, uploads and backups resume automatically without requiring a support ticket.",
+   "citations": [
+    "storage-quotas#50a53881f3b3"
+   ]
+  },
+  {
+   "id": "a-sso-setup#6ad1eb132c51",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 3271.1024577729404,
+   "cost_usd": 0.063755,
+   "answer": "SAML signing certificates must be rotated every 12 months. Northwind Cloud sends automated warning emails to workspace administrators at two intervals before expiry: 30 days before expiry (a warning email recommending rotation be scheduled), and 7 days before expiry (a second, higher priority warning email).",
+   "citations": [
+    "sso-setup#6ad1eb132c51"
+   ]
+  },
+  {
+   "id": "a-data-retention#f99a64565dbb",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 3024.12545774132,
+   "cost_usd": 0.05849,
+   "answer": "Customers with questions about retention configuration, export procedures, legal hold status, or erasure requests should contact Northwind Cloud support through the account dashboard. Enterprise customers may also reach out through their assigned account contact for expedited handling of retention and deletion inquiries.",
+   "citations": [
+    "data-retention#f99a64565dbb"
+   ]
+  },
+  {
+   "id": "a-mobile-app-support#cbcee6ebcd4f",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 0.5,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 5062.854999676347,
+   "cost_usd": 0.130317,
+   "answer": "Northwind Cloud supports the last two major releases of iOS and the last two major releases of Android. As of the effective date of this policy (2024-08-20), that means the two most recent major iOS versions and the two most recent major Android versions are supported. When a new major OS version ships, the support window shifts forward automatically and the oldest supported version is retired. Northwind Cloud recommends keeping automatic OS updates enabled so your device stays within the supported range without manual action.",
+   "citations": [
+    "mobile-app-support#cbcee6ebcd4f"
+   ]
+  },
+  {
+   "id": "a-maintenance-windows#4182dd5401d2",
+   "recall_at_k": 1.0,
+   "mrr": 0.3333333333333333,
+   "faithfulness": null,
+   "citation_validity": 1.0,
+   "refused": true,
+   "refusal_correct": false,
+   "latency_ms": 85.74487501755357,
+   "cost_usd": 0.0,
+   "answer": "I cannot answer that from Northwind's current policies. Please contact support.",
+   "citations": []
+  },
+  {
+   "id": "a-dashboards-performance#f5ba5f69c14e",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 2844.0984589979053,
+   "cost_usd": 0.06954,
+   "answer": "No. Shareable dashboard links expire automatically after 7 days by default, and this default expiry period cannot be disabled. It can only be shortened or extended when creating the link, up to limits defined by the customer's plan.",
+   "citations": [
+    "dashboards-performance#f5ba5f69c14e"
+   ]
+  },
+  {
+   "id": "a-deprecations-2025#69fcfcbbb4ae",
+   "recall_at_k": 1.0,
+   "mrr": 0.5,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 3280.494499951601,
+   "cost_usd": 0.083456,
+   "answer": "Enterprise customers should route extension requests through their assigned Customer Success contact rather than general support, to ensure the request is logged against the correct account and reviewed within the required timelines. Additionally, the request must be submitted through the Enterprise support channel at least 30 days before the relevant sunset date.",
+   "citations": [
+    "deprecations-2025#69fcfcbbb4ae",
+    "deprecations-2025#136379ea1228"
+   ]
+  },
+  {
+   "id": "a-data-retention#3a6bf05b80dd",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 3354.8156660981476,
+   "cost_usd": 0.090546,
+   "answer": "Verified erasure requests are completed within 30 days of receipt. Erasure applies to primary storage, audit logs, and pipeline run logs, but residual copies in backup systems are removed through the standard 35 day backup rotation described in Section 3 (i.e., backups are retained for 35 days from creation and then automatically overwritten).",
+   "citations": [
+    "data-retention#3a6bf05b80dd",
+    "data-retention#09bb87c20c2a"
+   ]
+  },
+  {
+   "id": "a-plans-and-entitlements#f92d99ed14a1",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 2428.358333185315,
+   "cost_usd": 0.099966,
+   "answer": "The Plans, Seats and Entitlements policy, which covers seat counting, billing, and downgrade rules, is effective 2025-06-01 and applies to all customer accounts as of that date.",
+   "citations": [
+    "plans-and-entitlements#f92d99ed14a1"
+   ]
+  },
+  {
+   "id": "a-dashboards-performance#91c01bb0f82a",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 2497.216624673456,
+   "cost_usd": 0.08128200000000001,
+   "answer": "The Dashboard Performance and Limits document covers: widget capacity by plan, query timeouts, export constraints, external sharing rules, and caching.",
+   "citations": [
+    "dashboards-performance#91c01bb0f82a"
+   ]
+  },
+  {
+   "id": "a-sso-setup#adf44c22934f",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 2363.167833071202,
+   "cost_usd": 0.071552,
+   "answer": "The IdP's signing certificate must be exported in X.509 PEM format before uploading it to Northwind Cloud in the Security tab.",
+   "citations": [
+    "sso-setup#adf44c22934f"
+   ]
+  },
+  {
+   "id": "a-api-rate-limits#80ac06263142",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 4292.700041085482,
+   "cost_usd": 0.110644,
+   "answer": "This happens because per-workspace limits aggregate usage across all keys in a workspace using the same plan ceiling. If a workspace has multiple keys, the per-workspace limit becomes the binding constraint once combined traffic reaches the plan threshold, even if no single key has exceeded its own limit.",
+   "citations": [
+    "api-rate-limits#80ac06263142"
+   ]
+  },
+  {
+   "id": "a-mobile-app-support#c4032c8e7e29",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 4890.651459340006,
+   "cost_usd": 0.139866,
+   "answer": "If a device's OS is two major versions behind the latest, it falls outside the last two major releases and is considered unsupported. Since the device can't be updated, the recommended workaround is to access Northwind Cloud through a supported web browser instead, where all core features remain available. As for their bug ticket, support tickets related to bugs on unsupported devices may be closed with a recommendation to update the OS or device.",
+   "citations": [
+    "mobile-app-support#c4032c8e7e29",
+    "mobile-app-support#cbcee6ebcd4f"
+   ]
+  },
+  {
+   "id": "a-gdpr-data-residency#773f6e79800b",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 2968.7992921099067,
+   "cost_usd": 0.092379,
+   "answer": "Northwind Cloud will provide the requested data extract or confirmation within 30 days of receiving a complete and verified request. Yes, this timeline can be extended: Northwind Cloud may extend the 30 day period once, by up to 30 additional days, for requests of particular complexity, with written notice to the customer explaining the reason for delay.",
+   "citations": [
+    "gdpr-data-residency#773f6e79800b"
+   ]
+  },
+  {
+   "id": "a-mobile-app-support#45d88873cc50",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 3541.579166892916,
+   "cost_usd": 0.096809,
+   "answer": "The app falls back to requiring standard email and password sign in after 3 failed biometric login attempts in a row. Biometric login is disabled automatically if you sign out manually or if your session expires after 90 days of inactivity.",
+   "citations": [
+    "mobile-app-support#45d88873cc50"
+   ]
+  },
+  {
+   "id": "a-sso-setup#bac658f49260",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 2471.4611670933664,
+   "cost_usd": 0.075714,
+   "answer": "Northwind Cloud supports Single Sign-On (SSO) using SAML 2.0 and OpenID Connect (OIDC). SSO configuration is managed from Workspace Settings, under the Security tab, by a workspace administrator.",
+   "citations": [
+    "sso-setup#bac658f49260"
+   ]
+  },
+  {
+   "id": "a-data-retention#d5a26818bdd8",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 4247.072834055871,
+   "cost_usd": 0.121581,
+   "answer": "After account closure, deletion of all account data (primary storage, audit logs, and pipeline run logs) completes within 30 days of the closure date. During this 30 day window, the account is placed in a read-only state, meaning data cannot be modified but can be exported. Customers can use self-service export through the dashboard at any time during this 30 day read-only period following closure. After the 30 day window ends, data is not recoverable from production systems and exports can no longer be performed.",
+   "citations": [
+    "data-retention#d5a26818bdd8",
+    "data-retention#e9e6cef58b52"
+   ]
+  },
+  {
+   "id": "a-integrations-slack-jira#291880fec2ab",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 5057.654292322695,
+   "cost_usd": 0.135007,
+   "answer": "Duplicate Slack/Jira notifications are typically caused by one of four things: (1) multiple integration instances pointing to the same channel or project, often left over from a prior reinstallation; (2) webhook retries \u2014 if Slack or Jira does not acknowledge delivery within 5 seconds, Northwind retries the request once, which can produce a second message if the first delivery actually succeeded but the acknowledgment was delayed; (3) Jira automation rules that independently trigger on the same issue transition Northwind Cloud already posted about; or (4) manual re-triggering of an alert rule within 30 seconds of the original, which the deduplication window does not suppress. So yes, webhook retries can be a cause of duplicates. To reduce duplicates, remove unused integration instances under Settings > Integrations and confirm only one active connection exists per channel or project.",
+   "citations": [
+    "integrations-slack-jira#291880fec2ab"
+   ]
+  },
+  {
+   "id": "a-refunds-2025#dd6382ce7ffe",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 3461.4926669746637,
+   "cost_usd": 0.09573700000000002,
+   "answer": "Refunds up to and including 2,000 USD are approved by the Support team lead handling the request; refunds above 2,000 USD require Finance approval before processing. Once approved, refunds are processed and issued within 5 business days for duplicate charges, and within 10 business days for annual plan pro rata refunds and other approved cases.",
+   "citations": [
+    "refunds-2025#dd6382ce7ffe"
+   ]
+  },
+  {
+   "id": "a-storage-quotas#a27dc89b6d37",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 3285.015834029764,
+   "cost_usd": 0.11175400000000002,
+   "answer": "Northwind Cloud commits to processing emergency quota increase requests for Enterprise accounts within 4 hours of request submission.",
+   "citations": [
+    "storage-quotas#a27dc89b6d37",
+    "storage-quotas#77795a07a709"
+   ]
+  },
+  {
+   "id": "a-dashboards-performance#20c970d7c2d6",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 4073.1656248681247,
+   "cost_usd": 0.11285899999999999,
+   "answer": "All dashboard widget queries are subject to a 30 second timeout to protect shared infrastructure. If a query does not return results within 30 seconds, the widget displays a timeout error rather than partial or stale data \u2014 it does not just load slowly. Common causes include filtering across very large date ranges, combining several high-cardinality dimensions in a single widget, or running complex joins across multiple data sources within one widget.",
+   "citations": [
+    "dashboards-performance#20c970d7c2d6"
+   ]
+  },
+  {
+   "id": "a-mfa-policy#fbc69c9bc2ba",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 2166.096458211541,
+   "cost_usd": 0.07505900000000001,
+   "answer": "The Multi-Factor Authentication policy is effective 2024-11-01.",
+   "citations": [
+    "mfa-policy#fbc69c9bc2ba"
+   ]
+  },
+  {
+   "id": "a-sla-2025#eed4019adfa3",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 3300.670958124101,
+   "cost_usd": 0.12706000000000003,
+   "answer": "Monthly uptime reports are retained for 12 months, so customers can request reports going back up to that period. Disputes over the measurement data in those reports must be raised within 30 days of the end of the month in question, accompanied by supporting evidence such as timestamps and error logs.",
+   "citations": [
+    "sla-2025#eed4019adfa3"
+   ]
+  },
+  {
+   "id": "a-api-rate-limits#68afe1c6fb5c",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 2706.867791712284,
+   "cost_usd": 0.08851699999999998,
+   "answer": "A minimum of 12 months notice is given before any breaking change or endpoint sunset. During the notice period, affected endpoints return a Sunset header indicating the planned removal date, along with a Deprecation header confirming the endpoint is deprecated.",
+   "citations": [
+    "api-rate-limits#68afe1c6fb5c"
+   ]
+  },
+  {
+   "id": "a-refunds-2025#fc923d58423a",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 2420.355707872659,
+   "cost_usd": 0.08791300000000002,
+   "answer": "If a customer initiates a chargeback with their card issuer or bank instead of contacting Northwind Cloud directly, the account is flagged for review and access to paid features may be paused until the chargeback is resolved.",
+   "citations": [
+    "refunds-2025#fc923d58423a"
+   ]
+  },
+  {
+   "id": "a-integrations-slack-jira#f13735d3ce6d",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 2918.005249928683,
+   "cost_usd": 0.10025499999999998,
+   "answer": "Slack enforces API rate limits at the workspace level (50 API calls per minute, with a burst allowance of up to 20 requests before throttling). If your workspace exceeds these limits, Slack returns a 429 response and Northwind queues the alert for retry, delaying delivery by up to 60 seconds. Sustained high alert volume, such as more than 50 alerts per minute, may cause visible delays.",
+   "citations": [
+    "integrations-slack-jira#f13735d3ce6d"
+   ]
+  },
+  {
+   "id": "a-plans-and-entitlements#36896149d7d9",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 5088.072375394404,
+   "cost_usd": 0.12487899999999996,
+   "answer": "For tickets marked urgent, Enterprise priority support provides a 4 hour first response service level, compared to standard next business day response on Starter and Pro plans.",
+   "citations": [
+    "plans-and-entitlements#36896149d7d9"
+   ]
+  },
+  {
+   "id": "a-plans-and-entitlements#692e9f5a182c",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 3180.382207967341,
+   "cost_usd": 0.09716400000000003,
+   "answer": "No. When a seat is removed mid-cycle, proration is calculated daily up to the date the user is deactivated, but no credit is issued for partial-day usage on the deactivation date itself.",
+   "citations": [
+    "plans-and-entitlements#692e9f5a182c"
+   ]
+  },
+  {
+   "id": "a-sla-2025#8eae45b3d855",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 3530.230041127652,
+   "cost_usd": 0.10890899999999998,
+   "answer": "A shortfall of 2 percentage points falls within the \"1.01 to 3.0 percentage points\" band, which qualifies for a service credit of 10 percent of the monthly fee. Yes, there is a cap: total credits issued in any single month will not exceed 25 percent of that month's fee for the affected plan.",
+   "citations": [
+    "sla-2025#8eae45b3d855"
+   ]
+  },
+  {
+   "id": "a-customer-security-commitments#fe649093af86",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 2497.61616718024,
+   "cost_usd": 0.09740900000000002,
+   "answer": "Northwind Cloud engages an independent third-party firm to conduct penetration testing at least annually. Testing covers production application environments, API endpoints, and supporting infrastructure.",
+   "citations": [
+    "customer-security-commitments#fe649093af86"
+   ]
+  },
+  {
+   "id": "a-admin-console#3e62456917d3",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 3694.4260420277715,
+   "cost_usd": 0.09796400000000005,
+   "answer": "No. The IP allowlist and audit log retention period are exceptions that are always controlled at the parent workspace level and cannot be overridden by sub-workspace admins, in order to ensure consistent security posture across the account. Additionally, unlike other settings (which are snapshotted at sub-workspace creation and require manual updates), changes to the parent's allowlist and audit retention settings update everywhere immediately.",
+   "citations": [
+    "admin-console#3e62456917d3"
+   ]
+  },
+  {
+   "id": "a-maintenance-windows#a638924c0f82",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 0.5,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 4377.7984590269625,
+   "cost_usd": 0.23758899999999994,
+   "answer": "Northwind Cloud typically gives at least 24 hours notice before applying an emergency security patch, even outside the standard Sunday maintenance window. If an emergency patch requires downtime with less than 24 hours notice because of an active exploit, Northwind Cloud will provide a post incident report within a reasonable time after resolution, including the reason immediate action was required.",
+   "citations": [
+    "maintenance-windows#a638924c0f82",
+    "maintenance-windows#fe728c0b9909"
+   ]
+  },
+  {
+   "id": "a-acceptable-use#849c6045c7a7",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 2689.5634159445763,
+   "cost_usd": 0.09931299999999998,
+   "answer": "Enterprise plan customers may request up to 25 named user seats per workspace at no additional charge; additional seats are billed per the applicable order form. Service accounts used for automated integrations must be labeled clearly in the dashboard and reviewed at least once every 90 days.",
+   "citations": [
+    "acceptable-use#849c6045c7a7"
+   ]
+  },
+  {
+   "id": "a-support-hours-channels#1c4f0a26d678",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 3127.055916003883,
+   "cost_usd": 0.09693299999999999,
+   "answer": "German is supported on a best effort basis, subject to agent availability at the time the ticket is submitted. Customers requesting German language support should note this in the ticket subject line, so it can be routed to an available German speaking agent when possible.",
+   "citations": [
+    "support-hours-channels#1c4f0a26d678"
+   ]
+  },
+  {
+   "id": "a-admin-console#850513bc7ef1",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 2614.900541026145,
+   "cost_usd": 0.08904799999999996,
+   "answer": "Audit log retention is 90 days on the Business plan and 400 days on the Enterprise plan. CSV exports are limited to 100,000 rows per CSV request; larger date ranges should be pulled in multiple date-bounded exports.",
+   "citations": [
+    "admin-console#850513bc7ef1",
+    "admin-console#c2c790626a57"
+   ]
+  },
+  {
+   "id": "a-notifications-alerting#aa00f4b017d3",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 2674.5254998095334,
+   "cost_usd": 0.08631700000000003,
+   "answer": "No. Transactional emails cannot be unsubscribed, and this category explicitly includes billing confirmations (along with account security notices and service-critical alerts), regardless of notification preferences.",
+   "citations": [
+    "notifications-alerting#aa00f4b017d3"
+   ]
+  },
+  {
+   "id": "a-refunds-2025#aa4c8a6f902a",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 0.5,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 2345.471041277051,
+   "cost_usd": 0.14168299999999995,
+   "answer": "The current Refunds and Billing Disputes policy (effective 2025-06-01) replaces the refunds-2024 policy in full as of the effective date. Refund decisions are jointly managed by Finance and Support.",
+   "citations": [
+    "refunds-2025#aa4c8a6f902a"
+   ]
+  },
+  {
+   "id": "a-data-pipelines-ops#a04fc2b21c1b",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 3292.498250026256,
+   "cost_usd": 0.08871299999999999,
+   "answer": "For a Pro plan, the memory limit per transform is 8 GB. If a transform exceeds its limit, the run fails with an out-of-memory error and is subject to the standard retry policy.",
+   "citations": [
+    "data-pipelines-ops#a04fc2b21c1b"
+   ]
+  },
+  {
+   "id": "a-gdpr-data-residency#426fbd3e35aa",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 3367.6899168640375,
+   "cost_usd": 0.11346899999999993,
+   "answer": "For customers on EU Data Residency, all support engineer access to EU-resident customer environments is logged, capturing the identity of the accessing engineer, timestamp, and the specific resource accessed. Access logs are retained for 90 days and are available to customers on request.",
+   "citations": [
+    "gdpr-data-residency#426fbd3e35aa"
+   ]
+  },
+  {
+   "id": "a-gdpr-data-residency#3c257c0578bd",
+   "recall_at_k": 1.0,
+   "mrr": 0.5,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 3145.7242500036955,
+   "cost_usd": 0.11457700000000004,
+   "answer": "Northwind Cloud will notify affected customers within 72 hours of confirming the incident. Notification is sent to the primary security or administrative contact on file, and this is consistent with the terms of the DPA, which also states that Northwind Cloud will notify the affected customer within 72 hours of becoming aware of a confirmed personal data breach.",
+   "citations": [
+    "customer-security-commitments#89a4e518c60d",
+    "gdpr-data-residency#3c257c0578bd"
+   ]
+  },
+  {
+   "id": "a-plans-and-entitlements#731f984ece3f",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 3372.2571250982583,
+   "cost_usd": 0.10921399999999998,
+   "answer": "Audit log and data residency records accumulated on Enterprise are retained for 30 days after downgrade for export purposes, after which they may be deleted.",
+   "citations": [
+    "plans-and-entitlements#731f984ece3f"
+   ]
+  },
+  {
+   "id": "a-maintenance-windows#dc736283efdc",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 2798.732334282249,
+   "cost_usd": 0.08233000000000007,
+   "answer": "Customers with questions about a specific maintenance notice, or who need to request a change to a scheduled window for their environment, should contact their account team or open a support ticket referencing the maintenance notice date and affected services.",
+   "citations": [
+    "maintenance-windows#dc736283efdc"
+   ]
+  },
+  {
+   "id": "a-outage-communication#0df5e5fd63cc",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 2535.3492917492986,
+   "cost_usd": 0.09703,
+   "answer": "If the root cause remains under investigation at the time a report is due, the report should state this clearly and commit to a follow-up update. Reports also avoid speculative language once a root cause is confirmed.",
+   "citations": [
+    "outage-communication#0df5e5fd63cc"
+   ]
+  },
+  {
+   "id": "a-acceptable-use#3d6216d24402",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 2401.007833890617,
+   "cost_usd": 0.09628999999999999,
+   "answer": "No. The Acceptable Use Policy prohibits \"Reverse engineering, scraping, or reselling Northwind Cloud services without a written reseller agreement.\"",
+   "citations": [
+    "acceptable-use#3d6216d24402"
+   ]
+  },
+  {
+   "id": "a-acceptable-use#fe59cd4eca5d",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 3120.040750131011,
+   "cost_usd": 0.10770000000000002,
+   "answer": "Yes. The Acceptable Use Policy applies to every account regardless of plan tier (Starter, Growth, and Enterprise) and to every user, service account, or API key associated with that account, covering direct platform use as well as use through third-party applications connected via the API. It also explicitly governs access via the API, dashboard, and storage infrastructure for all customers, authorized users, and integrations.",
+   "citations": [
+    "acceptable-use#fe59cd4eca5d",
+    "acceptable-use#57b4e1098e01"
+   ]
+  },
+  {
+   "id": "a-mfa-policy#5856dd76341d",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 3168.334749992937,
+   "cost_usd": 0.10238600000000009,
+   "answer": "Because the account holds an owner role, a mandatory 24 hour cooling period is applied between identity verification and the actual MFA reset taking effect. This cooling period cannot be waived by support staff. During that time, if more than one admin exists, support will notify the workspace's other admins by email so a compromised request can be flagged and halted before the reset completes.",
+   "citations": [
+    "mfa-policy#5856dd76341d"
+   ]
+  },
+  {
+   "id": "a-sla-2025#5151f40fdc3c",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 2878.931417129934,
+   "cost_usd": 0.09247099999999997,
+   "answer": "The current Service Level Agreement (SLA) covers customers on the Starter, Pro, and Enterprise plans. It is effective 2025-03-01.",
+   "citations": [
+    "sla-2025#5151f40fdc3c"
+   ]
+  },
+  {
+   "id": "a-outage-communication#3009558c78dd",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 2281.783999875188,
+   "cost_usd": 0.07261099999999998,
+   "answer": "Northwind Cloud's Outage Communication Standards apply to all customers on the Starter, Growth, and Enterprise plans, with additional accommodations noted for Enterprise customers.",
+   "citations": [
+    "outage-communication#3009558c78dd"
+   ]
+  },
+  {
+   "id": "a-api-rate-limits#1b25724e3cf4",
+   "recall_at_k": 1.0,
+   "mrr": 0.5,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 3457.085208967328,
+   "cost_usd": 0.095422,
+   "answer": "When the API returns a 429 Too Many Requests response: 1) The response body includes an error code of rate_limited and a short description of which limit (per-key or per-workspace) was exceeded. 2) The response includes a Retry-After header, expressed in seconds, indicating the minimum wait time before the next request is likely to succeed. 3) Clients should implement exponential backoff on repeated 429 responses rather than retrying immediately, even if Retry-After suggests a short wait. 4) Repeated sustained 429 responses from a single key may trigger a temporary cooldown period on that key to protect overall API stability.",
+   "citations": [
+    "api-rate-limits#735c167e2680"
+   ]
+  },
+  {
+   "id": "s-sla-2025#5151f40fdc3c",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 2088.4270411916077,
+   "cost_usd": 0.07633699999999999,
+   "answer": "The current SLA covers the Starter, Pro, and Enterprise plans, and it is effective 2025-03-01.",
+   "citations": [
+    "sla-2025#5151f40fdc3c"
+   ]
+  },
+  {
+   "id": "s-sla-2025#da1136bde219",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 7577.01116707176,
+   "cost_usd": 0.18215099999999995,
+   "answer": "No, scheduled maintenance is excluded from downtime calculations and does not count against the uptime SLA, as long as proper notice is given. However, the two policy documents state different notice requirements: the SLA itself says Northwind Cloud must give 'at least 48 hours advance notice via email or the status page' for scheduled maintenance to be excluded, while the separate Scheduled Maintenance policy states that standard maintenance (performed within the Sunday 02:00 to 06:00 UTC window) is excluded only if 'the 7 day notice period was met,' and elsewhere specifies 'at least 7 days advance notice before the scheduled window.' These two stated notice periods (48 hours vs. 7 days) differ, so it's unclear which governs without further clarification.",
+   "citations": [
+    "sla-2025#da1136bde219",
+    "maintenance-windows#d08ddb6b9f54",
+    "maintenance-windows#fe728c0b9909"
+   ]
+  },
+  {
+   "id": "s-sla-2025#8eae45b3d855",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 3481.585499830544,
+   "cost_usd": 0.0887,
+   "answer": "A shortfall of 2 percentage points falls within the \"1.01 to 3.0 percentage points\" band, which entitles the customer to a service credit of 10 percent of the monthly fee. Yes, there is a cap: total credits issued in any single month will not exceed 25 percent of that month's fee for the affected plan.",
+   "citations": [
+    "sla-2025#8eae45b3d855"
+   ]
+  },
+  {
+   "id": "s-api-rate-limits#19eb898dd935",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 3039.3554172478616,
+   "cost_usd": 0.12020900000000001,
+   "answer": "The current API Rate Limits and Fair Use policy took effect on 2025-05-05. It supersedes the previous policy \"api-rate-limits-2024\".",
+   "citations": [
+    "api-rate-limits#19eb898dd935"
+   ]
+  },
+  {
+   "id": "s-api-rate-limits#6232767faaa3",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 2816.128958016634,
+   "cost_usd": 0.06635400000000002,
+   "answer": "Approved API rate limit increases are typically applied within 5 business days, and they are reflected automatically in the X-RateLimit-Limit header without requiring any change to your integration code.",
+   "citations": [
+    "api-rate-limits#6232767faaa3"
+   ]
+  },
+  {
+   "id": "p-cust-security-incident-response#171666239a43",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": null,
+   "citation_validity": 1.0,
+   "refused": true,
+   "refusal_correct": true,
+   "latency_ms": 61.562541872262955,
+   "cost_usd": 0.0,
+   "answer": "I cannot answer that from Northwind's current policies. Please contact support.",
+   "citations": []
+  },
+  {
+   "id": "p-int-security-incident-response#171666239a43",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 3084.213125053793,
+   "cost_usd": 0.09584899999999996,
+   "answer": "The 72 hour clock starts at the moment Northwind Cloud confirms that customer data was actually exposed to an unauthorized party, not at the moment of first suspicion. Before any customer-facing communication is drafted, containment must be confirmed with the security lead.",
+   "citations": [
+    "security-incident-response#dd5c7d530685",
+    "security-incident-response#171666239a43"
+   ]
+  },
+  {
+   "id": "p-cust-account-verification-internal#7da9161b36f2",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": null,
+   "citation_validity": 1.0,
+   "refused": true,
+   "refusal_correct": true,
+   "latency_ms": 52.12470795959234,
+   "cost_usd": 0.0,
+   "answer": "I cannot answer that from Northwind's current policies. Please contact support.",
+   "citations": []
+  },
+  {
+   "id": "p-int-account-verification-internal#7da9161b36f2",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 4775.5795000121,
+   "cost_usd": 0.13149,
+   "answer": "API key regeneration for Enterprise accounts requires Level 3 (High) verification. This means: Level 2 proof (verified email plus answer to one account fact, plus a one-time verification code sent to the primary admin email or phone on file) PLUS a callback to a phone number verified in the account record at least 30 days prior, AND Team Lead approval. Beyond standard Level 3 proof, Enterprise accounts have an extra requirement: the customer's designated security contact must be copied on any Level 3 action.",
+   "citations": [
+    "account-verification-internal#7da9161b36f2"
+   ]
+  },
+  {
+   "id": "p-cust-security-incident-response#b52090fae622",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": null,
+   "citation_validity": 1.0,
+   "refused": true,
+   "refusal_correct": true,
+   "latency_ms": 53.44462534412742,
+   "cost_usd": 0.0,
+   "answer": "I cannot answer that from Northwind's current policies. Please contact support.",
+   "citations": []
+  },
+  {
+   "id": "p-int-security-incident-response#b52090fae622",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 3228.247375227511,
+   "cost_usd": 0.09079400000000004,
+   "answer": "Before the security lead approves a statement, support staff may: (1) Acknowledge that Northwind Cloud is investigating a reported issue and that the team takes it seriously; (2) Confirm that a ticket has been opened and provide a ticket number for tracking; and (3) Tell the customer they will receive updates as information becomes available. They must never confirm a breach has occurred, share identifying details of other customers, speculate about root cause, scope, or timeline, or promise specific remediation actions or compensation without sign-off. Detailed questions should be redirected to the incident communication channel rather than answered directly.",
+   "citations": [
+    "security-incident-response#b52090fae622"
+   ]
+  },
+  {
+   "id": "p-cust-refund-approval-internal#54eed045c442",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": null,
+   "citation_validity": 1.0,
+   "refused": true,
+   "refusal_correct": true,
+   "latency_ms": 50.822833087295294,
+   "cost_usd": 0.0,
+   "answer": "I cannot answer that from Northwind's current policies. Please contact support.",
+   "citations": []
+  },
+  {
+   "id": "p-int-refund-approval-internal#54eed045c442",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 3464.2447088845074,
+   "cost_usd": 0.08977400000000002,
+   "answer": "Every refund or credit, regardless of amount, must be logged in the ticket with the transaction ID, amount, approver, and reason.",
+   "citations": [
+    "refund-approval-internal#54eed045c442"
+   ]
+  },
+  {
+   "id": "p-cust-account-verification-internal#a5725f163614",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": false,
+   "latency_ms": 7968.994332943112,
+   "cost_usd": 0.12765500000000007,
+   "answer": "For an MFA reset, Support must perform identity verification before proceeding: confirming the account email address, verifying at least two account details on file (such as workspace name, billing contact, or last login location), and, where available, matching the request against previously registered contact information. If the account holds an admin or owner role, a mandatory 24 hour cooling period is then applied between identity verification and the reset taking effect (mfa-policy#5856dd76341d). The provided context does not address a general requirement for Billing or Customer Success staff before 'sharing account data,' nor does it state whether this policy's contents may be shared with a customer, so that part is not answerable from the given passages.",
+   "citations": [
+    "mfa-policy#5856dd76341d"
+   ]
+  },
+  {
+   "id": "p-int-account-verification-internal#a5725f163614",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": 1.0,
+   "citation_validity": 1.0,
+   "refused": false,
+   "refusal_correct": true,
+   "latency_ms": 4317.6393751055,
+   "cost_usd": 0.08859799999999995,
+   "answer": "Support, Billing, and Customer Success staff must verify the requester's identity before changing account settings, resetting MFA, or sharing any account data. This account-verification-internal policy is INTERNAL and must never be quoted, paraphrased, or forwarded to customers. If a customer asks why a request was denied, staff must use only the approved script in the Denial Language section.",
+   "citations": [
+    "account-verification-internal#a5725f163614"
+   ]
+  },
+  {
+   "id": "u-00",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": null,
+   "citation_validity": 1.0,
+   "refused": true,
+   "refusal_correct": true,
+   "latency_ms": 62.92637484148145,
+   "cost_usd": 0.0,
+   "answer": "I cannot answer that from Northwind's current policies. Please contact support.",
+   "citations": []
+  },
+  {
+   "id": "u-01",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": null,
+   "citation_validity": 1.0,
+   "refused": true,
+   "refusal_correct": true,
+   "latency_ms": 41.70250007882714,
+   "cost_usd": 0.0,
+   "answer": "I cannot answer that from Northwind's current policies. Please contact support.",
+   "citations": []
+  },
+  {
+   "id": "u-02",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": null,
+   "citation_validity": 1.0,
+   "refused": true,
+   "refusal_correct": true,
+   "latency_ms": 45.166542287915945,
+   "cost_usd": 0.0,
+   "answer": "I cannot answer that from Northwind's current policies. Please contact support.",
+   "citations": []
+  },
+  {
+   "id": "u-03",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": null,
+   "citation_validity": 1.0,
+   "refused": true,
+   "refusal_correct": true,
+   "latency_ms": 1845.5832921899855,
+   "cost_usd": 0.03278599999999998,
+   "answer": "I cannot answer that from Northwind's current policies. Please contact support.",
+   "citations": []
+  },
+  {
+   "id": "u-04",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": null,
+   "citation_validity": 1.0,
+   "refused": true,
+   "refusal_correct": true,
+   "latency_ms": 49.02629181742668,
+   "cost_usd": 0.0,
+   "answer": "I cannot answer that from Northwind's current policies. Please contact support.",
+   "citations": []
+  },
+  {
+   "id": "u-05",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": null,
+   "citation_validity": 1.0,
+   "refused": true,
+   "refusal_correct": true,
+   "latency_ms": 39.85262522473931,
+   "cost_usd": 0.0,
+   "answer": "I cannot answer that from Northwind's current policies. Please contact support.",
+   "citations": []
+  },
+  {
+   "id": "u-06",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": null,
+   "citation_validity": 1.0,
+   "refused": true,
+   "refusal_correct": true,
+   "latency_ms": 49.42504223436117,
+   "cost_usd": 0.0,
+   "answer": "I cannot answer that from Northwind's current policies. Please contact support.",
+   "citations": []
+  },
+  {
+   "id": "u-07",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": null,
+   "citation_validity": 1.0,
+   "refused": true,
+   "refusal_correct": true,
+   "latency_ms": 209.29766725748777,
+   "cost_usd": 0.0,
+   "answer": "I cannot answer that from Northwind's current policies. Please contact support.",
+   "citations": []
+  },
+  {
+   "id": "u-08",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": null,
+   "citation_validity": 1.0,
+   "refused": true,
+   "refusal_correct": true,
+   "latency_ms": 41.29108274355531,
+   "cost_usd": 0.0,
+   "answer": "I cannot answer that from Northwind's current policies. Please contact support.",
+   "citations": []
+  },
+  {
+   "id": "u-09",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": null,
+   "citation_validity": 1.0,
+   "refused": true,
+   "refusal_correct": true,
+   "latency_ms": 40.16304202377796,
+   "cost_usd": 0.0,
+   "answer": "I cannot answer that from Northwind's current policies. Please contact support.",
+   "citations": []
+  },
+  {
+   "id": "u-10",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": null,
+   "citation_validity": 1.0,
+   "refused": true,
+   "refusal_correct": true,
+   "latency_ms": 49.22745889052749,
+   "cost_usd": 0.0,
+   "answer": "I cannot answer that from Northwind's current policies. Please contact support.",
+   "citations": []
+  },
+  {
+   "id": "u-11",
+   "recall_at_k": 1.0,
+   "mrr": 1.0,
+   "faithfulness": null,
+   "citation_validity": 1.0,
+   "refused": true,
+   "refusal_correct": true,
+   "latency_ms": 47.72991593927145,
+   "cost_usd": 0.0,
+   "answer": "I cannot answer that from Northwind's current policies. Please contact support.",
+   "citations": []
+  }
+ ],
+ "config": {
+  "golden": "data/golden/policy_qa.jsonl",
+  "index": "artifacts/policy",
+  "chunks": "artifacts/policy/chunks.jsonl",
+  "baseline": "data/golden/baseline.json",
+  "out": "artifacts/policy/eval.json",
+  "k": 8,
+  "min_score": 0.0,
+  "hybrid": true,
+  "rerank": true
+ }
+}

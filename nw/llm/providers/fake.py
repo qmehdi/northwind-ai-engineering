@@ -57,7 +57,8 @@ class FakeProvider:
             "temperature": temperature,
             "index": index,
         }
-        self.calls.append({"messages": messages, **kwargs})
+        # Snapshot: callers may mutate their message list after the call (an agent loop does).
+        self.calls.append({"messages": list(messages), **kwargs})
         self.in_flight += 1
         self.high_water = max(self.high_water, self.in_flight)
         started = time.perf_counter()

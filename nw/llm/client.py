@@ -85,9 +85,11 @@ class LLMClient:
         """One completion, with concurrency limiting, retries, and metering.
 
         Order of operations matters:
-        1. Reserve budget on the meter (raises SpendCapExceeded before any network).
-        2. Take the semaphore, then call the provider under `_with_retries`.
-        3. Release the reservation, record the real cost, log one line.
+        1. Take the semaphore. Only calls that are about to go on the wire hold budget;
+           a thousand queued calls must not reserve a thousand times the estimate.
+        2. Reserve budget on the meter (raises SpendCapExceeded before any network).
+        3. Call the provider under `_with_retries`.
+        4. Release the reservation, record the real cost, log one line.
         """
         raise NotImplementedError("Session 1, Step 2: semaphore, retries, metering")
 
