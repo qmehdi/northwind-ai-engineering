@@ -21,4 +21,4 @@ Read `CONTEXT.md` first for the vocabulary. This file is how to work in the repo
 
 ## Working with the agent
 
-The room standardises on the `techwithshadab/skills` skill set, installed in Session 1. Use `/tdd` for the red-to-green exercises, `/code-review` against the session's acceptance criteria, `/diagnosing-bugs` when something spins, and `/session-check` before you call a session done.
+The room standardises on the `techwithshadab/claude-skills` skill set, installed in Session 1. Use `/tdd` for the red-to-green exercises, `/code-review` against the session's acceptance criteria, `/diagnosing-bugs` when something spins, and `/session-check` before you call a session done.
