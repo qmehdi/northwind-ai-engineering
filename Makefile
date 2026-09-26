@@ -14,8 +14,8 @@ fmt:
 	uv run ruff format .
 	uv run ruff check --fix .
 
-test:             ## Every test that runs without cloud credentials
-	uv run pytest -q -m "not live"
+test:             ## The tests this checkout is expected to pass (the skeleton list if present, else everything offline)
+	@if [ -f tests/skeleton-green.txt ]; then uv run pytest -q $$(cat tests/skeleton-green.txt); else uv run pytest -q -m "not live"; fi
 
 preflight:        ## Verify the machine and, for aws or gcp tracks, one model round trip
 	uv run python scripts/preflight.py

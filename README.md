@@ -37,6 +37,7 @@ make preflight            # paste the table into the cohort channel
 - Nothing outside `nw/llm/providers/` imports a cloud SDK.
 - Every service emits structured JSON logs with a correlation ID, and meters its model spend.
 - Tests never need a cloud account. Anything that spends money is marked `live`.
+- The exercise tests are red until you do the exercise. `make test` and CI run only the tests the skeleton is expected to pass (`tests/skeleton-green.txt`); `make sessionNN` is how you check your own progress.
 - Agent-written code is held to the same bar as anything else: it passes the tests or it does not go in.
 
 ## Solutions
