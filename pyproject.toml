@@ -32,7 +32,7 @@ dl = [
     "safetensors>=0.4",
 ]
 agents = [
-    "mcp>=1.10",
+    "mcp>=1.10,<2",
 ]
 agents-aws = [
     "strands-agents>=1.0",
