@@ -1,0 +1,54 @@
+# The Session 4 regression gate, run on demand against a real track. It needs cloud
+# credentials, so it is never part of the push CI: configure an OIDC role for GitHub
+# Actions in your account and store its ARN as the repository secret AWS_ROLE_ARN
+# (or GCP_WORKLOAD_IDENTITY_PROVIDER and GCP_SERVICE_ACCOUNT for the gcp track).
+name: eval-gate
+on:
+  workflow_dispatch:
+    inputs:
+      track:
+        description: aws or gcp
+        default: aws
+        type: choice
+        options: [aws, gcp]
+      judge:
+        description: run the faithfulness judge (about 6 USD) or retrieval-only
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv python install 3.12
+      - run: uv sync --locked --extra dev --extra dl
+      - if: inputs.track == 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+      - if: inputs.track == 'gcp'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - name: Build the policy index
+        run: uv run python -m nw.policy.build_index
+      - name: Run the golden set and apply the gate
+        env:
+          NW_TRACK: ${{ inputs.track }}
+          NW_AWS_REGION: us-east-1
+          NW_GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+          NW_SPEND_CAP_USD: "12"
+        run: |
+          if [ "${{ inputs.judge }}" = "true" ]; then uv run python -m nw.policy.evaluate; else uv run python -m nw.policy.evaluate --no-judge; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: policy-eval
+          path: artifacts/policy/eval.json

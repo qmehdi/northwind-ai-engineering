@@ -21,6 +21,7 @@ from nw.config import ModelRole
 from nw.llm import LLMClient
 from nw.llm.types import Completion, StopReason, ToolCall
 from nw.logging import correlation_id, get_logger, log_fields
+from nw.telemetry import span
 
 log = get_logger("nw.agent.loop")
 
@@ -45,6 +46,42 @@ the policy or the priority calls for it."""
 
 
 async def run_agent(
+    task: str,
+    registry: ToolRegistry,
+    client: LLMClient,
+    *,
+    system: str = SYSTEM_RULES,
+    max_steps: int = 10,
+    budget_usd: float = 0.25,
+    role: ModelRole = ModelRole.WORKHORSE,
+    approval: ApprovalPolicy = never_approve,
+    agent_name: str = "resolver",
+    max_tokens: int = 1024,
+    screener: Screener | None = None,
+) -> Trajectory:
+    """One span per run so the whole trajectory reads as a tree in the trace viewer."""
+    with span("agent.run", **{"nw.agent": agent_name}) as run_span:
+        t = await _run_agent(
+            task,
+            registry,
+            client,
+            system=system,
+            max_steps=max_steps,
+            budget_usd=budget_usd,
+            role=role,
+            approval=approval,
+            agent_name=agent_name,
+            max_tokens=max_tokens,
+            screener=screener,
+        )
+        run_span.set_attribute("nw.run_id", t.run_id)
+        run_span.set_attribute("nw.terminated", t.terminated.value)
+        run_span.set_attribute("nw.steps", len(t.steps))
+        run_span.set_attribute("nw.cost_usd", t.cost_usd)
+        return t
+
+
+async def _run_agent(
     task: str,
     registry: ToolRegistry,
     client: LLMClient,

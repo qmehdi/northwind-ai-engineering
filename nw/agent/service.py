@@ -28,10 +28,12 @@ from nw.agent.orchestrator import (
     run_specialist,
 )
 from nw.agent.tools import ToolRegistry
+from nw.auth import install_api_key
 from nw.config import settings
 from nw.llm import LLMClient
 from nw.llm.providers import make_provider
 from nw.logging import bind_correlation_id, configure_logging, get_logger, log_fields
+from nw.telemetry import configure_tracing, instrument_app
 
 log = get_logger("nw.agent.service")
 RUNS = Counter("nw_agent_runs_total", "Agent runs", ["role", "terminated"])
@@ -90,6 +92,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Northwind agent", version="1.0", lifespan=lifespan)
+install_api_key(app)
+configure_tracing("northwind-agent")
+instrument_app(app)
 
 
 @app.middleware("http")

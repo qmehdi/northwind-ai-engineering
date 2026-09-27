@@ -43,3 +43,15 @@ make preflight            # paste the table into the cohort channel
 ## Solutions
 
 After each session, that session's solution is published on the branch `solutions/session-NN`.
+
+## Data and licence
+
+Every ticket, account and policy document here is synthetic, generated for the course; nothing is real customer data. The ticket schema and label mix are modelled on the public Hugging Face dataset Tobi-Bueck/customer-support-tickets (CC BY-NC 4.0), of which no rows are shipped. See `data/README.md`.
+
+The code is MIT licensed (`LICENSE`). The course material is for the cohort's use.
+
+## Getting help
+
+- The guide's Reference tab for each session explains the why; the step's "What to expect" block tells you what right looks like.
+- `/session-check N` in your coding agent reads your checkout against the session's acceptance criteria.
+- Open an issue on this repository for anything broken in the skeleton; bring anything else to the cohort channel.

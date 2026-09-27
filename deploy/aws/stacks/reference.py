@@ -198,6 +198,7 @@ class ReferenceStack(Stack):
             )
         )
         runtime_role.add_to_policy(bedrock_invoke_policy(self))
+        self.path.api_key.grant_read(runtime_role)
         runtime_role.add_to_policy(
             iam.PolicyStatement(
                 sid="ApplyGuardrail",
@@ -230,6 +231,8 @@ class ReferenceStack(Stack):
             "NW_GUARDRAIL_VERSION": guardrail_version.attr_version,
             "NW_VECTOR_BUCKET": vector_bucket.vector_bucket_name,
             "NW_VECTOR_INDEX": "policy-chunks",
+            "NW_API_KEY_SECRET_ARN": self.path.api_key.secret_arn,
+            "NW_TRACE_EXPORT": "xray",
         }
         tools_runtime = ac.CfnRuntime(
             self,

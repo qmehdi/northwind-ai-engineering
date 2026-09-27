@@ -1,5 +1,4 @@
 aws-cdk-lib>=2.268,<3
-aws-cdk.aws-apprunner-alpha>=2.268.0a0
 cdk-nag>=2.35,<3
 constructs>=10.3
 pytest>=8

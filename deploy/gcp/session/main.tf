@@ -14,11 +14,32 @@ locals {
 }
 
 resource "google_project_service" "apis" {
-  for_each = toset(["run.googleapis.com", "artifactregistry.googleapis.com", "aiplatform.googleapis.com", "monitoring.googleapis.com", "cloudtrace.googleapis.com", "logging.googleapis.com", "billingbudgets.googleapis.com"])
+  for_each = toset(["run.googleapis.com", "artifactregistry.googleapis.com", "aiplatform.googleapis.com", "monitoring.googleapis.com", "cloudtrace.googleapis.com", "logging.googleapis.com", "billingbudgets.googleapis.com", "secretmanager.googleapis.com"])
   project  = var.project
   service  = each.value
 
   disable_on_destroy = false
+}
+
+# One API key for the cohort's services, generated here and never written to a file or an
+# image. `terraform output -raw api_key` prints it once for the curl commands in the guide.
+resource "random_password" "api_key" {
+  length  = 40
+  special = false
+}
+
+resource "google_secret_manager_secret" "api_key" {
+  project   = var.project
+  secret_id = "northwind-api-key"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret_version" "api_key" {
+  secret      = google_secret_manager_secret.api_key.id
+  secret_data = random_password.api_key.result
 }
 
 resource "google_artifact_registry_repository" "images" {
@@ -30,18 +51,19 @@ resource "google_artifact_registry_repository" "images" {
 }
 
 module "service" {
-  for_each      = local.services
-  source        = "../modules/service"
-  name          = each.key
-  project       = var.project
-  region        = var.region
-  image         = "${local.registry}/nw-${each.key}:${var.image_tag}"
-  cpu           = each.value.cpu
-  memory        = each.value.memory
-  invoke_models = each.value.models
-  env           = each.value.env
-  public        = each.key == "agent"
-  depends_on    = [google_artifact_registry_repository.images]
+  for_each       = local.services
+  source         = "../modules/service"
+  name           = each.key
+  project        = var.project
+  region         = var.region
+  image          = "${local.registry}/nw-${each.key}:${var.image_tag}"
+  cpu            = each.value.cpu
+  memory         = each.value.memory
+  invoke_models  = each.value.models
+  env            = each.value.env
+  public         = true
+  api_key_secret = google_secret_manager_secret.api_key.secret_id
+  depends_on     = [google_artifact_registry_repository.images, google_secret_manager_secret_version.api_key]
 }
 
 # ----- observability ------------------------------------------------------------
@@ -161,3 +183,7 @@ resource "google_billing_budget" "monthly" {
 }
 
 output "urls" { value = { for k, m in module.service : k => m.url } }
+output "api_key" {
+  value     = random_password.api_key.result
+  sensitive = true
+}

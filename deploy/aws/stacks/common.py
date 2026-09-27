@@ -4,9 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from aws_cdk import Duration, Stack
+from aws_cdk import Stack
 from aws_cdk import aws_budgets as budgets
-from aws_cdk import aws_cloudwatch as cw
 from aws_cdk import aws_ecr_assets as ecr_assets
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_sns as sns
@@ -121,104 +120,3 @@ def monthly_budget(scope: Construct, *, limit_usd: float, email: str | None) -> 
         ),
         notifications_with_subscribers=notifications or None,
     )
-
-
-def service_alarms(scope: Construct, service_name: str, topic: sns.Topic) -> list[cw.Alarm]:
-    """App Runner emits 5xxStatusResponses, RequestLatency and ActiveInstances per service."""
-    dims = {"ServiceName": service_name}
-    errors = cw.Alarm(
-        scope,
-        f"Alarm5xx{service_name}",
-        metric=cw.Metric(
-            namespace="AWS/AppRunner",
-            metric_name="5xxStatusResponses",
-            dimensions_map=dims,
-            statistic="Sum",
-            period=Duration.minutes(5),
-        ),
-        threshold=5,
-        evaluation_periods=2,
-        alarm_description=f"{service_name}: more than 5 server errors in 5 minutes, twice",
-        treat_missing_data=cw.TreatMissingData.NOT_BREACHING,
-    )
-    latency = cw.Alarm(
-        scope,
-        f"AlarmLatency{service_name}",
-        metric=cw.Metric(
-            namespace="AWS/AppRunner",
-            metric_name="RequestLatency",
-            dimensions_map=dims,
-            statistic="p95",
-            period=Duration.minutes(5),
-        ),
-        threshold=8000,
-        evaluation_periods=3,
-        alarm_description=f"{service_name}: p95 latency above 8 seconds for 15 minutes",
-        treat_missing_data=cw.TreatMissingData.NOT_BREACHING,
-    )
-    for a in (errors, latency):
-        a.add_alarm_action(
-            __import__("aws_cdk.aws_cloudwatch_actions", fromlist=["SnsAction"]).SnsAction(topic)
-        )
-    return [errors, latency]
-
-
-def dashboard(scope: Construct, service_names: list[str]) -> cw.Dashboard:
-    board = cw.Dashboard(scope, "Dashboard", dashboard_name="northwind")
-    for name in service_names:
-        dims = {"ServiceName": name}
-        board.add_widgets(
-            cw.GraphWidget(
-                title=f"{name} requests and errors",
-                left=[
-                    cw.Metric(
-                        namespace="AWS/AppRunner",
-                        metric_name="Requests",
-                        dimensions_map=dims,
-                        statistic="Sum",
-                    ),
-                    cw.Metric(
-                        namespace="AWS/AppRunner",
-                        metric_name="5xxStatusResponses",
-                        dimensions_map=dims,
-                        statistic="Sum",
-                    ),
-                ],
-            ),
-            cw.GraphWidget(
-                title=f"{name} latency p50 p95",
-                left=[
-                    cw.Metric(
-                        namespace="AWS/AppRunner",
-                        metric_name="RequestLatency",
-                        dimensions_map=dims,
-                        statistic="p50",
-                    ),
-                    cw.Metric(
-                        namespace="AWS/AppRunner",
-                        metric_name="RequestLatency",
-                        dimensions_map=dims,
-                        statistic="p95",
-                    ),
-                ],
-            ),
-        )
-    board.add_widgets(
-        cw.GraphWidget(
-            title="Bedrock tokens",
-            left=[
-                cw.Metric(namespace="AWS/Bedrock", metric_name="InputTokenCount", statistic="Sum"),
-                cw.Metric(namespace="AWS/Bedrock", metric_name="OutputTokenCount", statistic="Sum"),
-            ],
-        ),
-        cw.GraphWidget(
-            title="Bedrock invocations and throttles",
-            left=[
-                cw.Metric(namespace="AWS/Bedrock", metric_name="Invocations", statistic="Sum"),
-                cw.Metric(
-                    namespace="AWS/Bedrock", metric_name="InvocationThrottles", statistic="Sum"
-                ),
-            ],
-        ),
-    )
-    return board

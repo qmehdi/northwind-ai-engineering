@@ -1,6 +1,6 @@
 # Cost sheet
 
-Every figure is an estimate from vendor list prices fetched on 2026-09-08 (see the instructor research notes for sources) and must be replaced by the measured figure after the validation run. Model prices: Bedrock global endpoint prices for the AWS track (Sonnet 5 is 3.00 and 15.00 USD per million tokens since 2026-09-01, when launch pricing ended; Opus 5 at 5.00 and 25.00; Haiku 4.5 at 1.00 and 5.00) and first-party list prices for Vertex. The AWS figures below are about 40 percent higher than the same runs on the launch price. Assumptions: cohort of 25, six sessions, us-east-1 and us-central1, participants run in their own accounts.
+Every figure is an estimate from vendor list prices fetched on 2026-09-08 and 2026-09-27 (see the instructor research notes for sources) and must be replaced by the measured figure after the validation run. Model prices: Bedrock global endpoint prices for the AWS track (Sonnet 5 is 3.00 and 15.00 USD per million tokens since 2026-09-01, when launch pricing ended; Opus 5 at 5.00 and 25.00; Haiku 4.5 at 1.00 and 5.00) and first-party list prices for Vertex. The AWS figures below are about 40 percent higher than the same runs on the launch price. Assumptions: cohort of 25, six sessions, us-east-1 and us-central1, participants run in their own accounts.
 
 ## Model spend, both tracks
 
@@ -23,34 +23,38 @@ The Session 1 spend cap of 10 USD per session is set in `.env`; the Session 4 ju
 
 | Item | Rate | Assumption | Cost |
 | --- | --- | --- | --- |
-| App Runner, 4 services, provisioned memory | 0.007 USD per GB-hour | 2, 3, 3, 4 GB, always provisioned | 0.084 USD per hour |
-| App Runner, active compute during the session | 0.064 USD per vCPU-hour | 5 vCPU active 2 hours | 0.64 USD |
+| Lambda compute, arm64 | 0.0000133334 USD per GB-second | about 5,400 GB-seconds: agent 8 GB, policy and semantic 4 GB, triage 2 GB, four cold starts, 50 routed tickets | 0.07 USD, inside the 400,000 GB-second free tier |
+| Lambda requests | 0.20 USD per million | a few hundred | 0 |
+| Ephemeral storage above 512 MB | 0.0000000309 USD per GB-second | 1 GB configured | under 0.01 USD |
 | ECR storage | 0.10 USD per GB-month | about 4 GB of images | 0.40 USD per month |
-| CloudWatch, X-Ray, SNS, Budgets | free tier | | 0 |
-| **During the 2-hour session** | | | **about 0.85 USD** |
-| **Idle per day if left running** | | | **2.0 USD** |
-| **Idle per month if left running** | | | **61 USD** |
-| After `make stop` (services deleted, images kept) | | | 0.40 USD per month |
+| Secrets Manager, the API key | 0.40 USD per secret per month, 0.05 USD per 10,000 calls | one secret, read once per cold start | 0.40 USD per month |
+| X-Ray with Transaction Search | 0.35 USD per GB of spans, 1 percent indexed free, 100,000 traces free per month | a few MB | 0 |
+| CloudWatch Logs, dashboard, alarms, SNS, Budgets | free tier | | 0 |
+| **During the 2-hour session** | | | **under 0.10 USD** |
+| **Idle per day if left running** | | Lambda bills nothing idle; images and the secret | **0.03 USD** |
+| **Idle per month if left running** | | | **about 0.80 USD** |
+| After `make stop` (reserved concurrency 0) | | | about 0.80 USD per month |
 | After `make destroy` | | | 0 |
+| Always warm instead: provisioned concurrency on the agent | 0.0000041667 USD per GB-second | 8 GB, one instance, all day | 0.12 USD per hour, about 2.90 USD per day, about 88 USD per month |
 
-Credit to request per participant for the AWS track: 20 USD of model spend plus 10 USD of App Runner headroom, **30 USD**, assuming they destroy after the session. Say that in the pre-session message.
+Credit to request per participant for the AWS track: 20 USD of model spend plus 5 USD headroom, **25 USD**, assuming they destroy after the session. Say that in the pre-session message. App Runner, the service this path used first, is closed to new customers; ECS Express Mode is the always-warm alternative and would add about 1.20 USD per day for four small Fargate tasks plus the load balancer.
 
 ### Reference stack (deployed once, shown by the instructor)
 
 | Item | Rate | Assumption | Cost |
 | --- | --- | --- | --- |
-| Session path services | as above | | 2.0 USD per day idle |
+| Session path functions | as above | | 0.03 USD per day idle |
 | AgentCore Runtime, 2 runtimes | 0.0895 USD per vCPU-hour active, 0.00945 per GB-hour | billed per second only while a session is active; 1 hour of demos a day at 1 vCPU 2 GB each | 0.22 USD per day |
 | AgentCore Gateway | 0.005 USD per 1,000 invocations, 0.02 USD per 100 tools per month | 1,000 calls per day, 7 tools | 0.005 USD per day plus 0.02 USD per month |
 | Policy engine | 0.000025 USD per authorization | 1,000 per day | 0.025 USD per day |
 | Bedrock Guardrails | 0.15 USD per 1,000 text units for prompt attack, 0.10 for PII and grounding | 1,000 requests per day, 2 units each | 0.70 USD per day |
 | S3 Vectors | 0.06 USD per GB-month, 2.50 USD per million queries | 212 chunks, 1,000 queries per day | under 0.01 USD per day |
-| CloudWatch Logs with Transaction Search | 0.50 USD per GB ingested | 200 MB per day | 0.10 USD per day |
+| Spans through Transaction Search | 0.35 USD per GB ingested, 1 percent indexed free | 200 MB per day | 0.07 USD per day |
 | **Upfront** | | ECR push, guardrail version | 0 |
 | **One end-to-end validation run** | | deploy, 15 adversarial tickets through the gateway, demo, destroy same day | **about 3 USD plus model spend, about 5 USD** |
-| **Per day, demos only** | | | **about 3 USD** |
-| **Per month if left running** | | | **about 95 USD**, of which 61 is the App Runner provisioned memory |
-| After `make stop` | App Runner services deleted, runtimes idle bill nothing | | under 1 USD per month |
+| **Per day, demos only** | | | **about 1 USD** |
+| **Per month if left running** | | | **about 35 USD**, most of it the guardrail at demo volume |
+| After `make stop` | functions refuse invocations, runtimes idle bill nothing | | under 1 USD per month |
 | After `make destroy` | | | 0 |
 
 Argus, the reference project this course borrows from, cost about 400 USD a month idle because of an always-on Fargate observability stack and Aurora. This stack has neither: observability is native and retrieval is S3 Vectors.

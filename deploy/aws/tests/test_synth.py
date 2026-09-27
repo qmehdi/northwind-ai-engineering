@@ -3,6 +3,7 @@ otherwise teach us one rollback at a time."""
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -17,6 +18,7 @@ os.environ.setdefault("JSII_SILENCE_WARNING_DEPRECATED_NODE_VERSION", "1")
 
 def synth(tier: str) -> dict:
     out = HERE / "cdk.out.test" / tier
+    shutil.rmtree(out, ignore_errors=True)
     subprocess.run(
         [sys.executable, str(HERE / "app.py")],
         cwd=HERE,
@@ -58,12 +60,26 @@ def statements(t):
                     yield from d["Statement"]
 
 
-def test_session_has_four_services_with_readyz_and_tracing(session):
-    services = resources(session, "AWS::AppRunner::Service")
-    assert len(services) == 4
-    for s in services.values():
-        assert s["Properties"]["HealthCheckConfiguration"]["Path"] == "/readyz"
-        assert s["Properties"]["ObservabilityConfiguration"]["ObservabilityEnabled"] is True
+def test_session_has_four_lambda_functions_with_urls_tracing_and_secret(session):
+    fns = resources(session, "AWS::Lambda::Function")
+    assert len(fns) == 4
+    for f in fns.values():
+        p = f["Properties"]
+        assert p["PackageType"] == "Image" and p["Architectures"] == ["arm64"]
+        assert p["TracingConfig"]["Mode"] == "Active"
+        env = p["Environment"]["Variables"]
+        assert "NW_API_KEY_SECRET_ARN" in env and env["NW_TRACE_EXPORT"] == "xray"
+        assert "NW_API_KEY" not in env, "the key value must never be in the template"
+    assert len(resources(session, "AWS::Lambda::Url")) == 4
+    assert resources(session, "AWS::SecretsManager::Secret")
+    assets = json.loads(
+        (HERE / "cdk.out.test" / "session" / "northwind-session.assets.json").read_text()
+    )
+    for a in assets["dockerImages"].values():
+        assert (
+            a["source"]["platform"] == "linux/arm64"
+            and a["source"]["dockerBuildArgs"]["LAMBDA"] == "1"
+        )
     assert resources(session, "AWS::Budgets::Budget")
     assert resources(session, "AWS::CloudWatch::Dashboard")
     assert len(resources(session, "AWS::CloudWatch::Alarm")) == 8
@@ -84,7 +100,6 @@ def test_model_access_is_scoped_to_the_three_models(session, reference):
 
 
 def test_only_policy_and_agent_roles_may_invoke_models(session):
-    roles = resources(session, "AWS::IAM::Role")
     policies = resources(session, "AWS::IAM::Policy")
     invoking = set()
     for p in policies.values():
@@ -93,10 +108,9 @@ def test_only_policy_and_agent_roles_may_invoke_models(session):
             if any(a.startswith("bedrock:InvokeModel") for a in actions):
                 for ref in p["Properties"]["Roles"]:
                     invoking.add(ref["Ref"])
-    names = {r for r in invoking}
-    assert len(names) == 2
-    assert all(("Policy" in n) or ("Agent" in n) for n in names), names
-    assert not any(("Triage" in n) or ("Semantic" in n) for n in roles if n in names)
+    assert len(invoking) == 2
+    assert all(("Policy" in n) or ("Agent" in n) for n in invoking), invoking
+    assert not any(("Triage" in n) or ("Semantic" in n) for n in invoking)
 
 
 def test_reference_runtimes_are_arm64_and_gated(reference):

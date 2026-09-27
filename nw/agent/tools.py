@@ -19,6 +19,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from nw.llm.types import ToolSpec
+from nw.telemetry import span
 
 ToolFn = Callable[..., Any] | Callable[..., Awaitable[Any]]
 
@@ -99,6 +100,18 @@ class ToolRegistry:
         """Validate, gate, run. Errors become observations the model can read, never
         exceptions that kill the loop; a tool that raises is a tool with a bad contract."""
         started = time.perf_counter()
+        with span(f"tool.{name}", **{"nw.tool": name}) as sp:
+            obs = await self._execute(name, arguments, approved, started)
+            sp.set_attribute("nw.ok", obs.ok)
+            if obs.error:
+                sp.set_attribute("nw.error", obs.error)
+            if obs.pending_approval:
+                sp.set_attribute("nw.pending_approval", True)
+            return obs
+
+    async def _execute(
+        self, name: str, arguments: dict[str, Any], approved: bool, started: float
+    ) -> Observation:
         try:
             tool, args, error = self.validate(name, arguments)
         except KeyError as exc:

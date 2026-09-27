@@ -21,7 +21,9 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel, Field
 
+from nw.auth import install_api_key
 from nw.logging import bind_correlation_id, configure_logging, get_logger, log_fields
+from nw.telemetry import configure_tracing, instrument_app
 from nw.triage.model import TriageModel, TriageResult
 
 log = get_logger("nw.triage.service")
@@ -70,6 +72,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Northwind triage", version="1.0", lifespan=lifespan)
+install_api_key(app)
+configure_tracing("northwind-triage")
+instrument_app(app)
 
 
 @app.middleware("http")

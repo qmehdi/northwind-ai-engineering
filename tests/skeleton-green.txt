@@ -1,8 +1,11 @@
+tests/session01/test_auth.py::test_key_required_and_probes_open
+tests/session01/test_auth.py::test_open_when_no_key_configured
 tests/session01/test_provider_translation.py::test_messages_round_trip_to_vendor_shape
 tests/session01/test_provider_translation.py::test_refusal_becomes_content_filtered_error
 tests/session01/test_provider_translation.py::test_response_is_normalised
 tests/session01/test_provider_translation.py::test_sampling_is_dropped_for_models_that_reject_it
 tests/session01/test_provider_translation.py::test_sdk_errors_are_classified
+tests/session01/test_telemetry.py::test_no_exporter_means_no_crash
 tests/session02/test_features.py::test_same_ticket_same_features
 tests/session02/test_features.py::test_structural_signals_fire_on_logs_and_shouting
 tests/session02/test_features.py::test_subject_is_weighted_twice
@@ -21,6 +24,7 @@ tests/session03/test_data.py::test_multi_hot_uses_fixed_vocabulary
 tests/session03/test_data.py::test_stratified_subset_keeps_p0
 tests/session03/test_index.py::test_index_returns_nearest_by_cosine
 tests/session03/test_service.py::test_missing_artifact_is_alive_not_ready
+tests/session04/test_calibrate.py::test_shipped_cases_are_balanced_and_self_contained
 tests/session04/test_chunking.py::test_chunks_carry_metadata_and_supersession
 tests/session04/test_chunking.py::test_corpus_links_supersession_both_ways
 tests/session04/test_chunking.py::test_long_sections_are_windowed_with_overlap

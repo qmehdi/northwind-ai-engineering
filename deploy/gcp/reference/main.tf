@@ -80,16 +80,17 @@ resource "google_project_iam_member" "agent_engine_armor" {
 }
 
 module "mcp" {
-  source        = "../modules/service"
-  name          = "mcp"
-  project       = var.project
-  region        = var.region
-  image         = "${local.registry}/nw-mcp:${var.image_tag}"
-  cpu           = "2"
-  memory        = "4Gi"
-  invoke_models = false
-  env           = { NW_MCP_HOST = "0.0.0.0", NW_MCP_PORT = "8000" }
-  public        = false
+  source         = "../modules/service"
+  name           = "mcp"
+  project        = var.project
+  region         = var.region
+  image          = "${local.registry}/nw-mcp:${var.image_tag}"
+  cpu            = "2"
+  memory         = "4Gi"
+  invoke_models  = false
+  env            = { NW_MCP_HOST = "0.0.0.0", NW_MCP_PORT = "8000" }
+  public         = false
+  api_key_secret = "northwind-api-key"
 }
 
 resource "google_cloud_run_v2_service_iam_member" "mcp_invoker" {

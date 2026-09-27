@@ -33,6 +33,11 @@ variable "invoke_models" {
   default     = false
   description = "Grant roles/aiplatform.user so the service can call Claude on Vertex AI"
 }
+variable "api_key_secret" {
+  type        = string
+  default     = ""
+  description = "Secret Manager secret id holding the service API key; injected as NW_API_KEY at runtime"
+}
 
 resource "google_service_account" "svc" {
   project      = var.project
@@ -61,7 +66,18 @@ resource "google_project_iam_member" "metrics" {
   member  = "serviceAccount:${google_service_account.svc.email}"
 }
 
+# The API key is read by Cloud Run from Secret Manager at revision start and handed to the
+# container as an environment variable. Only this service account may read this one secret.
+resource "google_secret_manager_secret_iam_member" "api_key" {
+  count     = var.api_key_secret == "" ? 0 : 1
+  project   = var.project
+  secret_id = var.api_key_secret
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.svc.email}"
+}
+
 resource "google_cloud_run_v2_service" "svc" {
+  depends_on          = [google_secret_manager_secret_iam_member.api_key]
   project             = var.project
   name                = "northwind-${var.name}"
   location            = var.region
@@ -95,10 +111,23 @@ resource "google_cloud_run_v2_service" "svc" {
       }
 
       dynamic "env" {
-        for_each = merge({ NW_TRACK = "gcp", NW_GCP_PROJECT = var.project, NW_GCP_REGION = "global", NW_LOG_FORMAT = "json", PORT = "8000" }, var.env)
+        for_each = merge({ NW_TRACK = "gcp", NW_GCP_PROJECT = var.project, NW_GCP_REGION = "global", NW_LOG_FORMAT = "json", PORT = "8000", NW_TRACE_EXPORT = "cloudtrace", OTEL_SERVICE_NAME = "northwind-${var.name}" }, var.env)
         content {
           name  = env.key
           value = env.value
+        }
+      }
+
+      dynamic "env" {
+        for_each = var.api_key_secret == "" ? [] : [var.api_key_secret]
+        content {
+          name = "NW_API_KEY"
+          value_source {
+            secret_key_ref {
+              secret  = env.value
+              version = "latest"
+            }
+          }
         }
       }
 

@@ -16,7 +16,7 @@ def suppress_known(stack: Stack) -> None:
             },
             {
                 "id": "AwsSolutions-IAM4",
-                "reason": "App Runner's managed access role for ECR (AWSAppRunnerServicePolicyForECRAccess) is the documented way to pull images.",
+                "reason": "AWSLambdaBasicExecutionRole is the documented Lambda logging policy and AWSXrayWriteOnlyPolicy is the policy AWS documents for the X-Ray OTLP endpoint.",
             },
             {
                 "id": "AwsSolutions-SNS3",

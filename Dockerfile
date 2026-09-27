@@ -15,15 +15,22 @@ COPY --from=ghcr.io/astral-sh/uv:0.6.9 /uv /bin/uv
 WORKDIR /app
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never
 COPY pyproject.toml uv.lock .python-version ./
-RUN uv sync --frozen --no-dev --no-install-project --extra dl --extra agents
+RUN uv sync --frozen --no-dev --no-install-project --extra dl --extra agents --extra agents-aws --extra agents-gcp
 COPY nw ./nw
-RUN uv sync --frozen --no-dev --extra dl --extra agents
+RUN uv sync --frozen --no-dev --extra dl --extra agents --extra agents-aws --extra agents-gcp
 
 FROM python:3.12-slim AS runtime
 ARG APP=nw.triage.service:app
 ARG ARTIFACTS="triage"
 ARG HF_MODELS=0
 ARG PORT=8000
+# LAMBDA=1 adds the AWS Lambda Web Adapter (1.1.0, multi-arch) as an extension so the
+# same uvicorn process serves behind a Lambda function URL. Readiness waits on /readyz
+# and async init lets model loading run past Lambda's 10 second init window.
+ARG LAMBDA=0
+COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:1.1.0 /lambda-adapter /tmp/lambda-adapter
+RUN if [ "$LAMBDA" = "1" ]; then mkdir -p /opt/extensions && mv /tmp/lambda-adapter /opt/extensions/lambda-adapter; else rm -f /tmp/lambda-adapter; fi
+ENV AWS_LWA_PORT=${PORT} AWS_LWA_READINESS_CHECK_PATH=/readyz AWS_LWA_ASYNC_INIT=true AWS_LWA_INVOKE_MODE=buffered
 RUN useradd --create-home --uid 10001 nw
 WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv

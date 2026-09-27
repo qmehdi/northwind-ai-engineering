@@ -1,4 +1,4 @@
-.PHONY: setup check test lint fmt preflight session01 session02 train-triage serve-triage image-triage images up up-observability down session03 train-semantic export-semantic benchmark index serve-semantic session04 index-policy eval-policy serve-policy session05 agent-eval replay specialists agent-eval-strands agent-eval-adk mcp
+.PHONY: setup check test lint fmt preflight session01 session02 train-triage serve-triage image-triage images up up-observability down session03 train-semantic export-semantic benchmark index serve-semantic session04 index-policy eval-policy calibrate-judge serve-policy session05 agent-eval replay specialists agent-eval-strands agent-eval-adk mcp
 
 setup:            ## Create the virtualenv and install everything, deep learning and agents included
 	uv sync --extra dev --extra dl --extra agents --extra agents-aws --extra agents-gcp
@@ -71,6 +71,9 @@ session04:        ## Session 4 acceptance tests
 index-policy:     ## Chunk the policy corpus and build the retrieval index
 	uv run python -m nw.policy.build_index
 
+calibrate-judge:  ## Session 4: judge agreement with human labels (about 0.10 USD)
+	uv run python -m nw.policy.calibrate
+
 eval-policy:      ## Run the golden set against the index and apply the regression gate
 	uv run python -m nw.policy.evaluate
 
@@ -111,10 +114,10 @@ deploy-aws:       ## AWS: synth test, then cdk deploy. TIER=session|reference
 synth-aws:        ## AWS: synth and the review test only
 	TIER=$(TIER) scripts/deploy_aws.sh synth
 
-stop-aws:         ## AWS: pause every northwind App Runner service
+stop-aws:         ## AWS: set reserved concurrency 0 on every northwind function (idle already costs nothing)
 	scripts/deploy_aws.sh stop
 
-start-aws:        ## AWS: resume them
+start-aws:        ## AWS: remove the concurrency limit
 	scripts/deploy_aws.sh start
 
 destroy-aws:      ## AWS: delete the tier's stack

@@ -18,6 +18,10 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "prometheus-client>=0.20",
     "rank-bm25>=0.2.2",
+    "opentelemetry-sdk>=1.30",
+    "opentelemetry-exporter-otlp-proto-http>=1.30",
+    "opentelemetry-instrumentation-fastapi>=0.51b0",
+    "opentelemetry-instrumentation-httpx>=0.51b0",
 ]
 
 [project.optional-dependencies]
@@ -37,9 +41,18 @@ agents = [
 agents-aws = [
     "strands-agents>=1.0",
     "strands-agents-tools>=0.2",
+    "boto3>=1.35",
+    # 0.19+ pins opentelemetry-sdk 1.44, which google-adk 2.x caps at 1.42.1; 0.18 is the
+    # newest ADOT release the two tracks can share in one lock. Revisit when ADK moves.
+    "aws-opentelemetry-distro>=0.18,<0.19",
+    "opentelemetry-sdk-extension-aws>=2.1",
+    "opentelemetry-propagator-aws-xray>=1.0",
 ]
 agents-gcp = [
-    "google-adk>=1.10",
+    "google-adk>=2.10",
+    "google-cloud-secret-manager>=2.20",
+    "opentelemetry-exporter-gcp-trace>=1.9",
+    "opentelemetry-resourcedetector-gcp>=1.9",
 ]
 dev = [
     "pytest>=8.2",
