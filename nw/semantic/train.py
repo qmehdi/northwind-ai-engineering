@@ -205,11 +205,11 @@ def train(
     counts = np.bincount(
         [PRIORITIES.index(r["priority"]) for r in rows_train], minlength=len(PRIORITIES)
     ).astype(np.float32)
-    prio_weight = torch.tensor(
+    prio_weight = torch.tensor(  # noqa: F841 (used in the loop the skeleton stubs)
         counts.sum() / np.maximum(counts, 1) / len(PRIORITIES), dtype=torch.float32
     ).to(device)
     use_amp = device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)  # noqa: F841 (same)
 
     started = time.perf_counter()
     for epoch in range(start_epoch, epochs):
