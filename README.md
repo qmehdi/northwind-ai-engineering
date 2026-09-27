@@ -1,8 +1,8 @@
-# Northwind AI Engineering
+# AI Engineering: GenAI and Agentic Systems
 
 The course repository for **AI Engineering: GenAI and Agentic Systems**. Six sessions of two hours. Four projects, each shipped as a running service, on one domain: support-ticket intelligence for Northwind Cloud, a B2B SaaS company.
 
-You are the AI engineer Northwind hired to make the support desk faster without making it dangerous.
+Northwind Cloud has just hired you as its AI engineer to make the support desk faster without making it dangerous.
 
 ## Start here
 
