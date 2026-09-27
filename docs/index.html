@@ -14,6 +14,7 @@
           --accent: #5b9dff; --accent-ink: #0b1220; --code-bg: #10151c; }
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { margin: 0; background: var(--bg); color: var(--ink); font-size: 16px; line-height: 1.55; }
 a { color: var(--accent); }
 .app { display: grid; grid-template-columns: var(--side) 1fr; min-height: 100vh; }
@@ -370,10 +371,9 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
   }
 
   function renderHome() {
-    const n = C.sessions.filter(s => s.n > 0).length;
     $(".eyebrow").textContent = C.subtitle;
     $("h1").textContent = "Course overview";
-    $(".builds").textContent = `${n} sessions of two hours. Four projects. One deployed system. Track: ${state.track.toUpperCase()}.`;
+    $(".builds").textContent = `Six sessions of two hours. Four projects. One deployed system. Track: ${state.track === "aws" ? "AWS" : "Google Cloud"}.`;
     $(".tabs").hidden = true; $(".links").hidden = true;
     const ins = $("#instructions"), ref = $("#reference");
     ref.hidden = true; ins.hidden = false;
