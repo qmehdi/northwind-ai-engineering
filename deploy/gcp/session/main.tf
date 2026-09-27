@@ -5,16 +5,19 @@
 
 locals {
   registry = "${var.region}-docker.pkg.dev/${var.project}/northwind"
+  # The agent runs a multi-step resolution, so it gets 300 s where the tools get 120 s.
   services = {
-    triage   = { app = "nw.triage.service:app", cpu = "1", memory = "2Gi", models = false, env = {} }
-    semantic = { app = "nw.semantic.service:app", cpu = "1", memory = "3Gi", models = false, env = {} }
-    policy   = { app = "nw.policy.service:app", cpu = "1", memory = "3Gi", models = true, env = {} }
-    agent    = { app = "nw.agent.service:app", cpu = "2", memory = "4Gi", models = true, env = { NW_AGENT_ROLE = "resolver" } }
+    triage   = { app = "nw.triage.service:app", cpu = "1", memory = "2Gi", models = false, timeout = 120, env = {} }
+    semantic = { app = "nw.semantic.service:app", cpu = "1", memory = "3Gi", models = false, timeout = 120, env = {} }
+    policy   = { app = "nw.policy.service:app", cpu = "1", memory = "3Gi", models = true, timeout = 120, env = {} }
+    agent    = { app = "nw.agent.service:app", cpu = "2", memory = "4Gi", models = true, timeout = 300, env = { NW_AGENT_ROLE = "resolver", NW_SPEND_CAP_USD = "25" } }
   }
 }
 
 resource "google_project_service" "apis" {
-  for_each = toset(["run.googleapis.com", "artifactregistry.googleapis.com", "aiplatform.googleapis.com", "monitoring.googleapis.com", "cloudtrace.googleapis.com", "logging.googleapis.com", "billingbudgets.googleapis.com", "secretmanager.googleapis.com"])
+  # iam and cloudresourcemanager back the service accounts and project IAM bindings the
+  # service module creates; on a fresh project they are not on by default.
+  for_each = toset(["run.googleapis.com", "artifactregistry.googleapis.com", "aiplatform.googleapis.com", "monitoring.googleapis.com", "cloudtrace.googleapis.com", "logging.googleapis.com", "billingbudgets.googleapis.com", "secretmanager.googleapis.com", "iam.googleapis.com", "cloudresourcemanager.googleapis.com"])
   project  = var.project
   service  = each.value
 
@@ -42,11 +45,13 @@ resource "google_secret_manager_secret_version" "api_key" {
   secret_data = random_password.api_key.result
 }
 
-resource "google_artifact_registry_repository" "images" {
+# The repository is created by scripts/images_gcp.sh before the images are pushed, because
+# the push has to succeed before this apply can create services from those images. Terraform
+# only checks it exists; `make destroy-gcp TIER=session` deletes it with gcloud afterwards.
+data "google_artifact_registry_repository" "images" {
   project       = var.project
   location      = var.region
   repository_id = "northwind"
-  format        = "DOCKER"
   depends_on    = [google_project_service.apis]
 }
 
@@ -60,10 +65,11 @@ module "service" {
   cpu            = each.value.cpu
   memory         = each.value.memory
   invoke_models  = each.value.models
+  timeout        = each.value.timeout
   env            = each.value.env
   public         = true
   api_key_secret = google_secret_manager_secret.api_key.secret_id
-  depends_on     = [google_artifact_registry_repository.images, google_secret_manager_secret_version.api_key]
+  depends_on     = [google_project_service.apis, data.google_artifact_registry_repository.images, google_secret_manager_secret_version.api_key]
 }
 
 # ----- observability ------------------------------------------------------------
@@ -74,6 +80,7 @@ resource "google_monitoring_notification_channel" "email" {
   display_name = "Northwind alerts"
   type         = "email"
   labels       = { email_address = var.alert_email }
+  depends_on   = [google_project_service.apis]
 }
 
 resource "google_monitoring_alert_policy" "errors" {
@@ -99,6 +106,7 @@ resource "google_monitoring_alert_policy" "errors" {
   documentation {
     content = "More than five 5xx responses in five minutes. Check the revision's logs and /readyz."
   }
+  depends_on = [google_project_service.apis]
 }
 
 resource "google_monitoring_alert_policy" "latency" {
@@ -122,10 +130,12 @@ resource "google_monitoring_alert_policy" "latency" {
     }
   }
   notification_channels = [for c in google_monitoring_notification_channel.email : c.id]
+  depends_on            = [google_project_service.apis]
 }
 
 resource "google_monitoring_dashboard" "northwind" {
-  project = var.project
+  project    = var.project
+  depends_on = [google_project_service.apis]
   dashboard_json = jsonencode({
     displayName = "northwind"
     mosaicLayout = {

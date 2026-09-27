@@ -6,8 +6,9 @@
   `escalate` is denied to every principal except the approvers role, so the
   approval gate is enforced by the platform, not only by the loop.
 - A Bedrock Guardrail (prompt attack, PII masking, grounding) with a snapshot version.
-- An S3 Vectors bucket and index for the policy chunks: the managed retriever.
-- An Agent Registry with a record for the resolver.
+- An S3 Vectors bucket and index for the policy chunks: the managed retriever,
+  populated by `scripts/deploy_aws.sh` with `nw.policy.publish_vectors` after the deploy.
+- One log group for the two runtimes, so their logs have a retention and a lifecycle.
 
 Every IAM statement here comes from the developer guide pages recorded in the
 instructor research notes; `tests/test_synth.py` pins them.
@@ -15,7 +16,7 @@ instructor research notes; `tests/test_synth.py` pins them.
 
 from __future__ import annotations
 
-from aws_cdk import CfnOutput, Fn, Stack
+from aws_cdk import CfnOutput, Fn, RemovalPolicy, Stack
 from aws_cdk import aws_bedrock as bedrock
 from aws_cdk import aws_bedrockagentcore as ac
 from aws_cdk import aws_ecr_assets as ecr_assets
@@ -27,16 +28,38 @@ from constructs import Construct
 from stacks.common import MODEL_IDS, bedrock_invoke_policy, image
 from stacks.session_path import SessionPath
 
-CEDAR_POLICIES = {
-    # Tools every caller may use.
-    "AllowReadTools": """permit(principal, action, resource)
-when { ["search_policies", "classify_urgency", "classify_semantic", "find_similar_tickets", "lookup_customer", "check_entitlement"].contains(action.id) };""",
-    # Escalation only for the approvers role. The runtime's own role is not in it,
-    # so an agent calling escalate through the gateway is denied by the platform.
-    "DenyEscalateUnlessApprover": """forbid(principal, action, resource)
-when { action.id == "escalate" }
-unless { principal.hasTag("northwind:approver") && principal.getTag("northwind:approver") == "true" };""",
-}
+# The gateway target below is named `northwind-tools`; the gateway exposes every tool of an
+# MCP target as the action `AgentCore::Action::"<TargetName>___<tool>"`. The AWS_IAM principal
+# is `AgentCore::IamEntity` with a single `id` attribute (the caller's ARN), and the resource
+# is the gateway itself, so the policy schema has no tags to test.
+TARGET_NAME = "northwind-tools"
+READ_TOOLS = (
+    "search_policies",
+    "classify_urgency",
+    "classify_semantic",
+    "find_similar_tickets",
+    "lookup_customer",
+    "check_entitlement",
+)
+APPROVERS_ROLE = "NorthwindApprovers"
+
+
+def cedar_policies(account: str) -> dict[str, str]:
+    actions = ", ".join(f'AgentCore::Action::"{TARGET_NAME}___{t}"' for t in READ_TOOLS)
+    return {
+        # Read tools for every authenticated IAM caller.
+        "AllowReadTools": (
+            "permit(principal is AgentCore::IamEntity, "
+            f"action in [{actions}], "
+            "resource is AgentCore::Gateway);"
+        ),
+        # Escalation only for the approvers role. The runtime's own role is not it, so an
+        # agent calling escalate through the gateway is denied by the platform.
+        "DenyEscalateUnlessApprover": (
+            f'forbid(principal, action == AgentCore::Action::"{TARGET_NAME}___escalate", resource) '
+            f'unless {{ principal.id like "arn:aws:sts::{account}:assumed-role/{APPROVERS_ROLE}/*" }};'
+        ),
+    }
 
 
 class ReferenceStack(Stack):
@@ -269,11 +292,13 @@ class ReferenceStack(Stack):
             network_configuration=ac.CfnRuntime.NetworkConfigurationProperty(network_mode="PUBLIC"),
             environment_variables={
                 **common_env,
-                "NW_APP": "nw.agent.service:app",
+                # The HTTP protocol contract: POST /invocations and GET /ping on 8080.
+                "NW_APP": "nw.agent.agentcore:app",
                 "NW_AGENT_ROLE": "resolver",
+                "NW_SPEND_CAP_USD": "25",
                 "PORT": "8080",
             },
-            description="Northwind resolver agent",
+            description="Northwind resolver agent (HTTP protocol, nw.agent.agentcore)",
         )
         for r in (tools_runtime, agent_runtime):
             r.node.add_dependency(runtime_role)
@@ -285,7 +310,7 @@ class ReferenceStack(Stack):
             name="northwind_tools",
             description="Authorises tool calls through the Northwind gateway",
         )
-        for name, statement in CEDAR_POLICIES.items():
+        for name, statement in cedar_policies(self.account).items():
             ac.CfnPolicy(
                 self,
                 f"Policy{name}",
@@ -299,12 +324,20 @@ class ReferenceStack(Stack):
             )
 
         # ----- gateway role: exact set from the devguide policy-permissions page (Argus ADR-0013) ---
+        # The name must contain BedrockAgentCore: the deployer's iam:PassRole is scoped to
+        # `role/*BedrockAgentCore*` (devguide policy-permissions).
         gateway_role = iam.Role(
             self,
             "GatewayRole",
+            role_name=f"NorthwindBedrockAgentCoreGateway-{self.region}",
             assumed_by=iam.ServicePrincipal(
                 "bedrock-agentcore.amazonaws.com",
-                conditions={"StringEquals": {"aws:SourceAccount": self.account}},
+                conditions={
+                    "StringEquals": {"aws:SourceAccount": self.account},
+                    "ArnLike": {
+                        "aws:SourceArn": f"arn:aws:bedrock-agentcore:{self.region}:{self.account}:*"
+                    },
+                },
             ),
             description="AgentCore Gateway execution role",
         )
@@ -322,9 +355,7 @@ class ReferenceStack(Stack):
             iam.PolicyStatement(
                 sid="PolicyEngineRead",
                 actions=["bedrock-agentcore:GetPolicyEngine"],
-                resources=[
-                    f"arn:aws:bedrock-agentcore:{self.region}:{self.account}:policy-engine/*"
-                ],
+                resources=[engine.attr_policy_engine_arn],
             )
         )
         gateway_role.add_to_policy(
@@ -335,7 +366,9 @@ class ReferenceStack(Stack):
                     "bedrock-agentcore:PartiallyAuthorizeActions",
                 ],
                 resources=[
-                    f"arn:aws:bedrock-agentcore:{self.region}:{self.account}:policy-engine/*",
+                    engine.attr_policy_engine_arn,
+                    # The gateway ARN is unknown until the gateway exists, and the gateway
+                    # needs this role to exist first.
                     f"arn:aws:bedrock-agentcore:{self.region}:{self.account}:gateway/*",
                 ],
             )
@@ -370,7 +403,7 @@ class ReferenceStack(Stack):
             self,
             "ToolsTarget",
             gateway_identifier=gateway.attr_gateway_identifier,
-            name="northwind-tools",
+            name=TARGET_NAME,
             description="The course tool registry",
             target_configuration=ac.CfnGatewayTarget.TargetConfigurationProperty(
                 mcp=ac.CfnGatewayTarget.McpTargetConfigurationProperty(
@@ -386,16 +419,18 @@ class ReferenceStack(Stack):
             ],
         )
 
-        # ----- registry --------------------------------------------------------------
+        # ----- runtime logs: one group with a retention, deleted with the stack -----------
         logs.LogGroup(
             self,
             "RuntimeLogs",
             log_group_name="/aws/bedrock-agentcore/runtimes/northwind",
             retention=logs.RetentionDays.ONE_MONTH,
+            removal_policy=RemovalPolicy.DESTROY,
         )
 
         CfnOutput(self, "GatewayUrl", value=gateway.attr_gateway_url)
         CfnOutput(self, "AgentRuntimeArn", value=agent_runtime.attr_agent_runtime_arn)
         CfnOutput(self, "ToolsRuntimeArn", value=tools_runtime.attr_agent_runtime_arn)
         CfnOutput(self, "GuardrailId", value=guardrail.attr_guardrail_id)
+        CfnOutput(self, "PolicyVectorBucket", value=vector_bucket.vector_bucket_name)
         CfnOutput(self, "Models", value=",".join(MODEL_IDS.values()))

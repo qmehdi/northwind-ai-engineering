@@ -57,14 +57,28 @@ class Message(BaseModel):
     content: str | None = None
     tool_calls: list[ToolCall] = Field(default_factory=list)
     tool_results: list[ToolResult] = Field(default_factory=list)
+    # The vendor's own content blocks for an assistant turn (text, tool_use, thinking).
+    # Replayed verbatim so a model that thinks keeps its thinking blocks in a tool loop.
+    raw_content: list[dict[str, Any]] | None = None
 
     @classmethod
     def user(cls, text: str) -> Message:
         return cls(role="user", content=text)
 
     @classmethod
-    def assistant(cls, text: str, tool_calls: list[ToolCall] | None = None) -> Message:
-        return cls(role="assistant", content=text, tool_calls=tool_calls or [])
+    def assistant(
+        cls,
+        text: str,
+        tool_calls: list[ToolCall] | None = None,
+        raw_content: list[dict[str, Any]] | None = None,
+    ) -> Message:
+        return cls(
+            role="assistant", content=text, tool_calls=tool_calls or [], raw_content=raw_content
+        )
+
+    @classmethod
+    def from_completion(cls, completion: Completion) -> Message:
+        return cls.assistant(completion.text, completion.tool_calls, completion.raw_content)
 
     @classmethod
     def results(cls, results: list[ToolResult]) -> Message:
@@ -86,3 +100,4 @@ class Completion(BaseModel):
     request_id: str
     model: str
     stop_reason: StopReason = StopReason.END_TURN
+    raw_content: list[dict[str, Any]] | None = None

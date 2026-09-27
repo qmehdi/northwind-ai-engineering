@@ -91,7 +91,7 @@ class LLMClient:
         3. Call the provider under `_with_retries`.
         4. Release the reservation, record the real cost, log one line.
         """
-        raise NotImplementedError("Session 1, Step 2: semaphore, retries, metering")
+        raise NotImplementedError("Service layer, Step 4: semaphore, retries, metering")
 
     async def structured[T: BaseModel](
         self,
@@ -109,7 +109,7 @@ class LLMClient:
         After that, StructuredOutputError. Never loop forever on a model that will
         not comply; that is a budget leak.
         """
-        raise NotImplementedError("Session 1, Step 4: schema prompt, parse, one repair")
+        raise NotImplementedError("Service layer, Step 5: schema prompt, parse, one repair")
 
     async def map(
         self,
@@ -122,7 +122,7 @@ class LLMClient:
     ) -> list[Completion | BaseException]:
         """Fan out over `prompts` with bounded concurrency. Results come back in
         input order regardless of the order in which the provider answered."""
-        raise NotImplementedError("Session 1, Step 5: gather, keep input order")
+        raise NotImplementedError("Service layer, Step 6: gather, keep input order")
 
     # ----- internals --------------------------------------------------------
 
@@ -130,7 +130,7 @@ class LLMClient:
         self, request_id: str, call: Callable[[], Awaitable[Completion]]
     ) -> Completion:
         """Run `call` under the retry policy. Terminal errors are raised at once."""
-        raise NotImplementedError("Session 1, Step 3: classify, back off, give up")
+        raise NotImplementedError("Service layer, Step 4: classify, back off, give up")
 
 
 def _parse_as[T: BaseModel](text: str, schema: type[T]) -> T:

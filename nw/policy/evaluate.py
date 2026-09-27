@@ -125,6 +125,8 @@ async def run_case(
 
 
 def aggregate(results: list[CaseResult]) -> dict[str, Any]:
+    if not results:
+        raise ValueError("no cases: the golden set is empty or the filter removed everything")
     faith = [r.faithfulness for r in results if r.faithfulness is not None]
     lat = [r.latency_ms for r in results]
     return {
@@ -182,13 +184,16 @@ async def evaluate(
     k: int = 8,
     min_score: float = 0.0,
     concurrency: int = 8,
+    use_judge: bool = True,
     **retrieve_kw: Any,
 ) -> tuple[list[CaseResult], dict[str, Any]]:
     sem = asyncio.Semaphore(concurrency)
 
     async def one(c: EvalCase) -> CaseResult:
         async with sem:
-            return await run_case(client, index, c, k=k, min_score=min_score, **retrieve_kw)
+            return await run_case(
+                client, index, c, k=k, min_score=min_score, use_judge=use_judge, **retrieve_kw
+            )
 
     results = await asyncio.gather(*(one(c) for c in cases))
     return list(results), aggregate(results)
@@ -214,6 +219,7 @@ async def main_async(args: argparse.Namespace) -> int:
         cases,
         k=args.k,
         min_score=args.min_score,
+        use_judge=args.judge,
         hybrid=args.hybrid,
         rerank=args.rerank,
     )

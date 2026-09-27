@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import uuid
 from pathlib import Path
@@ -109,8 +110,10 @@ def main() -> int:
     s = settings()
     if s.track.value != "aws":
         raise SystemExit("the Strands port runs on the aws track")
-    model_id = s.model_for(ModelRole.WORKHORSE)
-    # Strands talks to Bedrock through boto3 (Converse), which takes the bare Bedrock model id.
+    # Strands talks to Bedrock through boto3 (Converse). The Converse API may want a versioned
+    # id or an inference profile rather than the Mantle id the course client uses, so the id
+    # is overridable: NW_MODEL_STRANDS=global.anthropic.claude-sonnet-5... if a 400 says so.
+    model_id = os.environ.get("NW_MODEL_STRANDS") or s.model_for(ModelRole.WORKHORSE)
     registry = build_registry("local")
     scores = []
     for case in load_cases(args.cases):

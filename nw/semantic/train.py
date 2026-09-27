@@ -45,7 +45,7 @@ def loss_fn(
     """Multi-label BCE on tags plus weighted cross-entropy on priority. BCE treats each
     tag as its own yes/no question, which is what multi-label means; softmax would
     force the tags to compete."""
-    raise NotImplementedError("Session 3, Step 4: BCE for tags, weighted CE for priority")
+    raise NotImplementedError("Step 4: BCE for tags, weighted CE for priority")
 
 
 @torch.no_grad()
@@ -198,10 +198,23 @@ def train(
         best = ck["best"] if (out / "best_metrics.json").exists() else -1.0
         print(f"resumed from {resume}: epoch {start_epoch}, step {step}, best {best:.4f}")
 
+    # Loop invariants, given. Priority weights are inverse class frequency, so a P0
+    # mistake costs the loss more than a P2 mistake. fp16 gradients underflow, so on
+    # CUDA the loss is scaled before backward and unscaled before the step; elsewhere
+    # the scaler is disabled and passes through.
+    counts = np.bincount(
+        [PRIORITIES.index(r["priority"]) for r in rows_train], minlength=len(PRIORITIES)
+    ).astype(np.float32)
+    prio_weight = torch.tensor(
+        counts.sum() / np.maximum(counts, 1) / len(PRIORITIES), dtype=torch.float32
+    ).to(device)
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
     started = time.perf_counter()
     for epoch in range(start_epoch, epochs):
         model.train()
-        raise NotImplementedError("Step 4: class weights, scaler, the batch loop")
+        raise NotImplementedError("Step 4: the batch loop")
         tag_p, prio_p, tag_y, prio_y = predict(model, val_loader, device)
         thresholds = tune_tag_thresholds(tag_p, tag_y)
         m = metrics(tag_p, prio_p, tag_y, prio_y, thresholds)

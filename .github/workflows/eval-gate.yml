@@ -23,17 +23,17 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v3
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
       - run: uv python install 3.12
       - run: uv sync --locked --extra dev --extra dl
       - if: inputs.track == 'aws'
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: us-east-1
       - if: inputs.track == 'gcp'
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
@@ -47,7 +47,7 @@ jobs:
           NW_SPEND_CAP_USD: "12"
         run: |
           if [ "${{ inputs.judge }}" = "true" ]; then uv run python -m nw.policy.evaluate; else uv run python -m nw.policy.evaluate --no-judge; fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: policy-eval

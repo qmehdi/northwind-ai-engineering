@@ -65,7 +65,7 @@ def load_model(path: Path) -> TriageModel:
 async def lifespan(app: FastAPI):
     configure_logging(os.environ.get("NW_LOG_FORMAT", "json"))
     path = Path(os.environ.get("NW_TRIAGE_MODEL", "artifacts/triage/latest"))
-    state.model, state.ready = load_model(path), True  # Step 7: and if it fails?
+    state.model, state.ready = load_model(path), True  # Step 6: and if it fails?
     yield
     state.model, state.ready = None, False
     MODEL_LOADED.set(0)

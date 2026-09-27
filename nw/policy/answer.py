@@ -60,7 +60,8 @@ def build_context(retrieved: list[Retrieved], budget_tokens: int = 2500) -> tupl
 
 
 def weak_retrieval(retrieved: list[Retrieved], min_score: float) -> bool:
-    return not retrieved or retrieved[0].score < min_score
+    """Refuse when the best hit's confidence (one scale for every retriever) is below the bar."""
+    return not retrieved or retrieved[0].confidence < min_score
 
 
 async def answer(

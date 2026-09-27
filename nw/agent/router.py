@@ -5,7 +5,7 @@ ticket in two milliseconds for nothing. The router uses it as a pre-filter:
 
 - confident P0: propose escalation directly, no model call at all
 - P3 questions: the Economy model, fewer steps, smaller budget
-- everything else: the Workhorse loop as in Session 5
+- everything else: the Workhorse loop from Project 4
 
 Cost per resolved ticket is measured before and after, on the same tickets,
 so the saving is a number and not a slide.
@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from nw.agent.loop import run_agent
+from nw.agent.screen import Screener
 from nw.agent.tools import ToolRegistry
 from nw.agent.trace import Trajectory
 from nw.llm import LLMClient
@@ -29,7 +30,7 @@ class RoutingPolicy:
     economy_max_steps: int = 4
     economy_budget_usd: float = 0.05
     workhorse_max_steps: int = 10
-    workhorse_budget_usd: float = 0.25
+    workhorse_budget_usd: float = 0.40
 
 
 async def route(
@@ -41,10 +42,13 @@ async def route(
     client: LLMClient,
     *,
     policy: RoutingPolicy | None = None,
+    screener: Screener | None = None,
 ) -> Trajectory:
+    """`screener` runs in front of any branch that calls a model. The P0 branch makes no
+    model call, so the ticket text never reaches one and is not screened there."""
     policy = policy or RoutingPolicy()
     task = f"Ticket {ticket_id} from account {account_id}\nSubject: {subject}\n\n{body}"
-    return await run_agent(task, registry, client, agent_name="resolver")  # Step 5: route
+    return await run_agent(task, registry, client, screener=screener)  # Step 3: route
 
 
 def _read_triage(content: str) -> tuple[str, float]:

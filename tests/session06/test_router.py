@@ -49,3 +49,68 @@ async def test_economy_route_uses_the_cheap_model_and_small_caps(registry, make_
         policy=policy,
     )
     assert t.agent == "resolver-economy" and provider.calls[0]["model"] == "fake-economy"
+
+
+class _Block:
+    name = "test-screen"
+
+    def screen(self, text):
+        from nw.agent.screen import Verdict
+
+        return Verdict(False, self.name, "prompt attack")
+
+
+async def test_router_screens_before_any_model_call(registry, make_client):
+    """The screener travels with the route: a blocked ticket never reaches the Workhorse."""
+    provider = FakeProvider([scripted_completion("should not be called")])
+    client = make_client(provider)
+    t = await route(
+        "T-200001",
+        "NW-10007",
+        "Slow export",
+        "Export takes 40 seconds.",
+        registry,
+        client,
+        screener=_Block(),
+    )
+    assert provider.calls == [] and t.agent == "resolver"
+    assert t.steps[0].tool == "screen:test-screen" and "Blocked" in (t.final or "")
+
+
+def test_route_endpoint_observes_steps_and_latency(registry, make_client, monkeypatch, tmp_path):
+    from contextlib import asynccontextmanager
+
+    from fastapi.testclient import TestClient
+
+    from nw.agent import service
+
+    @asynccontextmanager
+    async def noop(app):
+        yield
+
+    monkeypatch.setattr(service, "state", service.State())
+    service.state.role = "resolver"
+    service.state.registry = registry
+    service.state.trace_dir = tmp_path
+    service.state.client = make_client(FakeProvider([scripted_completion("Check the export.")]))
+    service.state.ready = True
+    service.app.router.lifespan_context = noop
+    from prometheus_client import REGISTRY
+
+    def count(name):
+        return REGISTRY.get_sample_value(name, {"role": "resolver"}) or 0.0
+
+    steps0, latency0 = count("nw_agent_steps_count"), count("nw_agent_latency_seconds_count")
+    with TestClient(service.app) as c:
+        r = c.post(
+            "/route",
+            json={
+                "ticket_id": "T-200001",
+                "account_id": "NW-10007",
+                "subject": "Slow export",
+                "task": "Export takes 40 seconds.",
+            },
+        )
+        assert r.status_code == 200 and r.json()["terminated"] == "answer"
+    assert count("nw_agent_steps_count") == steps0 + 1
+    assert count("nw_agent_latency_seconds_count") == latency0 + 1

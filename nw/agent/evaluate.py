@@ -178,7 +178,7 @@ def main() -> int:
     ap.add_argument("--traces", type=Path, default=Path("artifacts/traces"))
     ap.add_argument("--out", type=Path, default=Path("artifacts/agent_eval.json"))
     ap.add_argument("--max-steps", type=int, default=10)
-    ap.add_argument("--budget", type=float, default=0.25)
+    ap.add_argument("--budget", type=float, default=0.40)
     ap.add_argument("--min-pass", type=int, default=12)
     return asyncio.run(main_async(ap.parse_args()))
 

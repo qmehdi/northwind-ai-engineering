@@ -10,7 +10,9 @@ comes from and most of the latency goes.
 from __future__ import annotations
 
 import json
+import math
 import re
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -33,6 +35,21 @@ class Retrieved:
     score: float
     retriever: str  # dense | bm25 | hybrid | reranked
 
+    @property
+    def confidence(self) -> float:
+        """The score on one 0 to 1 scale whatever produced it, so a refusal threshold means
+        the same thing in every retrieval mode: cosine for dense, a saturating BM25 map,
+        reciprocal-rank fusion scaled so first place in both lists is about 1, and the
+        cross-encoder logit through a sigmoid."""
+        s = self.score
+        if self.retriever == "dense":
+            return max(0.0, min(1.0, s))
+        if self.retriever == "bm25":
+            return 1.0 - math.exp(-s / 5.0)
+        if self.retriever == "hybrid":
+            return max(0.0, min(1.0, s * 30.0))
+        return 1.0 / (1.0 + math.exp(-s))
+
 
 class Embeddings(Protocol):
     def encode(self, texts: list[str], batch_size: int = 64) -> np.ndarray: ...
@@ -50,7 +67,7 @@ class HashEmbeddings:
         out = np.zeros((len(texts), self.dim), dtype=np.float32)
         for i, t in enumerate(texts):
             for tok in tokenize(t):
-                out[i, hash(tok) % self.dim] += 1.0
+                out[i, zlib.crc32(tok.encode()) % self.dim] += 1.0
         norms = np.linalg.norm(out, axis=1, keepdims=True)
         return out / np.maximum(norms, 1e-6)
 

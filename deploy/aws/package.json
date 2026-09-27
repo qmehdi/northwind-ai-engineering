@@ -1,0 +1,8 @@
+{
+  "name": "northwind-deploy-aws",
+  "private": true,
+  "description": "Pins the CDK CLI so `npx --yes cdk` resolves the same version on every laptop.",
+  "devDependencies": {
+    "aws-cdk": "2.1143.0"
+  }
+}

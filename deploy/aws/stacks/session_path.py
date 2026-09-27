@@ -24,7 +24,14 @@ from aws_cdk import aws_logs as logs
 from aws_cdk import aws_secretsmanager as sm
 from constructs import Construct
 
-from stacks.common import REPO_ROOT, SERVICES, alerts_topic, bedrock_invoke_policy, monthly_budget
+from stacks.common import (
+    MODEL_IDS,
+    REPO_ROOT,
+    SERVICES,
+    alerts_topic,
+    bedrock_invoke_policy,
+    monthly_budget,
+)
 
 # memory in MB and timeout in seconds per service; Lambda allocates CPU with memory.
 SIZING = {"triage": (2048, 60), "semantic": (4096, 90), "policy": (4096, 120), "agent": (8192, 300)}
@@ -75,6 +82,9 @@ class SessionPath(Construct):
                 "NW_LOG_FORMAT": "json",
                 "NW_API_KEY_SECRET_ARN": self.api_key.secret_arn,
                 "NW_TRACE_EXPORT": "xray",
+                # The capstone sends 20 tickets through the loop and 20 through the router;
+                # the cap stops a runaway loop before the budget alarm can.
+                "NW_SPEND_CAP_USD": "25",
                 "OTEL_SERVICE_NAME": f"northwind-{name}",
                 "NW_TRACE_DIR": "/tmp/traces",
                 "HF_HOME": "/app/hf",
@@ -127,11 +137,17 @@ class SessionPath(Construct):
             url = fn.add_function_url(auth_type=lam.FunctionUrlAuthType.NONE)
             self.functions[name] = fn
             self.urls[name] = url.url
-            CfnOutput(self, f"Url{name.title()}", value=url.url)
+            # Outputs are read by the guide with jq as `.["northwind-session"].UrlAgent`, so the
+            # logical id is pinned; without this CDK prefixes the construct path (SessionUrlAgent...).
+            CfnOutput(self, f"Url{name.title()}", value=url.url).override_logical_id(
+                f"Url{name.title()}"
+            )
             self._alarms(name, fn, topic)
         self._dashboard()
         monthly_budget(self, limit_usd=budget_usd, email=alert_email)
-        CfnOutput(self, "ApiKeySecretArn", value=self.api_key.secret_arn)
+        CfnOutput(self, "ApiKeySecretArn", value=self.api_key.secret_arn).override_logical_id(
+            "ApiKeySecretArn"
+        )
 
     def _alarms(self, name: str, fn: lam.Function, topic) -> None:
         errors = cw.Alarm(
@@ -171,26 +187,28 @@ class SessionPath(Construct):
                     left=[fn.metric_duration(statistic="p50"), fn.metric_duration(statistic="p95")],
                 ),
             )
+
+        # AWS/Bedrock publishes per model: without the ModelId dimension the panel stays empty.
+        def bedrock(metric: str) -> list[cw.Metric]:
+            return [
+                cw.Metric(
+                    namespace="AWS/Bedrock",
+                    metric_name=metric,
+                    statistic="Sum",
+                    dimensions_map={"ModelId": model_id},
+                    label=f"{metric} {role}",
+                )
+                for role, model_id in MODEL_IDS.items()
+            ]
+
         board.add_widgets(
             cw.GraphWidget(
-                title="Bedrock tokens",
-                left=[
-                    cw.Metric(
-                        namespace="AWS/Bedrock", metric_name="InputTokenCount", statistic="Sum"
-                    ),
-                    cw.Metric(
-                        namespace="AWS/Bedrock", metric_name="OutputTokenCount", statistic="Sum"
-                    ),
-                ],
+                title="Bedrock tokens per model",
+                left=bedrock("InputTokenCount") + bedrock("OutputTokenCount"),
             ),
             cw.GraphWidget(
-                title="Bedrock invocations and throttles",
-                left=[
-                    cw.Metric(namespace="AWS/Bedrock", metric_name="Invocations", statistic="Sum"),
-                    cw.Metric(
-                        namespace="AWS/Bedrock", metric_name="InvocationThrottles", statistic="Sum"
-                    ),
-                ],
+                title="Bedrock invocations and throttles per model",
+                left=bedrock("Invocations") + bedrock("InvocationThrottles"),
             ),
         )
 

@@ -9,8 +9,10 @@ Checks:
 - uv, Docker, git
 - the track's CLI is authenticated (aws sts get-caller-identity / gcloud auth list)
 - one real round trip per model role on aws or gcp tracks (spends a fraction of a cent)
-- the accelerator PyTorch would see (reported, not required; Session 3 has a fallback)
+- the accelerator PyTorch would see (reported, not required; the deep learning part has a fallback)
 - free disk for model weights
+- warned, not required: docker compose, huggingface.co reachable, application default
+  credentials and terraform on gcp, node and cdk on aws
 """
 
 from __future__ import annotations
@@ -38,8 +40,8 @@ def _run(cmd: list[str], timeout: int = 30) -> tuple[int, str]:
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return p.returncode, (p.stdout or p.stderr).strip()
-    except FileNotFoundError:
-        return 127, f"{cmd[0]} not found"
+    except OSError as exc:
+        return 127, str(exc) if not isinstance(exc, FileNotFoundError) else f"{cmd[0]} not found"
     except subprocess.TimeoutExpired:
         return 124, "timed out"
 
@@ -55,8 +57,8 @@ def check_python() -> Check:
     )
 
 
-def check_tool(name: str, args: list[str], required: bool = True) -> Check:
-    code, out = _run([name, *args])
+def check_tool(name: str, args: list[str], required: bool = True, timeout: int = 30) -> Check:
+    code, out = _run([*name.split(), *args], timeout=timeout)
     return Check(name, code == 0, out.splitlines()[0] if out else "", required)
 
 
@@ -99,19 +101,34 @@ def check_track_auth(track: str, settings) -> list[Check]:
 
 
 async def check_round_trips(settings) -> list[Check]:
-    from nw.config import ModelRole
-    from nw.llm.client import LLMClient
-    from nw.llm.providers import make_provider
+    """One real completion per role, straight through the provider.
 
-    checks: list[Check] = []
+    Deliberately bypasses LLMClient: that class is the participant's work in
+    the service layer and is a stub until they finish it.
+    """
+    from nw.config import ModelRole
+    from nw.llm.cost import cost_usd
+    from nw.llm.providers import make_provider
+    from nw.llm.types import Message
+
     try:
-        client = LLMClient(make_provider(settings), settings=settings, max_concurrency=1)
+        provider = make_provider(settings)
     except Exception as exc:  # noqa: BLE001
         return [Check("provider", False, f"{type(exc).__name__}: {exc}")]
+    checks: list[Check] = []
+    spend = 0.0
     for role in ModelRole:
         model = settings.model_for(role)
         try:
-            c = await client.complete("Reply with the single word: ready", role=role, max_tokens=8)
+            c = await provider.complete(
+                [Message.user("Reply with the single word: ready")],
+                model=model,
+                system=None,
+                tools=None,
+                max_tokens=8,
+                temperature=None,
+            )
+            spend += cost_usd(model, c.usage)
             checks.append(
                 Check(
                     f"model {role.value}",
@@ -124,8 +141,45 @@ async def check_round_trips(settings) -> list[Check]:
             checks.append(
                 Check(f"model {role.value}", False, f"{model}: {type(exc).__name__}: {exc}")
             )
-    checks.append(Check("spend", True, f"{client.spend_usd:.5f} USD", required=False))
+    checks.append(Check("spend", True, f"{spend:.5f} USD", required=False))
     return checks
+
+
+def check_hf_reachable() -> Check:
+    """The deep learning part downloads a sentence-transformers checkpoint."""
+    import urllib.error
+    import urllib.request
+
+    url = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2"
+    req = urllib.request.Request(url, method="HEAD")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310
+            return Check("huggingface.co", resp.status < 400, f"HTTP {resp.status}", False)
+    except urllib.error.HTTPError as exc:
+        return Check("huggingface.co", exc.code < 400, f"HTTP {exc.code}", False)
+    except Exception as exc:  # noqa: BLE001
+        return Check("huggingface.co", False, f"{type(exc).__name__}: {exc}", False)
+
+
+def check_track_tools(track: str) -> list[Check]:
+    """Toolchain the deploy part needs. Warned, not required, before the first session."""
+    if track == "aws":
+        return [
+            check_tool("node", ["--version"], required=False),
+            check_tool("npx cdk", ["--version"], required=False, timeout=120),
+        ]
+    if track == "gcp":
+        code, out = _run(["gcloud", "auth", "application-default", "print-access-token"])
+        return [
+            Check(
+                "gcloud adc",
+                code == 0 and bool(out),
+                "application default credentials present" if code == 0 else out[:80],
+                required=False,
+            ),
+            check_tool("terraform", ["version"], required=False),
+        ]
+    return []
 
 
 def main() -> int:
@@ -138,9 +192,12 @@ def main() -> int:
         check_tool("uv", ["--version"]),
         check_tool("git", ["--version"]),
         check_tool("docker", ["version", "--format", "{{.Server.Version}}"]),
+        check_tool("docker compose", ["version"], required=False),
         check_disk(),
         check_accelerator(),
+        check_hf_reachable(),
         *check_track_auth(track, settings),
+        *check_track_tools(track),
     ]
     if track in {"aws", "gcp"}:
         checks.extend(asyncio.run(check_round_trips(settings)))

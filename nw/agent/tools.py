@@ -152,5 +152,7 @@ UNTRUSTED_CLOSE = "</untrusted_data>"
 
 
 def untrusted(text: str) -> str:
-    """Wrap text that came from outside the system, so the prompt can say it is data."""
+    """Wrap text that came from outside the system, so the prompt can say it is data.
+    A closing tag inside the text is defused, so the data cannot end its own wrapper."""
+    text = text.replace("</untrusted_data", "</untrusted_data_")
     return f"{UNTRUSTED_OPEN}\n{text}\n{UNTRUSTED_CLOSE}"

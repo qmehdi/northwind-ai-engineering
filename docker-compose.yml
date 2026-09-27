@@ -1,7 +1,8 @@
-# Local stack: the four project services, the agent, and the MCP server, plus an
-# OpenTelemetry collector and Jaeger under the `observability` profile.
+# Local stack: the four project services, the agent in every role, and the MCP server,
+# plus an OpenTelemetry collector and Jaeger under the `observability` profile.
 #   docker compose up --build
 #   docker compose --profile observability up --build
+# Every agent container shares the `nw-agent` image: compose builds it once and reuses it.
 x-env: &env
   NW_TRACK: ${NW_TRACK:-local}
   NW_AWS_REGION: ${NW_AWS_REGION:-us-east-1}
@@ -12,19 +13,30 @@ x-env: &env
 
 services:
   triage:
+    image: nw-triage
     build: { context: ., args: { APP: nw.triage.service:app, ARTIFACTS: "triage" } }
     environment: *env
     ports: ["8001:8000"]
   semantic:
+    image: nw-semantic
     build: { context: ., args: { APP: nw.semantic.service:app, ARTIFACTS: "semantic index", HF_MODELS: "1" } }
     environment: *env
     ports: ["8002:8000"]
   policy:
+    image: nw-policy
     build: { context: ., args: { APP: nw.policy.service:app, ARTIFACTS: "policy", HF_MODELS: "1" } }
     environment: *env
     ports: ["8003:8000"]
     volumes: ["~/.aws:/home/nw/.aws:ro", "~/.config/gcloud:/home/nw/.config/gcloud:ro"]
+  resolver:
+    # The Session path's deployment: the whole registry behind /run and /route on :8014
+    image: nw-agent
+    build: { context: ., args: { APP: nw.agent.service:app, ARTIFACTS: "triage semantic index policy", HF_MODELS: "1" } }
+    environment: { <<: *env, NW_AGENT_ROLE: resolver }
+    ports: ["8014:8000"]
+    volumes: ["~/.aws:/home/nw/.aws:ro", "~/.config/gcloud:/home/nw/.config/gcloud:ro"]
   agent:
+    image: nw-agent
     build: { context: ., args: { APP: nw.agent.service:app, ARTIFACTS: "triage semantic index policy", HF_MODELS: "1" } }
     environment:
       <<: *env
@@ -36,29 +48,34 @@ services:
     depends_on: [agent-triage, agent-policy, agent-resolution]
     volumes: ["~/.aws:/home/nw/.aws:ro", "~/.config/gcloud:/home/nw/.config/gcloud:ro"]
   agent-triage:
+    image: nw-agent
     build: { context: ., args: { APP: nw.agent.service:app, ARTIFACTS: "triage semantic index policy", HF_MODELS: "1" } }
     environment: { <<: *env, NW_AGENT_ROLE: triage }
     volumes: ["~/.aws:/home/nw/.aws:ro", "~/.config/gcloud:/home/nw/.config/gcloud:ro"]
   agent-policy:
+    image: nw-agent
     build: { context: ., args: { APP: nw.agent.service:app, ARTIFACTS: "triage semantic index policy", HF_MODELS: "1" } }
     environment: { <<: *env, NW_AGENT_ROLE: policy }
     volumes: ["~/.aws:/home/nw/.aws:ro", "~/.config/gcloud:/home/nw/.config/gcloud:ro"]
   agent-resolution:
+    image: nw-agent
     build: { context: ., args: { APP: nw.agent.service:app, ARTIFACTS: "triage semantic index policy", HF_MODELS: "1" } }
     environment: { <<: *env, NW_AGENT_ROLE: resolution }
     volumes: ["~/.aws:/home/nw/.aws:ro", "~/.config/gcloud:/home/nw/.config/gcloud:ro"]
   mcp:
+    image: nw-mcp
     build: { context: ., args: { APP: mcp, ARTIFACTS: "triage semantic index policy", HF_MODELS: "1" } }
     environment: { <<: *env, NW_MCP_HOST: 0.0.0.0, NW_MCP_PORT: "8000" }
     ports: ["8020:8000"]
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.110.0
+    image: otel/opentelemetry-collector-contrib:0.161.0
     profiles: [observability]
     command: ["--config=/etc/otel/config.yaml"]
     volumes: ["./deploy/local/otel-collector.yaml:/etc/otel/config.yaml:ro"]
     ports: ["4318:4318"]
     depends_on: [jaeger]
   jaeger:
-    image: jaegertracing/all-in-one:1.62
+    # Jaeger v2 (the all-in-one image is v1 and frozen); UI on 16686, OTLP gRPC on 4317
+    image: jaegertracing/jaeger:2.21.0
     profiles: [observability]
     ports: ["16686:16686", "4317:4317"]

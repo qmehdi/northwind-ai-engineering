@@ -53,3 +53,20 @@ def test_adk_accepts_the_generated_tool(registry):
     assert decl.name == "lookup_customer"
     schema = decl.parameters_json_schema or decl.parameters.model_dump()
     assert "account_id" in schema["properties"]
+
+
+def test_adk_port_reports_how_the_runner_ended():
+    """The runner yields events, never a termination. A run with no final text is not an
+    answer: paused on the confirmation gate it counts as a proposal, otherwise an error."""
+    from nw.agent.ports.adk_port import finish
+    from nw.agent.trace import Termination, Trajectory
+
+    t = Trajectory(run_id="a", agent="resolver-adk", task="t")
+    finish(t, ["Escalation proposed to engineering."])
+    assert t.terminated is Termination.ANSWER and t.final.startswith("Escalation")
+    t = Trajectory(run_id="b", agent="resolver-adk", task="t")
+    finish(t, [], paused_on="escalate")
+    assert t.terminated is Termination.ANSWER and "escalate" in t.final and "proposed" in t.final
+    t = Trajectory(run_id="c", agent="resolver-adk", task="t")
+    finish(t, [""])
+    assert t.terminated is Termination.ERROR and "without a final response" in t.final

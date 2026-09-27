@@ -28,6 +28,11 @@ variable "public" {
   type    = bool
   default = false
 }
+variable "timeout" {
+  type        = number
+  default     = 120
+  description = "Request timeout in seconds; the agent needs 300 for a multi-step resolution"
+}
 variable "invoke_models" {
   type        = bool
   default     = false
@@ -86,7 +91,7 @@ resource "google_cloud_run_v2_service" "svc" {
 
   template {
     service_account                  = google_service_account.svc.email
-    timeout                          = "120s"
+    timeout                          = "${var.timeout}s"
     max_instance_request_concurrency = 20
 
     scaling {

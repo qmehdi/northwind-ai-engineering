@@ -1,6 +1,13 @@
 import pytest
 
-from nw.policy.chunking import chunk_corpus, load_corpus, parse_document, split_sections, window
+from nw.policy.chunking import (
+    chunk_corpus,
+    chunk_document,
+    load_corpus,
+    parse_document,
+    split_sections,
+    window,
+)
 from nw.policy.redact import redact
 
 pytestmark = pytest.mark.session04
@@ -72,3 +79,22 @@ def test_dates_and_percentages_survive_redaction():
     )
     assert "2025-03-01" in r.text and "99.95" in r.text and "30 days" in r.text
     assert "[PHONE_1]" in r.text and r.count == 1
+
+
+def test_chunk_ids_are_unique_and_independent_of_the_window(corpus_dir):
+    """Step 8 changes the window size; gold chunk ids must survive for every section
+    that is not split, so the id depends on the section, not on document order."""
+    default = chunk_corpus(corpus_dir)
+    ids = [c.id for c in default]
+    assert len(ids) == len(set(ids))
+    assert set(ids) == {c.id for c in chunk_corpus(corpus_dir, max_tokens=1000)}
+    long_section = "\n\n".join(f"Paragraph {i} " + "word " * 40 for i in range(6))
+    doc = parse_document(
+        "---\ntitle: Long\ndoc_id: long\naudience: customer\neffective: 2025-01-01\n---\n"
+        "# Long\n\n## Short\n\nOne line.\n\n## Wide\n\n" + long_section + "\n"
+    )
+    whole = {c.section: c.id for c in chunk_document(doc)}
+    split = chunk_document(doc, max_tokens=60, overlap_tokens=10)
+    assert len(split) > 2 and len({c.id for c in split}) == len(split)
+    assert [c.id for c in split if c.section == "Short"] == [whole["Short"]]
+    assert [c.id for c in split if c.section == "Wide"][0] == whole["Wide"]

@@ -18,6 +18,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from nw.agent.loop import SYSTEM_RULES, run_agent
+from nw.agent.screen import Screener
 from nw.agent.tools import ToolRegistry
 from nw.agent.trace import Trajectory
 from nw.llm import LLMClient
@@ -75,8 +76,15 @@ def subset(registry: ToolRegistry, names: list[str]) -> ToolRegistry:
 
 
 async def run_specialist(
-    role: str, req: SpecialistRequest, registry: ToolRegistry, client: LLMClient
+    role: str,
+    req: SpecialistRequest,
+    registry: ToolRegistry,
+    client: LLMClient,
+    *,
+    screener: Screener | None = None,
 ) -> tuple[SpecialistResponse, Trajectory]:
+    """The specialist's task arrives over HTTP from the orchestrator, so it is screened
+    here, in front of the specialist's own loop, with the service's configured screener."""
     spec = SPECIALISTS[role]
     t = await run_agent(
         req.task,
@@ -86,6 +94,7 @@ async def run_specialist(
         max_steps=req.max_steps,
         budget_usd=req.budget_usd,
         agent_name=role,
+        screener=screener,
     )
     resp = SpecialistResponse(
         run_id=t.run_id,

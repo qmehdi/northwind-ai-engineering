@@ -96,7 +96,11 @@ def format_report(r: dict[str, Any]) -> str:
 
 
 async def main_async(args: argparse.Namespace) -> dict[str, Any]:
-    client = LLMClient()
+    from nw.config import settings
+    from nw.llm.providers import make_provider
+
+    s = settings()
+    client = LLMClient(make_provider(s), settings=s)
     cases = load_cases(Path(args.cases))
 
     async def judge(q: str, a: str, p: str) -> float:

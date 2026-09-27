@@ -7,7 +7,19 @@
 #   make deploy-gcp TIER=reference     (after the session tier)
 
 locals {
-  registry = "${var.region}-docker.pkg.dev/${var.project}/northwind"
+  registry       = "${var.region}-docker.pkg.dev/${var.project}/northwind"
+  api_key_secret = "northwind-api-key" # created by the session tier
+  # The Session path services the Agent Engine resolver calls as HTTP tools.
+  session_services = toset(["policy", "triage", "semantic"])
+}
+
+# The session tier is applied first in the same project; its services are read here so
+# the resolver on Agent Engine calls Projects 1 to 3 over HTTP with the cohort API key.
+data "google_cloud_run_v2_service" "session" {
+  for_each = local.session_services
+  project  = var.project
+  location = var.region
+  name     = "northwind-${each.key}"
 }
 
 resource "google_project_service" "apis" {
@@ -79,6 +91,21 @@ resource "google_project_iam_member" "agent_engine_armor" {
   member  = "serviceAccount:${google_service_account.agent_engine.email}"
 }
 
+resource "google_project_iam_member" "agent_engine_trace" {
+  project = var.project
+  role    = "roles/cloudtrace.agent"
+  member  = "serviceAccount:${google_service_account.agent_engine.email}"
+}
+
+# The runtime reads the cohort API key from Secret Manager so the resolver starts with
+# auth on and sends the key to the Session path tools.
+resource "google_secret_manager_secret_iam_member" "agent_engine_api_key" {
+  project   = var.project
+  secret_id = local.api_key_secret
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.agent_engine.email}"
+}
+
 module "mcp" {
   source         = "../modules/service"
   name           = "mcp"
@@ -88,9 +115,10 @@ module "mcp" {
   cpu            = "2"
   memory         = "4Gi"
   invoke_models  = false
+  timeout        = 300
   env            = { NW_MCP_HOST = "0.0.0.0", NW_MCP_PORT = "8000" }
   public         = false
-  api_key_secret = "northwind-api-key"
+  api_key_secret = local.api_key_secret
 }
 
 resource "google_cloud_run_v2_service_iam_member" "mcp_invoker" {
@@ -102,6 +130,12 @@ resource "google_cloud_run_v2_service_iam_member" "mcp_invoker" {
 }
 
 # ----- the resolver on Agent Engine, from the course image ---------------------------
+#
+# The image is the same nw-agent image the Session path runs; NW_APP switches uvicorn to
+# nw.agent.agentcore:app, which serves the Agent Engine runtime contract
+# (POST /api/reasoning_engine and /api/stream_reasoning_engine with
+# {"class_method": "route", "input": {...}}). class_methods must be declared by hand for a
+# container deployment or the SDK cannot discover the method and every call fails.
 
 resource "google_vertex_ai_reasoning_engine" "resolver" {
   project      = var.project
@@ -113,14 +147,43 @@ resource "google_vertex_ai_reasoning_engine" "resolver" {
     agent_framework = "custom"
     service_account = google_service_account.agent_engine.email
 
+    class_methods = jsonencode([
+      {
+        name        = "route"
+        api_mode    = ""
+        description = "Route one support ticket: triage, retrieval and a proposed resolution"
+        parameters = {
+          type     = "object"
+          required = ["ticket_id", "account_id", "subject", "task"]
+          properties = {
+            ticket_id  = { type = "string" }
+            account_id = { type = "string" }
+            subject    = { type = "string" }
+            task       = { type = "string", description = "The ticket body" }
+          }
+        }
+      }
+    ])
+
     container_spec {
       image_uri = "${local.registry}/nw-agent:${var.image_tag}"
       port      = 8000
     }
 
     deployment_spec {
-      min_instances = 0
-      max_instances = 2
+      min_instances         = 0
+      max_instances         = 2
+      container_concurrency = 5 # 2 x cpu + 1, the provider's recommendation
+      resource_limits       = { cpu = "2", memory = "4Gi" }
+
+      env {
+        name  = "NW_APP"
+        value = "nw.agent.agentcore:app"
+      }
+      env {
+        name  = "PORT"
+        value = "8000"
+      }
       env {
         name  = "NW_TRACK"
         value = "gcp"
@@ -130,20 +193,66 @@ resource "google_vertex_ai_reasoning_engine" "resolver" {
         value = var.project
       }
       env {
+        name  = "NW_GCP_REGION"
+        value = "global"
+      }
+      env {
+        name  = "NW_LOG_FORMAT"
+        value = "json"
+      }
+      env {
+        name  = "NW_TRACE_EXPORT"
+        value = "cloudtrace"
+      }
+      env {
+        name  = "OTEL_SERVICE_NAME"
+        value = "northwind-resolver-agent-engine"
+      }
+      env {
         name  = "NW_AGENT_ROLE"
         value = "resolver"
+      }
+      env {
+        name  = "NW_SPEND_CAP_USD"
+        value = "25"
       }
       env {
         name  = "NW_MODEL_ARMOR_TEMPLATE"
         value = google_model_armor_template.support.name
       }
       env {
-        name  = "NW_MCP_URL"
-        value = "${module.mcp.url}/mcp"
+        name  = "NW_TOOL_BACKEND"
+        value = "http"
+      }
+      env {
+        name  = "NW_POLICY_URL"
+        value = data.google_cloud_run_v2_service.session["policy"].uri
+      }
+      env {
+        name  = "NW_TRIAGE_URL"
+        value = data.google_cloud_run_v2_service.session["triage"].uri
+      }
+      env {
+        name  = "NW_SEMANTIC_URL"
+        value = data.google_cloud_run_v2_service.session["semantic"].uri
+      }
+
+      secret_env {
+        name = "NW_API_KEY"
+        secret_ref {
+          secret  = local.api_key_secret
+          version = "latest"
+        }
       }
     }
   }
-  depends_on = [google_project_service.apis, google_project_iam_member.agent_engine_models]
+  depends_on = [
+    google_project_service.apis,
+    google_project_iam_member.agent_engine_models,
+    google_project_iam_member.agent_engine_armor,
+    google_project_iam_member.agent_engine_trace,
+    google_secret_manager_secret_iam_member.agent_engine_api_key,
+  ]
 }
 
 # ----- optional: pgvector on Cloud SQL ---------------------------------------------
@@ -160,10 +269,15 @@ resource "google_sql_database_instance" "pgvector" {
     edition           = "ENTERPRISE"
     availability_type = "ZONAL"
     disk_size         = 10
+    # Public IP with no authorized networks and SSL required: only the Cloud SQL Auth Proxy
+    # or a client holding the server certificate can connect. Private IP needs a VPC and a
+    # Service Networking peering, which the course does not create.
     ip_configuration {
-      ipv4_enabled = false
+      ipv4_enabled = true
+      ssl_mode     = "ENCRYPTED_ONLY"
     }
   }
+  depends_on = [google_project_service.apis]
 }
 
 output "agent_engine" { value = google_vertex_ai_reasoning_engine.resolver.name }

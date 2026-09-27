@@ -21,7 +21,7 @@ _NO_SAMPLING_PREFIXES = ("claude-sonnet-5", "claude-opus-5", "claude-fable", "cl
 
 
 def rejects_sampling(model: str) -> bool:
-    bare = model.split(".", 1)[-1] if model.startswith("anthropic.") else model
+    bare = model.split(".")[-1]  # strips `anthropic.`, `global.anthropic.`, `us.anthropic.`
     return bare.startswith(_NO_SAMPLING_PREFIXES)
 
 
@@ -43,6 +43,9 @@ def to_vendor_messages(messages: list[Message]) -> list[dict[str, Any]]:
                     ],
                 }
             )
+        elif m.role == "assistant" and m.raw_content:
+            # the model's own blocks, thinking included, exactly as it produced them
+            out.append({"role": "assistant", "content": m.raw_content})
         elif m.role == "assistant" and m.tool_calls:
             blocks: list[dict[str, Any]] = []
             if m.content:
@@ -57,13 +60,55 @@ def to_vendor_messages(messages: list[Message]) -> list[dict[str, Any]]:
     return out
 
 
+CACHE = {"type": "ephemeral"}
+
+
 def to_vendor_tools(tools: list[ToolSpec] | None) -> list[dict[str, Any]] | None:
+    """The tool list is the same on every step of a loop, so its last entry carries a cache
+    breakpoint: everything up to and including it is served from the prompt cache."""
     if not tools:
         return None
-    return [
+    out = [
         {"name": t.name, "description": t.description, "input_schema": t.input_schema}
         for t in tools
     ]
+    out[-1] = {**out[-1], "cache_control": CACHE}
+    return out
+
+
+def build_request(
+    messages: list[Message],
+    *,
+    model: str,
+    system: str | None,
+    tools: list[ToolSpec] | None,
+    max_tokens: int,
+    temperature: float | None,
+) -> dict[str, Any]:
+    """The Messages API request. Pure, so the translation is testable without a network."""
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": to_vendor_messages(messages),
+    }
+    if system:
+        kwargs["system"] = [{"type": "text", "text": system, "cache_control": CACHE}]
+    vendor_tools = to_vendor_tools(tools)
+    if vendor_tools:
+        kwargs["tools"] = vendor_tools
+    if temperature is not None and not rejects_sampling(model):
+        kwargs["temperature"] = temperature
+    return kwargs
+
+
+def _raw_blocks(response: Any) -> list[dict[str, Any]]:
+    out = []
+    for block in response.content:
+        if hasattr(block, "model_dump"):
+            out.append(block.model_dump(exclude_none=True))
+        elif isinstance(block, dict):
+            out.append(dict(block))
+    return out
 
 
 def from_vendor_response(response: Any, *, latency_ms: float) -> Completion:
@@ -96,13 +141,16 @@ def from_vendor_response(response: Any, *, latency_ms: float) -> Completion:
         request_id=response.id,
         model=response.model,
         stop_reason=stop,
+        raw_content=_raw_blocks(response),
     )
     if stop is StopReason.REFUSAL:
         details = getattr(response, "stop_details", None)
         category = getattr(details, "category", None) if details else None
-        raise ContentFilteredError(
+        err = ContentFilteredError(
             f"provider refused the request (category={category})", request_id=response.id
         )
+        err.completion = completion  # the refusal still cost tokens; the client meters it
+        raise err
     return completion
 
 
@@ -162,18 +210,14 @@ class AnthropicMessagesProvider:
         max_tokens: int = 1024,
         temperature: float | None = None,
     ) -> Completion:
-        kwargs: dict[str, Any] = {
-            "model": model,
-            "max_tokens": max_tokens,
-            "messages": to_vendor_messages(messages),
-        }
-        if system:
-            kwargs["system"] = system
-        vendor_tools = to_vendor_tools(tools)
-        if vendor_tools:
-            kwargs["tools"] = vendor_tools
-        if temperature is not None and not rejects_sampling(model):
-            kwargs["temperature"] = temperature
+        kwargs = build_request(
+            messages,
+            model=model,
+            system=system,
+            tools=tools,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
         started = time.perf_counter()
         try:
             response = await self._client.messages.create(**kwargs)

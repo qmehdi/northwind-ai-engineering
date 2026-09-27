@@ -13,6 +13,11 @@ counts, never customer text.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import httpx
+
 import hmac
 import os
 
@@ -23,7 +28,28 @@ from nw.logging import get_logger, log_fields
 
 log = get_logger("nw.auth")
 
-OPEN_PATHS = {"/healthz", "/readyz", "/metrics", "/docs", "/openapi.json"}
+OPEN_PATHS = {"/healthz", "/readyz", "/metrics"}
+
+
+def service_client(timeout: float = 30) -> httpx.AsyncClient:
+    """An HTTP client for one Northwind service calling another: carries the cohort API key
+    when one is configured, and the caller's correlation ID on every request."""
+    import httpx
+
+    from nw.logging import correlation_id
+
+    key = load_api_key()
+
+    async def add_correlation(request: httpx.Request) -> None:
+        cid = correlation_id()
+        if cid:
+            request.headers["x-correlation-id"] = cid
+
+    return httpx.AsyncClient(
+        timeout=timeout,
+        headers={"x-api-key": key} if key else None,
+        event_hooks={"request": [add_correlation]},
+    )
 
 
 def load_api_key() -> str:

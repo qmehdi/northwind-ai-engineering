@@ -20,6 +20,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
+from nw.agent.loop import run_agent
 from nw.agent.orchestrator import (
     SPECIALISTS,
     SpecialistRequest,
@@ -69,6 +70,8 @@ async def lifespan(app: FastAPI):
     state.role = os.environ.get("NW_AGENT_ROLE", "triage")
     state.trace_dir = Path(os.environ.get("NW_TRACE_DIR", "artifacts/traces"))
     try:
+        if state.role not in {*SPECIALISTS, "orchestrator", "resolver"}:
+            raise ValueError(f"unknown NW_AGENT_ROLE {state.role!r}")
         s = settings()
         state.client = LLMClient(make_provider(s), settings=s)
         from nw.agent.screen import from_env
@@ -134,9 +137,24 @@ async def run(req: SpecialistRequest) -> SpecialistResponse:
             cost_usd=t.cost_usd,
             proposed_actions=[p.model_dump() for p in t.proposed_actions],
         )
-    else:
+    elif state.role in SPECIALISTS:
         assert state.registry is not None
-        resp, t = await run_specialist(state.role, req, state.registry, state.client)
+        resp, t = await run_specialist(
+            state.role, req, state.registry, state.client, screener=state.screener
+        )
+    else:
+        # resolver: the whole registry and the hand-built loop, the Session path's deployment
+        assert state.registry is not None
+        t = await run_agent(
+            req.task,
+            state.registry,
+            state.client,
+            max_steps=req.max_steps,
+            budget_usd=req.budget_usd,
+            agent_name=state.role,
+            screener=state.screener,
+        )
+        resp = _response(t)
     t.save(state.trace_dir)
     RUNS.labels(role=state.role, terminated=resp.terminated).inc()
     STEPS.labels(role=state.role).observe(resp.steps)
@@ -171,11 +189,20 @@ async def route_ticket(req: RouteRequest) -> SpecialistResponse:
         raise HTTPException(503, "agent not ready")
     from nw.agent.router import route
 
+    t0 = time.perf_counter()
     t = await route(
-        req.ticket_id, req.account_id, req.subject, req.task, state.registry, state.client
+        req.ticket_id,
+        req.account_id,
+        req.subject,
+        req.task,
+        state.registry,
+        state.client,
+        screener=state.screener,
     )
     t.save(state.trace_dir)
     RUNS.labels(role=t.agent, terminated=t.terminated.value).inc()
+    STEPS.labels(role=t.agent).observe(t.n_steps)
+    LATENCY.labels(role=t.agent).observe(time.perf_counter() - t0)
     COST.labels(role=t.agent).inc(t.cost_usd)
     for p in t.proposed_actions:
         PROPOSALS.labels(role=t.agent, tool=p.tool).inc()

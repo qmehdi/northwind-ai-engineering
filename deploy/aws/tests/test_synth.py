@@ -1,6 +1,7 @@
 """Review before deploy: synthesise both tiers and check what a failed deploy would
 otherwise teach us one rollback at a time."""
 
+import csv
 import json
 import os
 import shutil
@@ -85,6 +86,32 @@ def test_session_has_four_lambda_functions_with_urls_tracing_and_secret(session)
     assert len(resources(session, "AWS::CloudWatch::Alarm")) == 8
 
 
+def test_outputs_have_the_keys_the_guide_reads(session):
+    """The guide runs `jq -r '.["northwind-session"].UrlAgent'` on outputs.json, so the
+    logical ids must be exactly these and not the construct-path prefixed defaults."""
+    keys = set(session["Outputs"])
+    assert {"UrlTriage", "UrlSemantic", "UrlPolicy", "UrlAgent", "ApiKeySecretArn"} <= keys, keys
+    assert not any(k.startswith("Session") for k in keys), keys
+
+
+def test_agent_function_has_the_capstone_environment(session):
+    fn = next(
+        f
+        for f in resources(session, "AWS::Lambda::Function").values()
+        if f["Properties"]["FunctionName"] == "northwind-agent"
+    )
+    env = fn["Properties"]["Environment"]["Variables"]
+    assert env["NW_AGENT_ROLE"] == "resolver" and env["NW_SPEND_CAP_USD"] == "25"
+
+
+def test_dashboard_bedrock_panels_carry_the_model_dimension(session):
+    board = next(iter(resources(session, "AWS::CloudWatch::Dashboard").values()))["Properties"]
+    body = json.dumps(board["DashboardBody"])
+    for model in ("claude-sonnet-5", "claude-opus-5", "claude-haiku-4-5"):
+        assert model in body, f"{model} missing from the dashboard"
+    assert "ModelId" in body and "InputTokenCount" in body and "InvocationThrottles" in body
+
+
 def test_model_access_is_scoped_to_the_three_models(session, reference):
     for t in (session, reference):
         for st in statements(t):
@@ -129,8 +156,18 @@ def test_reference_runtimes_are_arm64_and_gated(reference):
     assert gateway["AuthorizerType"] == "AWS_IAM"
     assert gateway["PolicyEngineConfiguration"]["Mode"] == "ENFORCE"
     policies = resources(reference, "AWS::BedrockAgentCore::Policy")
-    assert any(
-        "escalate" in p["Properties"]["Definition"]["Cedar"]["Statement"] for p in policies.values()
+    statements = [p["Properties"]["Definition"]["Cedar"]["Statement"] for p in policies.values()]
+    escalate = next(s for s in statements if "escalate" in s)
+    # The gateway's schema: actions are <target>___<tool>, IAM callers are IamEntity with an id.
+    assert 'AgentCore::Action::"northwind-tools___escalate"' in escalate
+    assert "assumed-role/NorthwindApprovers/" in escalate and "hasTag" not in escalate
+    allow = next(s for s in statements if "search_policies" in s)
+    assert (
+        "principal is AgentCore::IamEntity" in allow and "resource is AgentCore::Gateway" in allow
+    )
+    assert 'AgentCore::Action::"northwind-tools___check_entitlement"' in allow
+    assert all(
+        p["Properties"]["ValidationMode"] == "FAIL_ON_ANY_FINDINGS" for p in policies.values()
     )
     target = next(iter(resources(reference, "AWS::BedrockAgentCore::GatewayTarget").values()))[
         "Properties"
@@ -140,6 +177,24 @@ def test_reference_runtimes_are_arm64_and_gated(reference):
         == "GATEWAY_IAM_ROLE"
     )
     assert "invocations?qualifier=DEFAULT" in json.dumps(target["TargetConfiguration"])
+    assert target["Name"] == "northwind-tools"
+    agent = next(
+        r for r in runtimes.values() if r["Properties"]["ProtocolConfiguration"] == "HTTP"
+    )["Properties"]
+    env = agent["EnvironmentVariables"]
+    assert env["NW_APP"] == "nw.agent.agentcore:app" and env["PORT"] == "8080"
+
+
+def test_gateway_role_is_named_and_scoped_per_the_devguide(reference):
+    role = next(
+        v for k, v in resources(reference, "AWS::IAM::Role").items() if k.startswith("GatewayRole")
+    )["Properties"]
+    assert "BedrockAgentCore" in role["RoleName"], "iam:PassRole is scoped to *BedrockAgentCore*"
+    trust = role["AssumeRolePolicyDocument"]["Statement"][0]["Condition"]
+    assert "aws:SourceArn" in json.dumps(trust) and "aws:SourceAccount" in json.dumps(trust)
+    for st in statements(reference):
+        if st.get("Sid") == "PolicyEngineRead":
+            assert "policy-engine/*" not in json.dumps(st["Resource"]), "GetPolicyEngine wildcard"
 
 
 def test_reference_guardrail_vectors_and_trust(reference):
@@ -191,18 +246,22 @@ def test_no_dependency_cycles(reference):
         visit(n)
 
 
-def _nag_errors(tier: str) -> list[str]:
-    manifest = json.loads((HERE / "cdk.out.test" / tier / "manifest.json").read_text())
-    out = []
-    for art in manifest.get("artifacts", {}).values():
-        for path, entries in art.get("metadata", {}).items():
-            for e in entries:
-                if e.get("type") == "aws:cdk:error":
-                    out.append(f"{path}: {e.get('data')}")
-    return out
+def _nag_findings(tier: str) -> list[str]:
+    """cdk-nag records every finding in AwsSolutions-<stack>-NagReport.csv; the manifest only
+    carries errors when the synth is run through the CDK CLI, so the CSV is what to read."""
+    out = HERE / "cdk.out.test" / tier
+    report = next(out.glob("AwsSolutions-*-NagReport.csv"))
+    with report.open() as f:
+        rows = list(csv.DictReader(f))
+    assert rows, "empty nag report"
+    return [
+        f"{r['Rule ID']} {r['Resource ID']}: {r['Rule Info']}"
+        for r in rows
+        if r["Compliance"] == "Non-Compliant"
+    ]
 
 
 def test_cdk_nag_has_no_unsuppressed_findings(session, reference):
     for tier in ("session", "reference"):
-        errors = _nag_errors(tier)
-        assert not errors, "\n".join(errors)
+        findings = _nag_findings(tier)
+        assert not findings, "\n".join(findings)

@@ -113,13 +113,17 @@ def window(text: str, max_tokens: int, overlap_tokens: int) -> list[str]:
 def chunk_document(
     doc: Document, *, max_tokens: int = 350, overlap_tokens: int = 60
 ) -> list[Chunk]:
+    """A chunk id is sha1 of document, heading and the piece's index within its section,
+    not its position in the document. Changing the window size then keeps the id of
+    every section that is not split, so a golden set built at one size still scores
+    the same sections at another."""
     chunks: list[Chunk] = []
     order = 0
     for heading, text in split_sections(doc.body):
-        for piece in window(text, max_tokens, overlap_tokens):
+        for piece_index, piece in enumerate(window(text, max_tokens, overlap_tokens)):
             red = redact(piece)
             content = f"{doc.title} / {heading}\n\n{red.text}"
-            cid = hashlib.sha1(f"{doc.doc_id}|{heading}|{order}".encode()).hexdigest()[:12]
+            cid = hashlib.sha1(f"{doc.doc_id}|{heading}|{piece_index}".encode()).hexdigest()[:12]
             chunks.append(
                 Chunk(
                     id=f"{doc.doc_id}#{cid}",

@@ -215,14 +215,15 @@ def _register_local(reg: ToolRegistry, artifacts: Path) -> None:
 
 
 def _register_http(reg: ToolRegistry) -> None:
-    import httpx
 
     urls = {
         "policy": os.environ.get("NW_POLICY_URL", "http://localhost:8003"),
         "triage": os.environ.get("NW_TRIAGE_URL", "http://localhost:8001"),
         "semantic": os.environ.get("NW_SEMANTIC_URL", "http://localhost:8002"),
     }
-    client = httpx.AsyncClient(timeout=30)
+    from nw.auth import service_client
+
+    client = service_client(timeout=30)
 
     @reg.tool(
         "search_policies",

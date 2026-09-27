@@ -14,9 +14,18 @@ from nw.llm.errors import SpendCapExceeded
 from nw.llm.prices import price_for
 from nw.llm.types import Usage
 
+_warned: set[str] = set()
+
 
 def cost_usd(model: str, usage: Usage) -> float:
-    price, _ = price_for(model)
+    price, fallback = price_for(model)
+    if fallback and model not in _warned:
+        _warned.add(model)
+        from nw.logging import get_logger
+
+        get_logger("nw.llm.cost").warning(
+            "no price for model %s; using the fallback price, add it to nw/llm/prices.py", model
+        )
     return (
         usage.input_tokens * price.input_per_mtok
         + usage.output_tokens * price.output_per_mtok

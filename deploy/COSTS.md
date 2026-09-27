@@ -1,6 +1,6 @@
 # Cost sheet
 
-Every figure is an estimate from vendor list prices fetched on 2026-09-08 and 2026-09-27 (see the instructor research notes for sources) and must be replaced by the measured figure after the validation run. Model prices: Bedrock global endpoint prices for the AWS track (Sonnet 5 is 3.00 and 15.00 USD per million tokens since 2026-09-01, when launch pricing ended; Opus 5 at 5.00 and 25.00; Haiku 4.5 at 1.00 and 5.00) and first-party list prices for Vertex. The AWS figures below are about 40 percent higher than the same runs on the launch price. Assumptions: cohort of 25, six sessions, us-east-1 and us-central1, participants run in their own accounts.
+Every figure is an estimate from vendor list prices fetched on 2026-09-08 and 2026-09-27 (see the instructor research notes for sources) and must be replaced by the measured figure after the validation run. Model prices: Bedrock global endpoint prices for the AWS track (Sonnet 5 is 3.00 and 15.00 USD per million tokens since 2026-09-01, when launch pricing ended; Opus 5 at 5.00 and 25.00; Haiku 4.5 at 1.00 and 5.00) and first-party list prices for Vertex. The AWS figures below are about 50 percent higher than the same runs on the launch price. Assumptions: cohort of 25, six sessions, us-east-1 and us-central1, participants run in their own accounts.
 
 ## Model spend, both tracks
 
@@ -11,11 +11,11 @@ Every figure is an estimate from vendor list prices fetched on 2026-09-08 and 20
 | Session 4 unjudged experiments, 3 runs | 77 answers at 3k in, 0.3k out each | under 1 USD each | 2.5 |
 | Session 5 adversarial set, hand-built loop | 15 runs at about 5 steps | 1.6 USD measured on AWS at launch pricing, about 2.4 at the current Sonnet 5 price | 2.5 |
 | Session 5 framework port | same | under 1 USD | 1 |
-| Session 6 capstone runs and demos | 50 tickets routed | about 2 USD | 2 |
+| Session 6 capstone runs and demos | 20 tickets through the loop and the same 20 through the router, 4 at a time, plus the latency and rollback drills | about 3 USD | 3 |
 | Headroom for reruns and mistakes | | | 5 |
 | **Model spend per participant** | | | **about 20 USD** |
 
-The Session 1 spend cap of 10 USD per session is set in `.env`; the Session 4 judged run is the only step that approaches it.
+The Session 1 spend cap of 10 USD per session is set in `.env`; the Session 4 judged run is the only step that approaches it. The deployed agent runs with `NW_SPEND_CAP_USD=25` on both tracks so the whole capstone fits under one cap.
 
 ## AWS track
 
@@ -23,19 +23,22 @@ The Session 1 spend cap of 10 USD per session is set in `.env`; the Session 4 ju
 
 | Item | Rate | Assumption | Cost |
 | --- | --- | --- | --- |
-| Lambda compute, arm64 | 0.0000133334 USD per GB-second | about 5,400 GB-seconds: agent 8 GB, policy and semantic 4 GB, triage 2 GB, four cold starts, 50 routed tickets | 0.07 USD, inside the 400,000 GB-second free tier |
+| Lambda compute, arm64 | 0.0000133334 USD per GB-second | about 12,000 GB-seconds: 40 capstone runs on the 8 GB agent at about 30 seconds each, 20 latency runs, the tool functions at 2 to 4 GB behind them, a handful of cold starts | 0.16 USD, inside the 400,000 GB-second free tier |
 | Lambda requests | 0.20 USD per million | a few hundred | 0 |
 | Ephemeral storage above 512 MB | 0.0000000309 USD per GB-second | 1 GB configured | under 0.01 USD |
-| ECR storage | 0.10 USD per GB-month | about 4 GB of images | 0.40 USD per month |
+| ECR storage | 0.10 USD per GB-month | about 2.5 GB per image with CPU-only torch wheels (the CUDA builds were 6 to 8 GB); the four images share their dependency layers in one repository, about 4 GB stored | 0.40 USD per month |
 | Secrets Manager, the API key | 0.40 USD per secret per month, 0.05 USD per 10,000 calls | one secret, read once per cold start | 0.40 USD per month |
 | X-Ray with Transaction Search | 0.35 USD per GB of spans, 1 percent indexed free, 100,000 traces free per month | a few MB | 0 |
-| CloudWatch Logs, dashboard, alarms, SNS, Budgets | free tier | | 0 |
+| CloudWatch Logs ingestion | 0.50 USD per GB after 5 GB free per month | a few MB of JSON logs | 0 |
+| CloudWatch dashboard, alarms, SNS, Budgets | free tier | | 0 |
+| NAT gateway and data transfer | | none by design: no VPC, function URLs, responses of a few KB | 0 |
+| Cold start | billed as ordinary duration | first request after idle, measured in Step 6 | 20 to 40 seconds for the agent image |
 | **During the 2-hour session** | | | **under 0.10 USD** |
 | **Idle per day if left running** | | Lambda bills nothing idle; images and the secret | **0.03 USD** |
 | **Idle per month if left running** | | | **about 0.80 USD** |
 | After `make stop` (reserved concurrency 0) | | | about 0.80 USD per month |
 | After `make destroy` | | | 0 |
-| Always warm instead: provisioned concurrency on the agent | 0.0000041667 USD per GB-second | 8 GB, one instance, all day | 0.12 USD per hour, about 2.90 USD per day, about 88 USD per month |
+| Always warm instead: provisioned concurrency on the agent | 0.0000033334 USD per GB-second, arm64 (x86 is 0.0000041667) | 8 GB, one instance, all day | 0.10 USD per hour, about 2.30 USD per day, about 70 USD per month |
 
 Credit to request per participant for the AWS track: 20 USD of model spend plus 5 USD headroom, **25 USD**, assuming they destroy after the session. Say that in the pre-session message. App Runner, the service this path used first, is closed to new customers; ECS Express Mode is the always-warm alternative and would add about 1.20 USD per day for four small Fargate tasks plus the load balancer.
 
@@ -68,11 +71,12 @@ Argus, the reference project this course borrows from, cost about 400 USD a mont
 | Cloud Run, request-based billing | 0.000024 USD per vCPU-second, 0.0000025 per GiB-second while serving | 5 vCPU serving 20 minutes of the session | 0.15 USD |
 | Cloud Run idle, min instances 0 | 0 | | 0 |
 | Cloud Run free tier | 2M requests, 180k vCPU-seconds per month | covers the session | 0 |
-| Artifact Registry | 0.10 USD per GB-month | about 4 GB | 0.40 USD per month |
+| Artifact Registry | 0.10 USD per GB-month | about 2.5 GB per image with CPU-only torch wheels, five images sharing dependency layers, about 5 GB | 0.50 USD per month |
+| Secret Manager, the API key | 0.06 USD per active secret version per month after six free, 0.03 USD per 10,000 access operations after 10,000 free | one version, read at startup | 0 |
 | Cloud Monitoring, Trace, Logging | free tier | | 0 |
 | **During the 2-hour session** | | | **under 0.20 USD** |
 | **Idle per day** | | min instances 0 | **0** |
-| Cold start | | first request after idle, measured in Step 5 | 20 to 40 seconds for the agent image |
+| Cold start | | first request after idle, measured in Step 6 | 20 to 40 seconds for the agent image |
 | After `make destroy` | | | 0 |
 
 Credit to request per participant for the GCP track: 20 USD of model spend plus 5 USD headroom, **25 USD**.

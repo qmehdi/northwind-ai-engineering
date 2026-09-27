@@ -16,19 +16,34 @@ enable_transaction_search() {
   aws xray update-trace-segment-destination --destination CloudWatchLogs >/dev/null
   aws xray update-indexing-rule --name Default --rule '{"Probabilistic": {"DesiredSamplingPercentage": 1}}' >/dev/null
 }
+# The Reference stack's managed retriever is empty after the deploy; fill it from the same
+# chunks file the images carry. Idempotent (vectors are upserted by chunk id).
+publish_vectors() {
+  local bucket
+  bucket="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["northwind-reference"]["PolicyVectorBucket"])' deploy/aws/outputs.json)"
+  NW_AWS_REGION="$CDK_DEFAULT_REGION" uv run python -m nw.policy.publish_vectors --bucket "$bucket" --region "$CDK_DEFAULT_REGION"
+}
+# The CDK virtualenv and the pinned CDK CLI (deploy/aws/package.json): `make setup-aws` creates both.
+if [ ! -x deploy/aws/.venv/bin/python ] || [ ! -x deploy/aws/node_modules/.bin/cdk ]; then
+  echo "deploy/aws toolchain missing; running make setup-aws"
+  make setup-aws
+fi
 CTX=(-c "tier=$TIER" -c "alertEmail=${NW_ALERT_EMAIL:-}" -c "budgetUsd=${NW_BUDGET_USD:-100}")
 cd deploy/aws
+# `npx --yes cdk` runs the aws-cdk version pinned in package.json without a global install.
 case "$ACTION" in
-  synth)   .venv/bin/python -m pytest -q tests && npx cdk synth "${CTX[@]}" -q ;;
-  diff)    npx cdk diff "${CTX[@]}" ;;
+  synth)   .venv/bin/python -m pytest -q tests && npx --yes cdk synth "${CTX[@]}" -q ;;
+  diff)    npx --yes cdk diff "${CTX[@]}" ;;
   deploy)
     .venv/bin/python -m pytest -q tests
     echo "Read deploy/COSTS.md. Deploying tier=$TIER to account $CDK_DEFAULT_ACCOUNT in $CDK_DEFAULT_REGION."
-    npx cdk bootstrap "aws://$CDK_DEFAULT_ACCOUNT/$CDK_DEFAULT_REGION" -q
+    echo "The first deploy of a tier creates IAM roles, so cdk asks y/n once before it starts."
+    npx --yes cdk bootstrap "aws://$CDK_DEFAULT_ACCOUNT/$CDK_DEFAULT_REGION" -q
     enable_transaction_search
-    npx cdk deploy "${CTX[@]}" --require-approval broadening --outputs-file outputs.json
+    npx --yes cdk deploy "${CTX[@]}" --require-approval broadening --outputs-file outputs.json
+    if [ "$TIER" = "reference" ]; then cd ../.. && publish_vectors; fi
     ;;
-  destroy) npx cdk destroy "${CTX[@]}" --force ;;
+  destroy) npx --yes cdk destroy "${CTX[@]}" --force ;;
   stop)
     # Lambda bills nothing while idle. Stop means reserved concurrency 0: every invocation is
     # refused until start removes the limit. Images and the secret keep costing under 1 USD a month.

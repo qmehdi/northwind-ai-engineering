@@ -95,3 +95,13 @@ markers = [
     "session06: Session 6, Capstone and deployment",
     "live: needs cloud credentials and spends money",
 ]
+
+# Linux images (Lambda, Cloud Run, AgentCore) get CPU-only PyTorch wheels: the default index
+# resolves torch with the CUDA 13 stack, about 3 GB per image that no service uses.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu", marker = "sys_platform == 'linux'" }

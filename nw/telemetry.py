@@ -107,6 +107,16 @@ def instrument_app(app: Any) -> None:
 
     FastAPIInstrumentor.instrument_app(app, excluded_urls="healthz,readyz,metrics")
     HTTPXClientInstrumentor().instrument()
+    if os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
+        # Lambda freezes the sandbox as soon as the response is out, so the batch exporter's
+        # thread never gets to run; flush on the way out instead.
+        @app.middleware("http")
+        async def flush_spans(request: Any, call_next: Any) -> Any:
+            response = await call_next(request)
+            provider = trace.get_tracer_provider()
+            if isinstance(provider, TracerProvider):
+                provider.force_flush(timeout_millis=2000)
+            return response
 
 
 def tracer(name: str) -> trace.Tracer:

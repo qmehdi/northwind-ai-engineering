@@ -12,7 +12,11 @@ def suppress_known(stack: Stack) -> None:
         [
             {
                 "id": "AwsSolutions-IAM5",
-                "reason": "ecr:GetAuthorizationToken, xray:Put* and cloudwatch:PutMetricData (namespace-conditioned) require '*' per the AgentCore runtime-permissions devguide; log-stream ARNs need the wildcard suffix; ECR asset repositories are account-scoped.",
+                "reason": "ecr:GetAuthorizationToken, xray:Put* and cloudwatch:PutMetricData (namespace-conditioned) require '*' per the AgentCore runtime-permissions devguide; log-stream ARNs need the wildcard suffix; ECR asset repositories are account-scoped. The gateway role's AuthorizeAction and PartiallyAuthorizeActions run on gateway/* because the gateway ARN is not known until the gateway exists and the role must be attached first (devguide policy-permissions); InvokeAgentRuntime on <runtime>/* covers the runtime's endpoint qualifiers.",
+            },
+            {
+                "id": "AwsSolutions-SMG4",
+                "reason": "The API key is rotated by redeploying; a rotation Lambda is out of scope for a two-hour session.",
             },
             {
                 "id": "AwsSolutions-IAM4",

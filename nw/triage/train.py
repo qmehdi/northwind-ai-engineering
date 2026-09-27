@@ -54,7 +54,7 @@ def labels(rows: list[dict[str, Any]]) -> np.ndarray:
 def build_pipeline(class_weight: str | dict | None = "balanced", C: float = 4.0) -> Pipeline:
     """Features, then a linear classifier. Linear is deliberate: it trains in seconds on a
     laptop, its coefficients are readable, and on short texts it is hard to beat by much."""
-    clf = LogisticRegression(max_iter=2000, C=C)  # Step 4: what about the 4 percent?
+    clf = LogisticRegression(max_iter=2000, C=C)  # Step 3: what about the 4 percent?
     return Pipeline([("features", build_features()), ("clf", clf)])
 
 
@@ -128,6 +128,7 @@ def train(
     class_weight: str | None = "balanced",
     calibrate: bool = True,
     target_recall: float = 0.90,
+    min_precision: float = 0.25,
     seed: int = 0,
 ) -> tuple[TriageModel, dict[str, Any]]:
     rows = load_tickets(data)
@@ -136,11 +137,13 @@ def train(
     pipeline = build_pipeline(class_weight=class_weight)
     pipeline.fit(train_rows, labels(train_rows))
 
-    final, classes = pipeline, list(pipeline.named_steps["clf"].classes_)  # Step 6
+    final, classes = pipeline, list(pipeline.named_steps["clf"].classes_)  # Step 5
 
     provisional = TriageModel(pipeline=final, classes=classes, p0_threshold=0.5, metadata={})
     val_proba = provisional.predict_proba(val_rows)
-    threshold = choose_p0_threshold(val_proba[:, 0], labels(val_rows), target_recall=target_recall)
+    threshold = choose_p0_threshold(
+        val_proba[:, 0], labels(val_rows), target_recall=target_recall, min_precision=min_precision
+    )
 
     version = f"{dt.datetime.now(dt.UTC).strftime('%Y%m%d%H%M')}-{git_sha()}-{data_hash(data)}"
     model = TriageModel(
@@ -159,6 +162,7 @@ def train(
             "class_weight": class_weight,
             "calibrated": calibrate,
             "target_p0_recall": target_recall,
+            "min_p0_precision": min_precision,
             "seed": seed,
         },
     )
@@ -208,6 +212,7 @@ def main() -> int:
     ap.add_argument("--no-class-weight", action="store_true")
     ap.add_argument("--no-calibration", action="store_true")
     ap.add_argument("--target-recall", type=float, default=0.90)
+    ap.add_argument("--min-precision", type=float, default=0.25)
     args = ap.parse_args()
     model, report = train(
         args.data,
@@ -215,6 +220,7 @@ def main() -> int:
         class_weight=None if args.no_class_weight else "balanced",
         calibrate=not args.no_calibration,
         target_recall=args.target_recall,
+        min_precision=args.min_precision,
     )
     print(f"model {model.version}\n")
     print(format_report(report))

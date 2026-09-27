@@ -56,12 +56,18 @@ async def run_one(
     t = Trajectory(run_id=uuid.uuid4().hex[:10], agent="resolver-adk", task=task)
     calls: list[str] = []
     final_parts: list[str] = []
+    paused_on: str | None = None
     try:
         message = types.Content(role="user", parts=[types.Part(text=untrusted(task))])
         async for event in runner.run_async(
             user_id="eval", session_id=session.id, new_message=message
         ):
             for call in event.get_function_calls() or []:
+                if call.name == "adk_request_confirmation":
+                    # `require_confirmation` pauses the run here for a human; the proposal
+                    # was recorded when the tool itself was called.
+                    paused_on = paused_on or (calls[-1] if calls else call.name)
+                    continue
                 calls.append(call.name)
                 if is_irreversible(registry, call.name):
                     t.proposed_actions.append(
@@ -71,14 +77,29 @@ async def run_one(
                     )
             if event.is_final_response() and event.content and event.content.parts:
                 final_parts.extend(p.text for p in event.content.parts if getattr(p, "text", None))
-        t.final = "\n".join(final_parts)
-        t.terminated = Termination.ANSWER
+        finish(t, final_parts, paused_on=paused_on)
     except Exception as exc:  # noqa: BLE001
         t.terminated = Termination.ERROR
         t.final = f"Stopped: {type(exc).__name__}: {exc}"
     t.tools_called = list(calls)
     t.steps = [Step(index=i, tool=c) for i, c in enumerate(calls)]
     return t
+
+
+def finish(t: Trajectory, final_parts: list[str], *, paused_on: str | None = None) -> None:
+    """How the run ended, from what the runner yielded. ANSWER only when the model produced
+    a final text; a run paused on the confirmation gate is an answer too (the proposal is
+    recorded and nothing executed, as in the hand-built loop); a runner that stops with
+    neither, its step limit for instance, is an ERROR, never a silent success."""
+    text = "\n".join(p for p in final_parts if p).strip()
+    if text:
+        t.final, t.terminated = text, Termination.ANSWER
+    elif paused_on:
+        t.final = f"Paused for human confirmation of {paused_on}; the action was proposed, not run."
+        t.terminated = Termination.ANSWER
+    else:
+        t.final = "Stopped: the runner ended without a final response."
+        t.terminated = Termination.ERROR
 
 
 async def main_async(args: argparse.Namespace) -> int:

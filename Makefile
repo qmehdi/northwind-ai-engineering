@@ -1,4 +1,4 @@
-.PHONY: setup check test lint fmt preflight session01 session02 train-triage serve-triage image-triage images up up-observability down session03 train-semantic export-semantic benchmark index serve-semantic session04 index-policy eval-policy calibrate-judge serve-policy session05 agent-eval replay specialists agent-eval-strands agent-eval-adk mcp
+.PHONY: setup setup-aws check test lint fmt preflight session01 session02 train-triage serve-triage image-triage images up up-observability down session03 train-semantic export-semantic benchmark index serve-semantic session04 index-policy eval-policy calibrate-judge serve-policy session05 agent-eval replay specialists agent-eval-strands agent-eval-adk mcp
 
 setup:            ## Create the virtualenv and install everything, deep learning and agents included
 	uv sync --extra dev --extra dl --extra agents --extra agents-aws --extra agents-gcp
@@ -104,9 +104,13 @@ mcp:              ## The tool registry as an MCP server on :8020
 # ----- Session 6: deployment. Read deploy/COSTS.md before any of these. -----
 TIER ?= session
 
+setup-aws:        ## AWS track: the CDK virtualenv and the pinned CDK CLI (Node 22 or later, Docker running)
+	uv venv deploy/aws/.venv -p 3.12 && uv pip install -p deploy/aws/.venv/bin/python -r deploy/aws/requirements.txt
+	cd deploy/aws && npm install --no-audit --no-fund
+
 session06:        ## Session 6 acceptance tests (router, plus the CDK synth review on the aws track)
 	uv run pytest -q tests/session06
-	cd deploy/aws && .venv/bin/python -m pytest -q tests
+	@if [ -x deploy/aws/.venv/bin/python ]; then cd deploy/aws && .venv/bin/python -m pytest -q tests; else echo "aws synth review skipped: no deploy/aws/.venv (gcp track)"; fi
 
 deploy-aws:       ## AWS: synth test, then cdk deploy. TIER=session|reference
 	TIER=$(TIER) scripts/deploy_aws.sh deploy
