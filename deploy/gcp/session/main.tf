@@ -197,3 +197,39 @@ output "api_key" {
   value     = random_password.api_key.result
   sensitive = true
 }
+
+# Every service logs `drift_alert` when its drift signal passes the bar (input and
+# prediction PSI, retrieval confidence and refusal rate, agent cap and error rates); a
+# log-based metric counts those lines across the northwind services and the alert policy
+# emails on the first one, with the service name as a label.
+resource "google_logging_metric" "triage_drift" {
+  project = var.project
+  name    = "northwind-drift-alerts"
+  filter  = "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=~\"^northwind-\" AND jsonPayload.msg=\"drift_alert\""
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_monitoring_alert_policy" "triage_drift" {
+  project      = var.project
+  display_name = "northwind drift"
+  combiner     = "OR"
+  conditions {
+    display_name = "drift alert logged"
+    condition_threshold {
+      filter          = "metric.type=\"logging.googleapis.com/user/${google_logging_metric.triage_drift.name}\" AND resource.type=\"cloud_run_revision\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0
+      duration        = "0s"
+      aggregations {
+        alignment_period   = "300s"
+        per_series_aligner = "ALIGN_SUM"
+      }
+    }
+  }
+  notification_channels = [for c in google_monitoring_notification_channel.email : c.id]
+  depends_on            = [google_project_service.apis]
+}

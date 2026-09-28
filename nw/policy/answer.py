@@ -4,6 +4,10 @@ Three rules the model does not get to break:
 1. If retrieval is weak, refuse. Do not answer from parametric memory.
 2. Every citation must be a chunk ID that was actually in the context.
 3. The answer is structured, validated, and repaired once, through LLMClient.
+
+The system prompt is registered in `nw.llm.prompts` and every Answer carries its
+`prompt_version` (`policy.answer@<hash>`), so a faithfulness number in a report can always
+be traced to the exact prompt that produced it.
 """
 
 from __future__ import annotations
@@ -14,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from nw.config import ModelRole
 from nw.llm import LLMClient
+from nw.llm.prompts import register
 from nw.policy.retrieval import Retrieved
 
 REFUSAL = "I cannot answer that from Northwind's current policies. Please contact support."
@@ -36,6 +41,7 @@ class Answer(BaseModel):
     reason: str | None = None
     context_ids: list[str]
     dropped_citations: list[str] = Field(default_factory=list)
+    prompt_version: str = ""
 
 
 SYSTEM = """You answer questions about Northwind Cloud's policies for a support agent.
@@ -43,6 +49,8 @@ Use only the numbered context passages. Quote numbers, limits and dates exactly 
 Cite every passage you relied on by its id, and cite nothing else.
 If the passages do not contain the answer, set answerable to false and say so briefly.
 Never invent a policy, a number or a date."""
+
+ANSWER_PROMPT = register("policy.answer", SYSTEM)
 
 
 def build_context(retrieved: list[Retrieved], budget_tokens: int = 2500) -> tuple[str, list[str]]:

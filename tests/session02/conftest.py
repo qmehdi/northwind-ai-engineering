@@ -83,11 +83,13 @@ def make_rows(n: int, seed: int = 1) -> list[dict]:
             body = body.lower().replace(".", "")
         rows.append(
             {
-                "ticket_id": f"T-{i}",
+                "ticket_id": f"T-{i:06d}",
+                "account_id": f"NW-{10000 + i % 500:05d}",
                 "subject": subj,
-                "body": body,
+                "body": f"{body}\nRef {i}",  # unique text, so no duplicates or split leaks
                 "priority": p,
                 "split": "train" if i % 10 < 8 else ("val" if i % 10 == 8 else "test"),
+                "language": "en",
             }
         )
     return rows

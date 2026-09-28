@@ -10,6 +10,7 @@ from nw.llm.errors import (
     StructuredOutputError,
     TerminalError,
 )
+from nw.llm.prompts import Prompt, register
 from nw.llm.provider import LLMProvider
 from nw.llm.retry import RetryPolicy
 from nw.llm.types import (
@@ -30,8 +31,10 @@ __all__ = [
     "LLMError",
     "LLMProvider",
     "Message",
+    "Prompt",
     "RetryPolicy",
     "RetryableError",
+    "register",
     "SpendCapExceeded",
     "StopReason",
     "StructuredOutputError",

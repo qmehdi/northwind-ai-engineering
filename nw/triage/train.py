@@ -17,6 +17,7 @@ import hashlib
 import json
 import subprocess
 import sys
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,8 @@ from sklearn.metrics import (
 )
 from sklearn.pipeline import Pipeline
 
+from nw.triage.data_check import profile as profile_data
+from nw.triage.data_check import validate
 from nw.triage.features import PRIORITIES, build_features
 from nw.triage.model import TriageModel
 
@@ -76,13 +79,30 @@ def expected_calibration_error(proba_max: np.ndarray, correct: np.ndarray, bins:
     return float(ece)
 
 
-def evaluate(model: TriageModel, rows: list[dict[str, Any]]) -> dict[str, Any]:
+def evaluate(
+    model: TriageModel, rows: list[dict[str, Any]], *, by_language: bool = True
+) -> dict[str, Any]:
     y = labels(rows)
     proba = model.predict_proba(rows)
     pred = np.asarray([model.decide(p)[0] for p in proba])
     argmax = np.asarray([PRIORITIES[int(np.argmax(p))] for p in proba])
     is_p0 = y == "P0"
+    langs: dict[str, Any] = {}
+    if by_language and any("language" in r for r in rows):
+        lang = np.asarray([r.get("language", "en") for r in rows])
+        for code in sorted(set(lang)):
+            m = lang == code
+            langs[code] = {
+                "n": int(m.sum()),
+                "macro_f1": float(
+                    f1_score(y[m], pred[m], average="macro", labels=PRIORITIES, zero_division=0)
+                ),
+                "p0_recall": float(recall_score(is_p0[m], pred[m] == "P0", zero_division=0))
+                if is_p0[m].any()
+                else None,
+            }
     return {
+        "by_language": langs,
         "n": len(rows),
         "accuracy": float((pred == y).mean()),
         "macro_f1": float(f1_score(y, pred, average="macro", labels=PRIORITIES)),
@@ -130,8 +150,18 @@ def train(
     target_recall: float = 0.90,
     min_precision: float = 0.25,
     seed: int = 0,
+    promote: bool = True,
 ) -> tuple[TriageModel, dict[str, Any]]:
+    """Validate, train, evaluate, record the run, write the model card, then run the
+    promotion gate. With `promote=False` the run is a registered candidate only."""
     rows = load_tickets(data)
+    findings = validate(rows)
+    blocking = [f for f in findings if f.blocking]
+    if blocking:
+        raise SystemExit(
+            "data check failed: " + "; ".join(f"{f.check}: {f.detail}" for f in blocking)
+        )
+    data_profile = profile_data(rows, data_hash(data), findings)
     splits = by_split(rows)
     train_rows, val_rows, test_rows = splits["train"], splits["val"], splits["test"]
     pipeline = build_pipeline(class_weight=class_weight)
@@ -145,7 +175,7 @@ def train(
         val_proba[:, 0], labels(val_rows), target_recall=target_recall, min_precision=min_precision
     )
 
-    version = f"{dt.datetime.now(dt.UTC).strftime('%Y%m%d%H%M')}-{git_sha()}-{data_hash(data)}"
+    version = f"{dt.datetime.now(dt.UTC).strftime('%Y%m%d%H%M%S')}-{git_sha()}-{data_hash(data)}"
     model = TriageModel(
         pipeline=final,
         classes=classes,
@@ -176,10 +206,17 @@ def train(
     target = out / version
     model.save(target)
     (target / "report.json").write_text(json.dumps(report, indent=1))
-    latest = out / "latest"
-    if latest.is_symlink() or latest.exists():
-        latest.unlink()
-    latest.symlink_to(version, target_is_directory=True)
+    (target / "data_profile.json").write_text(json.dumps(asdict(data_profile), indent=1))
+    from nw.triage.model_card import write as write_card
+    from nw.triage.tracking import record_run
+
+    write_card(target)
+    report["run"] = record_run(out, model.metadata, report)
+    if promote:
+        from nw.triage.promote import promote as run_gate
+
+        decision = run_gate(out, version, write_summary=data == Path("data/tickets.jsonl"))
+        report["promotion"] = asdict(decision)
     return model, report
 
 
@@ -213,6 +250,9 @@ def main() -> int:
     ap.add_argument("--no-calibration", action="store_true")
     ap.add_argument("--target-recall", type=float, default=0.90)
     ap.add_argument("--min-precision", type=float, default=0.25)
+    ap.add_argument(
+        "--no-promote", action="store_true", help="register a candidate; do not run the gate"
+    )
     args = ap.parse_args()
     model, report = train(
         args.data,
@@ -221,9 +261,16 @@ def main() -> int:
         calibrate=not args.no_calibration,
         target_recall=args.target_recall,
         min_precision=args.min_precision,
+        promote=not args.no_promote,
     )
     print(f"model {model.version}\n")
     print(format_report(report))
+    if "promotion" in report:
+        from nw.triage.promote import Decision, format_decision
+
+        print()
+        print(format_decision(Decision(**report["promotion"])))
+        return 0 if report["promotion"]["passed"] else 1
     return 0
 
 

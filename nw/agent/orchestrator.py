@@ -68,7 +68,7 @@ class SpecialistResponse(BaseModel):
 
 
 def subset(registry: ToolRegistry, names: list[str]) -> ToolRegistry:
-    sub = ToolRegistry()
+    sub = ToolRegistry(hooks=list(registry.hooks))  # the service's metrics follow the tools
     for n in names:
         if n in registry.tools:
             sub.register(registry.tools[n])
@@ -146,8 +146,10 @@ async def run_orchestrator(
     http: httpx.AsyncClient | None = None,
     max_steps: int = 8,
     budget_usd: float = 0.5,
+    hooks: list[Any] | None = None,
 ) -> Trajectory:
     reg = orchestrator_registry(urls, http=http)
+    reg.hooks = list(hooks or [])
     return await run_agent(
         task,
         reg,

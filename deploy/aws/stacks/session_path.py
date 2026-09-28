@@ -143,6 +143,7 @@ class SessionPath(Construct):
                 f"Url{name.title()}"
             )
             self._alarms(name, fn, topic)
+            self._drift_alarm(name, fn, topic)
         self._dashboard()
         monthly_budget(self, limit_usd=budget_usd, email=alert_email)
         CfnOutput(self, "ApiKeySecretArn", value=self.api_key.secret_arn).override_logical_id(
@@ -171,6 +172,32 @@ class SessionPath(Construct):
         for a in (errors, latency):
             a.add_alarm_action(cw_actions.SnsAction(topic))
 
+    def _drift_alarm(self, name: str, fn: lam.Function, topic) -> None:
+        """Every service logs `drift_alert` when its drift signal passes the bar (triage and
+        semantic: input and prediction PSI; policy: retrieval confidence and refusal rate;
+        agent: cap rate, tool errors, cost per run). A metric filter per function turns that
+        line into a metric and the alarm pages on the first one."""
+        metric = logs.MetricFilter(
+            self,
+            f"DriftFilter{name.title()}",
+            log_group=fn.log_group,
+            metric_namespace="Northwind",
+            metric_name=f"DriftAlerts-{name}",
+            filter_pattern=logs.FilterPattern.string_value("$.msg", "=", "drift_alert"),
+            metric_value="1",
+        ).metric(period=Duration.minutes(5), statistic="Sum")
+        alarm = cw.Alarm(
+            self,
+            f"AlarmDrift{name.title()}",
+            metric=metric,
+            threshold=1,
+            evaluation_periods=1,
+            alarm_description=f"northwind-{name}: drift signal past its bar",
+            treat_missing_data=cw.TreatMissingData.NOT_BREACHING,
+        )
+        alarm.add_alarm_action(cw_actions.SnsAction(topic))
+        self.drift_metrics = getattr(self, "drift_metrics", []) + [metric]
+
     def _dashboard(self) -> None:
         board = cw.Dashboard(self, "Dashboard", dashboard_name="northwind")
         for name, fn in self.functions.items():
@@ -186,6 +213,11 @@ class SessionPath(Construct):
                     title=f"{name} duration p50 p95",
                     left=[fn.metric_duration(statistic="p50"), fn.metric_duration(statistic="p95")],
                 ),
+            )
+
+        if getattr(self, "drift_metrics", None):
+            board.add_widgets(
+                cw.GraphWidget(title="drift alerts per service", left=self.drift_metrics)
             )
 
         # AWS/Bedrock publishes per model: without the ModelId dimension the panel stays empty.

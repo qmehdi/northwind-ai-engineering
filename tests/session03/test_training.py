@@ -26,6 +26,7 @@ def test_lora_trains_a_small_fraction(config, spec):
 
 def test_training_learns_and_checkpoints(trained_tiny):
     out, meta = trained_tiny
+    assert out.name == meta["version"], "the artifact is a version directory under the root"
     assert (
         (out / "best.pt").exists()
         and (out / "checkpoint.pt").exists()
@@ -58,10 +59,11 @@ def test_resume_restores_step_and_optimizer(
         device=torch.device("cpu"),
         config=config,
         tokenizer=tiny_tokenizer,
-        resume=out / "checkpoint.pt",
+        resume=out.parent,  # the root: the newest candidate's checkpoint is meant
         log_every=1000,
     )
     assert meta2["best_metrics"] is not None
+    assert meta2["resumed_from"] == str(out / "checkpoint.pt") and out2.name == meta2["version"]
 
 
 def test_per_label_thresholds_help_rare_tags():

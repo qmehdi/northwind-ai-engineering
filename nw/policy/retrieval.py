@@ -20,6 +20,7 @@ from typing import Any, Protocol
 import numpy as np
 
 from nw.policy.chunking import Chunk, load_chunks
+from nw.policy.manifest import read_manifest
 
 DEFAULT_RERANKER = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 _TOKEN = re.compile(r"[a-z0-9][a-z0-9.\-]*")
@@ -114,6 +115,12 @@ class PolicyIndex:
         self.reranker = reranker
         self.vectors = embeddings.encode([c.text for c in chunks])
         self.bm25 = BM25Okapi([tokenize(c.text) for c in chunks])
+        self.manifest: dict[str, Any] = {}  # filled by `load` from manifest.json when present
+
+    @property
+    def manifest_hash(self) -> str:
+        """The corpus hash the index was built from, or "none" for an in-memory index."""
+        return str(self.manifest.get("corpus_sha256_12") or "none")
 
     # ----- single retrievers ------------------------------------------------
 
@@ -191,6 +198,7 @@ class PolicyIndex:
         obj.reranker = reranker
         obj.vectors = np.load(directory / "vectors.npy")
         obj.bm25 = BM25Okapi([tokenize(c.text) for c in obj.chunks])
+        obj.manifest = read_manifest(directory) or {}
         return obj
 
 
@@ -271,6 +279,7 @@ class ManagedPolicyIndex(PolicyIndex):
         self.vectors = None  # never materialised locally
         self.bm25 = BM25Okapi([tokenize(c.text) for c in chunks])
         self._dense = dense
+        self.manifest = {}
 
     def dense(self, query: str, k: int) -> list[Retrieved]:
         return [

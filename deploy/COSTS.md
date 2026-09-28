@@ -30,6 +30,7 @@ The Session 1 spend cap of 10 USD per session is set in `.env`; the Session 4 ju
 | Secrets Manager, the API key | 0.40 USD per secret per month, 0.05 USD per 10,000 calls | one secret, read once per cold start | 0.40 USD per month |
 | X-Ray with Transaction Search | 0.35 USD per GB of spans, 1 percent indexed free, 100,000 traces free per month | a few MB | 0 |
 | CloudWatch Logs ingestion | 0.50 USD per GB after 5 GB free per month | a few MB of JSON logs | 0 |
+| Drift alarms: a metric filter per function on the `drift_alert` log line | metric filters are free; four custom metrics sit inside the ten free ones | 4 filters, 4 alarms | 0 |
 | CloudWatch dashboard, alarms, SNS, Budgets | free tier | | 0 |
 | NAT gateway and data transfer | | none by design: no VPC, function URLs, responses of a few KB | 0 |
 | Cold start | billed as ordinary duration | first request after idle, measured in Step 6 | 20 to 40 seconds for the agent image |
@@ -74,6 +75,7 @@ Argus, the reference project this course borrows from, cost about 400 USD a mont
 | Artifact Registry | 0.10 USD per GB-month | about 2.5 GB per image with CPU-only torch wheels, five images sharing dependency layers, about 5 GB | 0.50 USD per month |
 | Secret Manager, the API key | 0.06 USD per active secret version per month after six free, 0.03 USD per 10,000 access operations after 10,000 free | one version, read at startup | 0 |
 | Cloud Monitoring, Trace, Logging | free tier | | 0 |
+| Drift alerts: one log-based metric over the northwind services and one alert policy | free | | 0 |
 | **During the 2-hour session** | | | **under 0.20 USD** |
 | **Idle per day** | | min instances 0 | **0** |
 | Cold start | | first request after idle, measured in Step 6 | 20 to 40 seconds for the agent image |

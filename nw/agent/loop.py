@@ -17,6 +17,7 @@ from typing import Any
 from nw.agent.screen import Screener
 from nw.agent.tools import ToolRegistry, untrusted
 from nw.agent.trace import Step, Termination, Trajectory
+from nw.agent.version import agent_version
 from nw.config import ModelRole
 from nw.llm import LLMClient
 from nw.llm.types import Completion, StopReason, ToolCall
@@ -75,6 +76,7 @@ async def run_agent(
             screener=screener,
         )
         run_span.set_attribute("nw.run_id", t.run_id)
+        run_span.set_attribute("nw.agent_version", t.agent_version or "")
         run_span.set_attribute("nw.terminated", t.terminated.value)
         run_span.set_attribute("nw.steps", len(t.steps))
         run_span.set_attribute("nw.cost_usd", t.cost_usd)
@@ -97,6 +99,7 @@ async def _run_agent(
 ) -> Trajectory:
     run_id = uuid.uuid4().hex[:10]
     t = Trajectory(run_id=run_id, agent=agent_name, task=task, correlation_id=correlation_id())
+    t.agent_version = agent_version(system, registry.specs(), {role.value: client.model_for(role)})
     spent_before = client.spend_usd
     if screener is not None:
         verdict = screener.screen(task)
@@ -134,6 +137,7 @@ async def _run_agent(
         extra=log_fields(
             run_id=run_id,
             agent=agent_name,
+            agent_version=t.agent_version,
             terminated=t.terminated.value,
             steps=t.n_steps,
             cost_usd=round(t.cost_usd, 5),

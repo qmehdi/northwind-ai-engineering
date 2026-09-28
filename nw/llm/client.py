@@ -81,6 +81,7 @@ class LLMClient:
         tools: list[ToolSpec] | None = None,
         max_tokens: int = 1024,
         temperature: float | None = None,
+        prompt_version: str | None = None,
     ) -> Completion:
         """One completion, with concurrency limiting, retries, and metering.
 
@@ -90,6 +91,9 @@ class LLMClient:
         2. Reserve budget on the meter (raises SpendCapExceeded before any network).
         3. Call the provider under `_with_retries`.
         4. Release the reservation, record the real cost, log one line.
+
+        `prompt_version` names the system prompt on the span (`nw.prompt_version`); when the
+        caller does not pass one it is looked up from the registry by the text of `system`.
         """
         raise NotImplementedError("Service layer, Step 4: semaphore, retries, metering")
 
@@ -108,6 +112,9 @@ class LLMClient:
         not parse or does not validate, one repair round trip sends the error back.
         After that, StructuredOutputError. Never loop forever on a model that will
         not comply; that is a budget leak.
+
+        The span names the caller's prompt, not the wrapped one: the schema instructions are
+        a registered prompt of their own (`llm.structured`) and their hash is in every report.
         """
         raise NotImplementedError("Service layer, Step 5: schema prompt, parse, one repair")
 

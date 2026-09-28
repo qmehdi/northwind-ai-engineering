@@ -25,6 +25,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+mlops = [
+    "mlflow>=3.0",
+]
 dl = [
     "torch>=2.4",
     "transformers>=4.44",

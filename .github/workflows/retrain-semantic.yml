@@ -1,0 +1,68 @@
+# Retrain Project 2 on demand: validate the data, train a candidate, export it, benchmark
+# it against Project 1, run the promotion gate against the committed production summary,
+# and publish the model card and the artifact. Promotion to serving is the deploy step;
+# this workflow never changes what is served on its own.
+#
+# On demand only: a GitHub-hosted CPU runner trains the 2,000 ticket subset at roughly
+# five to eight minutes per epoch, so the two epochs here take 10 to 20 minutes plus the
+# 260 MB base model download and the export. The laptop path in the guide is six epochs;
+# two is enough to prove the loop runs end to end in CI, and the gate says so honestly
+# when a two-epoch candidate does not clear the bars.
+name: retrain-semantic
+on:
+  workflow_dispatch:
+    inputs:
+      epochs:
+        description: "Training epochs on the 2,000 ticket subset (about 5 to 8 minutes each)"
+        default: "2"
+      force:
+        description: "Promote despite a failed gate (recorded as forced in the summary)"
+        type: boolean
+        default: false
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      TOKENIZERS_PARALLELISM: "false"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - run: uv sync --locked --extra dev --extra dl
+      - name: Validate the data
+        run: uv run python -m nw.triage.data_check
+      - name: Project 1 candidate for the benchmark
+        # CI has no artifacts/triage/latest; the benchmark compares against a fresh
+        # Project 1 trained on the same data, registered and not promoted.
+        run: |
+          uv run python -m nw.triage.train --no-promote > triage.log
+          echo "TRIAGE=$(ls -d artifacts/triage/2* | sort | tail -1)" >> "$GITHUB_ENV"
+      - name: Train a candidate
+        run: |
+          uv run python -m nw.semantic.train --subset 2000 --epochs "${{ inputs.epochs }}" \
+            --lr 1e-3 --no-promote | tee train.log
+      - name: Export and parity
+        run: uv run python -m nw.semantic.export | tee export.log
+      - name: Benchmark against Project 1
+        run: uv run python -m nw.semantic.benchmark --triage "$TRIAGE" | tee benchmark.log
+      - name: Promotion gate against the committed production summary
+        id: gate
+        run: |
+          uv run python -m nw.semantic.promote --summary data/golden/semantic_production.json \
+            ${{ inputs.force && '--force' || '' }} | tee gate.log
+        continue-on-error: true
+      - name: Summary
+        run: |
+          { echo "## Retrain Project 2"; echo; echo '```'; grep -E "^(parameters|epoch .* val|test:)" train.log; echo; cat benchmark.log; echo; cat gate.log; echo '```'; echo; cat artifacts/semantic/latest/MODEL_CARD.md 2>/dev/null || cat artifacts/semantic/*/MODEL_CARD.md; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: semantic-candidate
+          path: |
+            artifacts/semantic/*/
+            !artifacts/semantic/latest
+            !artifacts/semantic/*/model.onnx
+            !artifacts/semantic/*/checkpoint.pt
+          retention-days: 30
+      - name: Fail the job if the gate failed
+        if: steps.gate.outcome == 'failure'
+        run: exit 1

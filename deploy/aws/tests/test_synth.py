@@ -83,7 +83,11 @@ def test_session_has_four_lambda_functions_with_urls_tracing_and_secret(session)
         )
     assert resources(session, "AWS::Budgets::Budget")
     assert resources(session, "AWS::CloudWatch::Dashboard")
-    assert len(resources(session, "AWS::CloudWatch::Alarm")) == 8
+    assert (
+        len(resources(session, "AWS::CloudWatch::Alarm")) == 12
+    )  # errors and p95 per function, plus drift
+    filters = resources(session, "AWS::Logs::MetricFilter")
+    assert len(filters) == 4 and all("drift_alert" in json.dumps(f) for f in filters.values())
 
 
 def test_outputs_have_the_keys_the_guide_reads(session):

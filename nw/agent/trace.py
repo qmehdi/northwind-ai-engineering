@@ -55,6 +55,8 @@ class Trajectory(BaseModel):
     cost_usd: float = 0.0
     tools_called: list[str] = Field(default_factory=list)
     correlation_id: str | None = None
+    agent_version: str | None = None  # hash of prompt, tool specs and model ids, see version.py
+    resumed_from: str | None = None  # the run whose proposal this run executed with approval
 
     @property
     def n_steps(self) -> int:
@@ -77,6 +79,11 @@ def replay(t: Trajectory, width: int = 110) -> str:
         f"run {t.run_id}  agent={t.agent}  terminated={t.terminated.value}  "
         f"steps={t.n_steps}  cost={t.cost_usd:.4f} USD"
     ]
+    if t.agent_version or t.resumed_from:
+        lines.append(
+            f"agent_version={t.agent_version or '?'}"
+            + (f"  resumed_from={t.resumed_from}" if t.resumed_from else "")
+        )
     lines.append(f"task: {t.task[:width]}")
     for s in t.steps:
         head = f"[{s.index:02d}] "

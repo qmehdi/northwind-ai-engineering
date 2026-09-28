@@ -1,10 +1,13 @@
 """Export the fine-tuned encoder to ONNX, quantise it, and prove parity.
 
-    uv run python -m nw.semantic.export --artifact artifacts/semantic --data data/tickets.jsonl
+    uv run python -m nw.semantic.export                         # the newest candidate
+    uv run python -m nw.semantic.export --artifact artifacts/semantic/<version>
 
 Parity is checked against the PyTorch model on held-out tickets: fp32 ONNX
-must match within 1e-3 on logits; the int8 model is allowed a looser tolerance
-and is judged by the benchmark on task metrics, not by logit equality.
+must match within 1e-3 on logits here, and within 1e-4 at the promotion gate; the
+int8 model is allowed a looser tolerance and is judged by the benchmark on task
+metrics, not by logit equality. The graphs, the tokenizer and `export_report.json`
+are written into the version directory, where the gate reads them.
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from nw.semantic.artifacts import resolve
 from nw.semantic.data import load_rows
 from nw.semantic.model import ModelSpec, TicketEncoder, build_encoder, merge_lora
 from nw.semantic.train import load_checkpoint
@@ -41,7 +45,7 @@ class ExportWrapper(torch.nn.Module):
 def load_finetuned(
     artifact: Path, *, config: Any = None, tokenizer: Any = None
 ) -> tuple[TicketEncoder, Any, dict[str, Any]]:
-    artifact = Path(artifact)
+    artifact = resolve(artifact)
     meta = json.loads((artifact / "metadata.json").read_text())
     spec = ModelSpec(
         base=meta["base"],
@@ -60,7 +64,7 @@ def load_finetuned(
 
 
 def export_onnx(model: TicketEncoder, tokenizer: Any, path: Path, max_length: int = 256) -> Path:
-    raise NotImplementedError("Step 7: torch.onnx.export with dynamic axes")
+    raise NotImplementedError("Step 8: torch.onnx.export with dynamic axes")
 
 
 def quantize(src: Path, dst: Path) -> Path:
@@ -120,16 +124,16 @@ def parity(
     return float(np.abs(tl.numpy() - otl).max())
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--artifact", type=Path, default=Path("artifacts/semantic"))
-    ap.add_argument("--data", type=Path, default=Path("data/tickets.jsonl"))
-    ap.add_argument("--n", type=int, default=20)
-    args = ap.parse_args()
-    model, tokenizer, meta = load_finetuned(args.artifact)
-    fp32 = export_onnx(model, tokenizer, args.artifact / "model.onnx", meta["max_length"])
-    int8 = quantize(fp32, args.artifact / "model.int8.onnx")
-    rows = load_rows(args.data, "test")[: args.n]
+def run(
+    artifact: Path, data: Path, n: int = 20, *, config: Any = None, tokenizer: Any = None
+) -> dict[str, Any]:
+    """Export fp32 and int8 into the version directory, prove parity on `n` held-out
+    tickets, save the tokenizer beside the graphs, write `export_report.json`."""
+    artifact = resolve(artifact)
+    model, tokenizer, meta = load_finetuned(artifact, config=config, tokenizer=tokenizer)
+    fp32 = export_onnx(model, tokenizer, artifact / "model.onnx", meta["max_length"])
+    int8 = quantize(fp32, artifact / "model.int8.onnx")
+    rows = load_rows(data, "test")[:n]
     texts = [ticket_text(r["subject"], r["body"]) for r in rows]
     d32 = parity(
         model,
@@ -146,17 +150,36 @@ def main() -> int:
         meta["max_length"],
     )
     report = {
+        "version": meta["version"],
         "onnx_fp32_bytes": fp32.stat().st_size,
         "onnx_int8_bytes": int8.stat().st_size,
         "size_ratio": round(fp32.stat().st_size / int8.stat().st_size, 2),
         "max_abs_diff_fp32": d32,
         "max_abs_diff_int8": d8,
         "parity_fp32_ok": d32 < 1e-3,
+        "parity_n": len(texts),
     }
-    (args.artifact / "export_report.json").write_text(json.dumps(report, indent=1))
-    print(json.dumps(report, indent=1))
+    (artifact / "export_report.json").write_text(json.dumps(report, indent=1))
     # Keep the tokenizer with the artifact so the ONNX runtime image needs no hub access.
-    tokenizer.save_pretrained(args.artifact / "tokenizer")
+    tokenizer.save_pretrained(artifact / "tokenizer")
+    return report
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--artifact",
+        type=Path,
+        default=Path("artifacts/semantic"),
+        help="a version directory, or the root, which means the newest candidate",
+    )
+    ap.add_argument("--data", type=Path, default=Path("data/tickets.jsonl"))
+    ap.add_argument("--n", type=int, default=20)
+    args = ap.parse_args()
+    artifact = resolve(args.artifact)
+    print(f"export {artifact}")
+    report = run(artifact, args.data, args.n)
+    print(json.dumps(report, indent=1))
     return 0 if report["parity_fp32_ok"] else 1
 
 

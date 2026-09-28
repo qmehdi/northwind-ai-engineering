@@ -1,12 +1,15 @@
 """The benchmark harness: Project 1 against Project 2 in its three forms.
 
+    uv run python -m nw.semantic.benchmark                      # the newest candidate
     uv run python -m nw.semantic.benchmark --triage artifacts/triage/latest \
-        --semantic artifacts/semantic
+        --semantic artifacts/semantic/<version>
 
 One table, same test split, same machine: priority macro-F1 and P0 recall,
 tag micro-F1 where the model has tags, p50 and p95 latency per ticket at batch
 size one on CPU, artifact size, and cost per thousand tickets at a stated
-CPU price. The table is the deliverable; nobody remembers the loss curve.
+CPU price. The table is the deliverable; nobody remembers the loss curve. It is
+written to `benchmark.json` in the version directory, where the promotion gate
+reads the int8 rows.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ import numpy as np
 import torch
 from sklearn.metrics import f1_score, recall_score
 
+from nw.semantic.artifacts import resolve
 from nw.semantic.data import load_rows, multi_hot
 from nw.semantic.export import OnnxEncoder, load_finetuned
 from nw.triage.features import PRIORITIES, ticket_text
@@ -59,8 +63,16 @@ def dir_size(path: Path) -> int:
 
 
 def run(
-    triage_dir: Path, semantic_dir: Path, data: Path, n: int | None = None, latency_n: int = 100
+    triage_dir: Path,
+    semantic_dir: Path,
+    data: Path,
+    n: int | None = None,
+    latency_n: int = 100,
+    *,
+    config: Any = None,
+    tokenizer: Any = None,
 ) -> list[dict[str, Any]]:
+    semantic_dir = resolve(semantic_dir)
     rows = load_rows(data, "test")
     if n:
         rows = rows[:n]
@@ -85,7 +97,7 @@ def run(
     )
 
     # Project 2, PyTorch fp32
-    model, tokenizer, meta = load_finetuned(semantic_dir)
+    model, tokenizer, meta = load_finetuned(semantic_dir, config=config, tokenizer=tokenizer)
     thresholds = np.load(semantic_dir / "tag_thresholds.npy")
     torch.set_num_threads(max(1, torch.get_num_threads()))
 
@@ -171,15 +183,28 @@ def format_table(results: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def write(semantic_dir: Path, results: list[dict[str, Any]]) -> Path:
+    out = resolve(semantic_dir) / "benchmark.json"
+    out.write_text(json.dumps(results, indent=1))
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--triage", type=Path, default=Path("artifacts/triage/latest"))
-    ap.add_argument("--semantic", type=Path, default=Path("artifacts/semantic"))
+    ap.add_argument(
+        "--semantic",
+        type=Path,
+        default=Path("artifacts/semantic"),
+        help="a version directory, or the root, which means the newest candidate",
+    )
     ap.add_argument("--data", type=Path, default=Path("data/tickets.jsonl"))
     ap.add_argument("--n", type=int, default=None)
     args = ap.parse_args()
-    results = run(args.triage, args.semantic, args.data, args.n)
-    (args.semantic / "benchmark.json").write_text(json.dumps(results, indent=1))
+    semantic = resolve(args.semantic)
+    print(f"benchmark {semantic} against {args.triage}")
+    results = run(args.triage, semantic, args.data, args.n)
+    write(semantic, results)
     print(format_table(results))
     return 0
 

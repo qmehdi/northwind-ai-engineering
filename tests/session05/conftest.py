@@ -87,3 +87,31 @@ def registry(tmp_path, monkeypatch):
 @pytest.fixture
 def escalation_file(tmp_path) -> Path:
     return tmp_path / "escalations.jsonl"
+
+
+@pytest.fixture
+def make_agent_app(registry, make_client, monkeypatch, tmp_path):
+    """The agent service with an injected fake client and no lifespan, for any role.
+    Extra keyword arguments are set on the service state (monitor, capture, ...)."""
+    from contextlib import asynccontextmanager
+
+    from nw.agent import service
+
+    @asynccontextmanager
+    async def noop(app):
+        yield
+
+    def _make(provider, role: str = "resolver", **state_kw):
+        monkeypatch.setattr(service, "state", service.State())
+        service.state.role = role
+        service.state.registry = registry
+        service.state.trace_dir = tmp_path / "traces"
+        service.state.client = make_client(provider)
+        service.state.ready = True
+        service.attach_tool_metrics(registry)
+        for k, v in state_kw.items():
+            setattr(service.state, k, v)
+        service.app.router.lifespan_context = noop
+        return service.app
+
+    return _make

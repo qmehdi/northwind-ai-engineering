@@ -26,7 +26,7 @@ FROM python:3.12-slim AS artifacts
 ARG ARTIFACTS="triage"
 COPY artifacts/ /src/
 RUN mkdir -p /out && for a in $ARTIFACTS; do cp -r "/src/$a" "/out/$a"; done \
-    && rm -f /out/*/model.onnx /out/*/checkpoint.pt /out/*/best.pt
+    && rm -f /out/*/model.onnx /out/*/checkpoint.pt /out/*/best.pt /out/*/*/model.onnx /out/*/*/checkpoint.pt /out/*/*/best.pt
 
 FROM python:3.12-slim AS runtime
 ARG APP=nw.triage.service:app

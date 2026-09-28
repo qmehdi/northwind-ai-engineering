@@ -1,0 +1,40 @@
+# Retrain Project 1 on a schedule or on demand: validate the data, train a candidate,
+# run the promotion gate against the committed production summary, publish the model
+# card and the artifact. Promotion to serving is the deploy step; this workflow never
+# changes what is served on its own.
+name: retrain-triage
+on:
+  schedule:
+    - cron: "0 5 * * 1"   # Mondays 05:00 UTC
+  workflow_dispatch:
+  pull_request:
+    paths: ["data/tickets.jsonl", "nw/triage/**"]
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - run: uv sync --locked --extra dev
+      - name: Validate the data
+        run: uv run python -m nw.triage.data_check
+      - name: Train a candidate
+        run: uv run python -m nw.triage.train --no-promote | tee train.log
+      - name: Promotion gate against the committed production summary
+        id: gate
+        run: |
+          uv run python -m nw.triage.promote --summary data/golden/triage_production.json | tee gate.log
+        continue-on-error: true
+      - name: Summary
+        run: |
+          { echo "## Retrain"; echo; echo '```'; cat train.log; echo; cat gate.log; echo '```'; echo; cat artifacts/triage/latest/MODEL_CARD.md 2>/dev/null || cat artifacts/triage/*/MODEL_CARD.md; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: triage-candidate
+          path: |
+            artifacts/triage/*/
+            !artifacts/triage/latest
+          retention-days: 30
+      - name: Fail the job if the gate failed
+        if: steps.gate.outcome == 'failure'
+        run: exit 1

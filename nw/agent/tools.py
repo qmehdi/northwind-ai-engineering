@@ -51,9 +51,15 @@ class Observation:
     pending_approval: bool = False
 
 
+ObservationHook = Callable[[Observation], None]
+
+
 @dataclass
 class ToolRegistry:
     tools: dict[str, Tool] = field(default_factory=dict)
+    # Called with every Observation after a tool ran. The service registers its Prometheus
+    # counters here; the registry itself knows nothing about metrics.
+    hooks: list[ObservationHook] = field(default_factory=list)
 
     def register(self, tool: Tool) -> Tool:
         if tool.name in self.tools:
@@ -107,7 +113,9 @@ class ToolRegistry:
                 sp.set_attribute("nw.error", obs.error)
             if obs.pending_approval:
                 sp.set_attribute("nw.pending_approval", True)
-            return obs
+        for hook in self.hooks:
+            hook(obs)
+        return obs
 
     async def _execute(
         self, name: str, arguments: dict[str, Any], approved: bool, started: float

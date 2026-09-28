@@ -1,10 +1,24 @@
 """Project 2 as a service: tags, priority and similar tickets from the ONNX model.
 
-    NW_SEMANTIC_ARTIFACT=artifacts/semantic NW_INDEX=artifacts/index \
+    NW_SEMANTIC_ARTIFACT=artifacts/semantic/latest NW_INDEX=artifacts/index \
       uv run uvicorn nw.semantic.service:app --port 8002
 
 No torch in the runtime path: the ONNX graph and the tokenizer are enough,
 which is what makes the container small and the cold start short.
+
+Endpoints:
+- POST /classify      tags, priority, similar tickets for one ticket
+- GET  /healthz       process is up (liveness)
+- GET  /readyz        model is loaded and answered a probe (readiness)
+- GET  /metrics       Prometheus text format
+- GET  /version       model version and metadata
+- GET  /drift         text length, predicted priority and tag rate drift against training
+
+`NW_SEMANTIC_ARTIFACT` is a version directory, `latest`, a flat directory holding
+`metadata.json`, or the root `artifacts/semantic`, which means `latest`: the served model
+is the one the promotion gate chose. Environment, all optional: NW_QUANTIZED (1, the int8
+graph), NW_SEMANTIC_CAPTURE (a JSONL file of requests and predictions for backtests),
+NW_SEMANTIC_DRIFT_WINDOW, NW_SEMANTIC_DRIFT_MIN, NW_SEMANTIC_DRIFT_EVERY.
 """
 
 from __future__ import annotations
@@ -22,7 +36,9 @@ from pydantic import BaseModel, Field
 
 from nw.auth import install_api_key
 from nw.logging import bind_correlation_id, configure_logging, get_logger, log_fields
+from nw.semantic.artifacts import resolve
 from nw.semantic.data import TAGS
+from nw.semantic.monitor import ALERT, SemanticDriftMonitor
 from nw.telemetry import configure_tracing, instrument_app
 from nw.triage.features import PRIORITIES, ticket_text
 
@@ -36,6 +52,9 @@ LATENCY = Histogram(
 )
 LOADED = Gauge("nw_semantic_model_loaded", "1 when the model is loaded")
 INFO = Gauge("nw_semantic_model_info", "Model version", ["version", "format"])
+PREDICTIONS = Counter("nw_semantic_predictions_total", "Predictions by priority", ["priority"])
+DRIFT = Gauge("nw_semantic_drift_psi", "Population stability index against training", ["feature"])
+DRIFT_LEVEL = Gauge("nw_semantic_drift_level", "0 ok, 1 watch, 2 alert, -1 warming up")
 
 
 class TicketIn(BaseModel):
@@ -62,7 +81,12 @@ class State:
     embedder = None
     version = "unknown"
     fmt = "none"
+    metadata: dict = {}
     ready = False
+    monitor: SemanticDriftMonitor = SemanticDriftMonitor(None)
+    drift_every: int = 50
+    seen: int = 0
+    capture: Path | None = None
 
 
 state = State()
@@ -73,6 +97,7 @@ def load_all(artifact: Path, index_dir: Path | None, quantized: bool) -> None:
 
     from nw.semantic.export import OnnxEncoder
 
+    artifact = resolve(artifact, serve=True)
     meta = json.loads((artifact / "metadata.json").read_text())
     tok_dir = artifact / "tokenizer"
     state.tokenizer = AutoTokenizer.from_pretrained(
@@ -84,13 +109,33 @@ def load_all(artifact: Path, index_dir: Path | None, quantized: bool) -> None:
     state.onnx = OnnxEncoder(artifact / file, state.tokenizer, meta["max_length"])
     state.thresholds = np.load(artifact / "tag_thresholds.npy")
     state.version, state.fmt = meta["version"], file
+    state.metadata = {k: v for k, v in meta.items() if k not in ("metrics", "tags", "history")}
     if index_dir and (index_dir / "tickets.faiss").exists():
         from nw.semantic.embed import Embedder, TicketIndex
 
         state.index = TicketIndex.load(index_dir)
         state.embedder = Embedder(json.loads((index_dir / "metadata.json").read_text())["embedder"])
     state.onnx.run(["probe"])
+    _configure_mlops(artifact)
     state.ready = True
+
+
+def _configure_mlops(artifact: Path) -> None:
+    """Drift baseline from the artifact's data profile and an optional capture file. Both
+    are best effort: the service classifies without them."""
+    profile_path = artifact / "data_profile.json"
+    profile = json.loads(profile_path.read_text()) if profile_path.exists() else None
+    state.monitor = SemanticDriftMonitor(
+        profile,
+        window=int(os.environ.get("NW_SEMANTIC_DRIFT_WINDOW", "500")),
+        min_window=int(os.environ.get("NW_SEMANTIC_DRIFT_MIN", "50")),
+    )
+    state.drift_every = int(os.environ.get("NW_SEMANTIC_DRIFT_EVERY", "50"))
+    state.seen = 0
+    if not state.monitor.enabled:
+        log.info("drift monitoring off: no data_profile.json in the artifact")
+    capture = os.environ.get("NW_SEMANTIC_CAPTURE")
+    state.capture = Path(capture) if capture else None
 
 
 @asynccontextmanager
@@ -109,6 +154,7 @@ async def lifespan(app: FastAPI):
                 version=state.version,
                 format=state.fmt,
                 index=bool(state.index),
+                drift=state.monitor.enabled,
             ),
         )
     except Exception as exc:  # noqa: BLE001
@@ -145,6 +191,62 @@ def readyz() -> dict[str, str]:
     return {"status": "ready", "model_version": state.version, "format": state.fmt}
 
 
+@app.get("/version")
+def version() -> dict:
+    if not state.ready:
+        raise HTTPException(503, "model not loaded")
+    return {"model_version": state.version, "format": state.fmt, "metadata": state.metadata}
+
+
+@app.get("/drift")
+def drift() -> dict:
+    """PSI of text length, predicted priority and tag rate against the training profile."""
+    return state.monitor.snapshot().as_dict()
+
+
+def _observe(ticket: TicketIn, priority: str, tags: list[str]) -> None:
+    state.monitor.observe(len(ticket.subject) + len(ticket.body), priority, tags)
+    state.seen += 1
+    if state.seen % state.drift_every == 0:
+        snap = state.monitor.snapshot()
+        levels = {"warming_up": -1, "ok": 0, "watch": 1, "alert": 2}
+        DRIFT_LEVEL.set(levels[snap.level])
+        if snap.text_length_psi is not None:
+            DRIFT.labels(feature="text_length").set(snap.text_length_psi)
+            DRIFT.labels(feature="priority").set(snap.priority_psi or 0.0)
+            DRIFT.labels(feature="tag_rate").set(snap.tag_rate_psi or 0.0)
+        if snap.level == "alert":
+            log.warning(
+                "drift_alert",
+                extra=log_fields(
+                    text_length_psi=snap.text_length_psi,
+                    priority_psi=snap.priority_psi,
+                    tag_rate_psi=snap.tag_rate_psi,
+                    window=snap.window,
+                    threshold=ALERT,
+                    model_version=state.version,
+                ),
+            )
+
+
+def _capture(ticket: TicketIn, result: Classification) -> None:
+    if state.capture is None:
+        return
+    record = {
+        "ts": time.time(),
+        "subject": ticket.subject,
+        "body": ticket.body,
+        "tags": result.tags,
+        "priority": result.priority,
+        "priority_scores": result.priority_scores,
+        "model_version": result.model_version,
+        "format": result.format,
+    }
+    state.capture.parent.mkdir(parents=True, exist_ok=True)
+    with state.capture.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+
 @app.post("/classify", response_model=Classification)
 def classify(ticket: TicketIn) -> Classification:
     if not state.ready or state.onnx is None or state.thresholds is None:
@@ -175,6 +277,9 @@ def classify(ticket: TicketIn) -> Classification:
         model_version=state.version,
         format=state.fmt,
     )
+    PREDICTIONS.labels(priority=result.priority).inc()
+    _observe(ticket, result.priority, tags)
+    _capture(ticket, result)
     log.info(
         "classify",
         extra=log_fields(priority=result.priority, n_tags=len(tags), n_similar=len(similar)),

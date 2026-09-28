@@ -1,7 +1,7 @@
-.PHONY: setup setup-aws check test lint fmt preflight session01 session02 train-triage serve-triage image-triage images up up-observability down session03 train-semantic export-semantic benchmark index serve-semantic session04 index-policy eval-policy calibrate-judge serve-policy session05 agent-eval replay specialists agent-eval-strands agent-eval-adk mcp
+.PHONY: setup setup-aws check test lint fmt preflight session01 session02 data-check train-triage runs promote-triage backtest-triage mlflow-ui serve-triage image-triage images up up-observability down session03 train-semantic export-semantic benchmark runs-semantic promote-semantic backtest-semantic index serve-semantic session04 index-policy eval-policy check-index prompts eval-policy-free feedback-policy calibrate-judge serve-policy session05 agent-eval agent-gate agent-gate-offline approve review replay specialists agent-eval-strands agent-eval-adk mcp
 
 setup:            ## Create the virtualenv and install everything, deep learning and agents included
-	uv sync --extra dev --extra dl --extra agents --extra agents-aws --extra agents-gcp
+	uv sync --extra dev --extra dl --extra agents --extra agents-aws --extra agents-gcp --extra mlops
 	uv run pre-commit install
 
 check: lint test  ## What CI runs
@@ -26,8 +26,23 @@ session01:        ## Session 1 acceptance tests
 session02:        ## Session 2 acceptance tests
 	uv run pytest -q tests/session02
 
-train-triage:     ## Train the Project 1 model into artifacts/triage/<version>
+data-check:       ## Project 1: validate and profile the training data
+	uv run python -m nw.triage.data_check
+
+train-triage:     ## Project 1: validate, train, record the run, write the card, run the gate
 	uv run python -m nw.triage.train
+
+runs:             ## Project 1: the experiment table from artifacts/triage/runs.jsonl
+	uv run python -m nw.triage.tracking
+
+promote-triage:   ## Project 1: run the promotion gate on the newest candidate (CANDIDATE=<version>)
+	uv run python -m nw.triage.promote $(if $(CANDIDATE),--candidate $(CANDIDATE),)
+
+backtest-triage:  ## Project 1: compare two versions on the test split (A=<dir> B=<dir>)
+	uv run python -m nw.triage.backtest --a $(A) --b $(B)
+
+mlflow-ui:        ## Project 1: the MLflow UI on :5000 over artifacts/mlflow.db
+	uv run mlflow ui --backend-store-uri sqlite:///artifacts/mlflow.db --port 5000
 
 serve-triage:     ## Run the Project 1 service on :8001
 	NW_TRIAGE_MODEL=artifacts/triage/latest uv run uvicorn nw.triage.service:app --port 8001
@@ -50,20 +65,29 @@ down:             ## Stop the local stack
 session03:        ## Session 3 acceptance tests (tiny model, CPU, no download)
 	uv run pytest -q tests/session03
 
-train-semantic:   ## LoRA fine-tune on a laptop-sized subset, about two minutes on Apple silicon
-	uv run python -m nw.semantic.train --subset 2000 --epochs 6 --lr 1e-3
+train-semantic:   ## Project 2: LoRA fine-tune on a laptop-sized subset, about two minutes on Apple silicon; a registered candidate, no gate
+	uv run python -m nw.semantic.train --subset 2000 --epochs 6 --lr 1e-3 --no-promote
 
-export-semantic:  ## ONNX export, quantise, parity
+export-semantic:  ## Project 2: ONNX export, quantise, parity, into the newest candidate
 	uv run python -m nw.semantic.export
 
-benchmark:        ## Project 1 against Project 2, one table
+benchmark:        ## Project 1 against Project 2, one table, benchmark.json into the newest candidate
 	uv run python -m nw.semantic.benchmark
+
+runs-semantic:    ## Project 2: the experiment table from artifacts/semantic/runs.jsonl
+	uv run python -m nw.semantic.tracking
+
+promote-semantic: ## Project 2: the gate on the newest candidate (CANDIDATE=<version>); needs export and benchmark first
+	uv run python -m nw.semantic.promote $(if $(CANDIDATE),--candidate $(CANDIDATE),)
+
+backtest-semantic: ## Project 2: two versions on the test split, int8 as served (A=<dir> B=<dir>)
+	uv run python -m nw.semantic.backtest --a $(A) --b $(B)
 
 index:            ## Build the similar-tickets index
 	uv run python -m nw.semantic.embed
 
-serve-semantic:   ## Run the Project 2 service on :8002
-	NW_SEMANTIC_ARTIFACT=artifacts/semantic NW_INDEX=artifacts/index uv run uvicorn nw.semantic.service:app --port 8002
+serve-semantic:   ## Run the Project 2 service on :8002 from the promoted version
+	NW_SEMANTIC_ARTIFACT=artifacts/semantic/latest NW_INDEX=artifacts/index uv run uvicorn nw.semantic.service:app --port 8002
 
 session04:        ## Session 4 acceptance tests
 	uv run pytest -q tests/session04
@@ -71,7 +95,19 @@ session04:        ## Session 4 acceptance tests
 index-policy:     ## Chunk the policy corpus and build the retrieval index
 	uv run python -m nw.policy.build_index
 
-calibrate-judge:  ## Session 4: judge agreement with human labels (about 0.10 USD)
+check-index:      ## Project 3: exit 1 when artifacts/policy no longer matches data/policies (CI, and before the image build)
+	uv run python -m nw.policy.build_index --check
+
+prompts:          ## Every registered prompt with its hash
+	uv run python -m nw.llm.prompts
+
+eval-policy-free: ## Project 3: the retrieval-only harness, no model call, gated on recall and MRR
+	uv run python -m nw.policy.evaluate --retrieval-only
+
+feedback-policy:  ## Project 3: wrong and unsafe verdicts from /feedback as golden-set candidates
+	uv run python -m nw.policy.feedback --to-golden
+
+calibrate-judge:  ## Project 3: judge agreement with human labels (about 0.10 USD)
 	uv run python -m nw.policy.calibrate
 
 eval-policy:      ## Run the golden set against the index and apply the regression gate
@@ -85,6 +121,18 @@ session05:        ## Session 5 acceptance tests
 
 agent-eval:       ## The adversarial set through the hand-built loop
 	uv run python -m nw.agent.evaluate
+
+agent-gate:       ## Project 4: the 15 cases on your track against data/golden/agent_baseline.json (about 2.5 USD)
+	uv run python -m nw.agent.evaluate --gate
+
+agent-gate-offline: ## Project 4: the loop, tools, scorer and gate with a scripted model: free, what CI runs
+	uv run python -m nw.agent.evaluate --provider fake --gate --out artifacts/agent_eval_offline.json --traces artifacts/traces-offline
+
+approve:          ## Project 4: pending proposals; make approve RUN=<run_id> TOOL=escalate resumes one with approval
+	uv run python -m nw.agent.approve $(if $(RUN),--run $(RUN) --approve $(TOOL),)
+
+review:           ## Project 4: sample ten recent traces into artifacts/review.jsonl for a person to label
+	uv run python -m nw.agent.review --sample 10 --out artifacts/review.jsonl
 
 replay:           ## Print one trajectory: make replay RUN=<run_id>
 	uv run python -m nw.agent.trace artifacts/traces/$(RUN).json

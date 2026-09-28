@@ -8,29 +8,48 @@ or the orchestrator (`NW_AGENT_ROLE=orchestrator`, with the specialists' URLs).
     NW_AGENT_ROLE=orchestrator NW_TRIAGE_AGENT_URL=http://localhost:8011 \
         NW_POLICY_AGENT_URL=... NW_RESOLUTION_AGENT_URL=... \
         uv run uvicorn nw.agent.service:app --port 8010
+
+Endpoints: POST /run, POST /route (the capstone router), GET /healthz, /readyz, /version
+(the agent version and its parts), /drift (the behaviour window), /metrics.
+
+Operator controls, all environment variables: NW_AGENT_DISABLED=1 refuses /run and /route
+with 503 and leaves readiness alone (the platform keeps the instance, the operator stops
+the spend); NW_AGENT_MAX_CONCURRENT_RUNS (default 4) bounds runs in flight, 429 beyond it;
+NW_AGENT_CAPTURE appends one JSON line per run; NW_AGENT_BASELINE points the drift monitor
+at a baseline other than data/golden/agent_baseline.json; NW_AGENT_DRIFT_WINDOW and
+NW_AGENT_DRIFT_MIN size the window.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import time
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
-from nw.agent.loop import run_agent
+from nw.agent.loop import SYSTEM_RULES, run_agent
+from nw.agent.monitor import ALERT, AgentMonitor, RunSummary
 from nw.agent.orchestrator import (
+    ORCHESTRATOR_SYSTEM,
     SPECIALISTS,
     SpecialistRequest,
     SpecialistResponse,
     run_orchestrator,
     run_specialist,
+    subset,
 )
-from nw.agent.tools import ToolRegistry
+from nw.agent.tools import Observation, ToolRegistry
+from nw.agent.trace import Trajectory
+from nw.agent.version import describe
 from nw.auth import install_api_key
-from nw.config import settings
+from nw.config import ModelRole, settings
 from nw.llm import LLMClient
 from nw.llm.providers import make_provider
 from nw.logging import bind_correlation_id, configure_logging, get_logger, log_fields
@@ -49,6 +68,25 @@ PROPOSALS = Counter(
     "nw_agent_proposed_actions_total", "Irreversible actions proposed", ["role", "tool"]
 )
 READY = Gauge("nw_agent_ready", "1 when ready", ["role"])
+# AgentOps: per tool, per termination, the operator controls and the drift window.
+TOOL_CALLS = Counter("nw_agent_tool_calls_total", "Tool calls by outcome", ["tool", "outcome"])
+TOOL_LATENCY = Histogram(
+    "nw_agent_tool_latency_seconds",
+    "Tool latency",
+    ["tool"],
+    buckets=(0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30),
+)
+TERMINATIONS = Counter("nw_agent_terminations_total", "Runs by termination", ["terminated"])
+REJECTED = Counter(
+    "nw_agent_rejected_total", "Runs refused before any model call", ["role", "reason"]
+)
+DISABLED = Gauge("nw_agent_disabled", "1 while the kill switch is on", ["role"])
+IN_FLIGHT = Gauge("nw_agent_runs_in_flight", "Runs currently executing", ["role"])
+VERSION_INFO = Gauge("nw_agent_version_info", "Agent version as a label", ["role", "version"])
+DRIFT_CAP = Gauge("nw_agent_drift_cap_rate", "Share of recent runs stopped by a cap or an error")
+DRIFT_ERR = Gauge("nw_agent_drift_error_rate", "Tool errors over tool calls in the window")
+DRIFT_PSI = Gauge("nw_agent_drift_psi", "PSI against the baseline", ["feature"])
+DRIFT_LEVEL = Gauge("nw_agent_drift_level", "0 ok, 1 watch, 2 alert, -1 warming up")
 
 
 class State:
@@ -56,12 +94,55 @@ class State:
     role: str = "triage"
     registry: ToolRegistry | None = None
     client: LLMClient | None = None
-    urls: dict[str, str] = {}
     ready = False
     trace_dir = Path("artifacts/traces")
+    baseline: dict[str, Any] | None = None
+    capture: Path | None = None
+    max_runs: int = 4
+
+    def __init__(self) -> None:
+        # Mutable per instance: tests build a fresh State and must not share a window.
+        self.urls: dict[str, str] = {}
+        self.monitor: AgentMonitor = AgentMonitor(None)
+        self.slots: asyncio.Semaphore | None = None
 
 
 state = State()
+
+
+def tool_metrics(obs: Observation) -> None:
+    """The registry hook: one counter and one histogram per tool. Registered by the service;
+    the registry has no Prometheus import."""
+    outcome = "pending_approval" if obs.pending_approval else ("ok" if obs.ok else "error")
+    TOOL_CALLS.labels(tool=obs.tool, outcome=outcome).inc()
+    TOOL_LATENCY.labels(tool=obs.tool).observe(obs.latency_ms / 1000)
+
+
+def attach_tool_metrics(registry: ToolRegistry) -> None:
+    if tool_metrics not in registry.hooks:
+        registry.hooks.append(tool_metrics)
+
+
+def load_baseline(path: Path) -> dict[str, Any] | None:
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def configure_agentops() -> None:
+    """Drift baseline, capture file and the concurrency cap, from the environment. All best
+    effort: the service runs without a baseline, it just cannot compute PSI."""
+    state.baseline = load_baseline(
+        Path(os.environ.get("NW_AGENT_BASELINE", "data/golden/agent_baseline.json"))
+    )
+    state.monitor = AgentMonitor(
+        state.baseline,
+        window=int(os.environ.get("NW_AGENT_DRIFT_WINDOW", "200")),
+        min_window=int(os.environ.get("NW_AGENT_DRIFT_MIN", "20")),
+    )
+    if not state.monitor.enabled:
+        log.info("drift PSI off: no agent baseline with per-case steps and costs")
+    capture = os.environ.get("NW_AGENT_CAPTURE")
+    state.capture = Path(capture) if capture else None
+    state.slots = None  # created lazily on the serving loop, see _slots
 
 
 @asynccontextmanager
@@ -79,13 +160,22 @@ async def lifespan(app: FastAPI):
         state.screener = from_env()
         if state.role == "orchestrator":
             state.urls = {r: os.environ[f"NW_{r.upper()}_AGENT_URL"] for r in SPECIALISTS}
+            from nw.agent.orchestrator import orchestrator_registry
+
+            state.registry = orchestrator_registry(state.urls)  # for /version; runs build their own
         else:
             from nw.agent.northwind import build_registry
 
             state.registry = build_registry(os.environ.get("NW_TOOL_BACKEND", "local"))
+        attach_tool_metrics(state.registry)
+        configure_agentops()
         state.ready = True
         READY.labels(role=state.role).set(1)
-        log.info("agent ready", extra=log_fields(role=state.role))
+        VERSION_INFO.labels(role=state.role, version=version_info()["agent_version"]).set(1)
+        log.info(
+            "agent ready",
+            extra=log_fields(role=state.role, agent_version=version_info()["agent_version"]),
+        )
     except Exception as exc:  # noqa: BLE001
         state.ready = False
         READY.labels(role=state.role).set(0)
@@ -115,57 +205,136 @@ def healthz() -> dict[str, str]:
 
 @app.get("/readyz")
 def readyz() -> dict[str, str]:
+    """Readiness is about the process, not the operator's decision: the kill switch does not
+    fail it, so the platform keeps the instance while runs are refused."""
     if not state.ready:
         raise HTTPException(503, "agent not ready")
     return {"status": "ready", "role": state.role}
 
 
-@app.post("/run", response_model=SpecialistResponse)
-async def run(req: SpecialistRequest) -> SpecialistResponse:
+# ----- version -----------------------------------------------------------------------
+
+
+def version_info() -> dict[str, Any]:
+    """The agent version this role runs with, the same hash `run_agent` puts on a trajectory."""
+    if state.registry is None or state.client is None:
+        raise HTTPException(503, "agent not ready")
+    if state.role == "orchestrator":
+        system, specs = ORCHESTRATOR_SYSTEM, state.registry.specs()
+    elif state.role in SPECIALISTS:
+        spec = SPECIALISTS[state.role]
+        system, specs = spec["system"], subset(state.registry, spec["tools"]).specs()
+    else:
+        system, specs = SYSTEM_RULES, state.registry.specs()
+    models = {ModelRole.WORKHORSE.value: state.client.model_for(ModelRole.WORKHORSE)}
+    return {"role": state.role, **describe(system, specs, models)}
+
+
+@app.get("/version")
+def version() -> dict[str, Any]:
+    info = version_info()
+    info["economy_model"] = state.client.model_for(ModelRole.ECONOMY) if state.client else None
+    info["baseline"] = (
+        {
+            "agent_version": state.baseline.get("agent_version"),
+            "written_at": state.baseline.get("written_at"),
+        }
+        if state.baseline
+        else None
+    )
+    info["disabled"] = _disabled()
+    info["max_concurrent_runs"] = _slots_limit()
+    return info
+
+
+# ----- operator controls -------------------------------------------------------------
+
+
+def _disabled() -> bool:
+    on = os.environ.get("NW_AGENT_DISABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+    DISABLED.labels(role=state.role).set(1 if on else 0)
+    return on
+
+
+def _slots_limit() -> int:
+    return int(os.environ.get("NW_AGENT_MAX_CONCURRENT_RUNS", str(State.max_runs)))
+
+
+def _slots() -> asyncio.Semaphore:
+    if state.slots is None:
+        state.max_runs = _slots_limit()
+        state.slots = asyncio.Semaphore(state.max_runs)
+    return state.slots
+
+
+@asynccontextmanager
+async def admit(endpoint: str) -> AsyncIterator[None]:
+    """Readiness, the kill switch, then a slot. Refusals are metrics and log lines, never
+    model calls."""
     if not state.ready or state.client is None:
         raise HTTPException(503, "agent not ready")
-    t0 = time.perf_counter()
-    if state.role == "orchestrator":
-        t = await run_orchestrator(
-            req.task, state.urls, state.client, max_steps=req.max_steps, budget_usd=req.budget_usd
+    if _disabled():
+        REJECTED.labels(role=state.role, reason="disabled").inc()
+        log.warning("run refused", extra=log_fields(endpoint=endpoint, reason="disabled"))
+        raise HTTPException(
+            503,
+            "agent disabled by NW_AGENT_DISABLED: runs are refused, readiness is unchanged; "
+            "unset it to resume",
         )
-        resp = SpecialistResponse(
-            run_id=t.run_id,
-            final=t.final,
-            terminated=t.terminated.value,
-            steps=t.n_steps,
-            cost_usd=t.cost_usd,
-            proposed_actions=[p.model_dump() for p in t.proposed_actions],
+    sem = _slots()
+    if sem.locked():
+        REJECTED.labels(role=state.role, reason="concurrency").inc()
+        raise HTTPException(
+            429,
+            f"{state.max_runs} runs already in flight (NW_AGENT_MAX_CONCURRENT_RUNS); retry",
         )
-    elif state.role in SPECIALISTS:
-        assert state.registry is not None
-        resp, t = await run_specialist(
-            state.role, req, state.registry, state.client, screener=state.screener
-        )
-    else:
-        # resolver: the whole registry and the hand-built loop, the Session path's deployment
-        assert state.registry is not None
-        t = await run_agent(
-            req.task,
-            state.registry,
-            state.client,
-            max_steps=req.max_steps,
-            budget_usd=req.budget_usd,
-            agent_name=state.role,
-            screener=state.screener,
-        )
-        resp = _response(t)
-    t.save(state.trace_dir)
-    RUNS.labels(role=state.role, terminated=resp.terminated).inc()
-    STEPS.labels(role=state.role).observe(resp.steps)
-    LATENCY.labels(role=state.role).observe(time.perf_counter() - t0)
-    COST.labels(role=state.role).inc(resp.cost_usd)
-    for p in resp.proposed_actions:
-        PROPOSALS.labels(role=state.role, tool=p["tool"]).inc()
-    return resp
+    async with sem:
+        IN_FLIGHT.labels(role=state.role).inc()
+        try:
+            yield
+        finally:
+            IN_FLIGHT.labels(role=state.role).dec()
 
 
-def _response(t) -> SpecialistResponse:
+# ----- runs --------------------------------------------------------------------------
+
+
+@app.post("/run", response_model=SpecialistResponse)
+async def run(req: SpecialistRequest) -> SpecialistResponse:
+    async with admit("/run"):
+        assert state.client is not None
+        t0 = time.perf_counter()
+        if state.role == "orchestrator":
+            t = await run_orchestrator(
+                req.task,
+                state.urls,
+                state.client,
+                max_steps=req.max_steps,
+                budget_usd=req.budget_usd,
+                hooks=[tool_metrics],
+            )
+        elif state.role in SPECIALISTS:
+            assert state.registry is not None
+            _, t = await run_specialist(
+                state.role, req, state.registry, state.client, screener=state.screener
+            )
+        else:
+            # resolver: the whole registry and the hand-built loop, the Session path's deployment
+            assert state.registry is not None
+            t = await run_agent(
+                req.task,
+                state.registry,
+                state.client,
+                max_steps=req.max_steps,
+                budget_usd=req.budget_usd,
+                agent_name=state.role,
+                screener=state.screener,
+            )
+        finish_run(t, state.role, t0)
+        return _response(t)
+
+
+def _response(t: Trajectory) -> SpecialistResponse:
     return SpecialistResponse(
         run_id=t.run_id,
         final=t.final,
@@ -185,28 +354,80 @@ class RouteRequest(SpecialistRequest):
 @app.post("/route", response_model=SpecialistResponse)
 async def route_ticket(req: RouteRequest) -> SpecialistResponse:
     """Capstone endpoint: Project 1 first, then the cheapest loop that will do."""
-    if not state.ready or state.client is None or state.registry is None:
+    if state.registry is None:
         raise HTTPException(503, "agent not ready")
-    from nw.agent.router import route
+    async with admit("/route"):
+        assert state.client is not None
+        from nw.agent.router import route
 
-    t0 = time.perf_counter()
-    t = await route(
-        req.ticket_id,
-        req.account_id,
-        req.subject,
-        req.task,
-        state.registry,
-        state.client,
-        screener=state.screener,
-    )
+        t0 = time.perf_counter()
+        t = await route(
+            req.ticket_id,
+            req.account_id,
+            req.subject,
+            req.task,
+            state.registry,
+            state.client,
+            screener=state.screener,
+        )
+        finish_run(t, t.agent, t0)
+        return _response(t)
+
+
+def finish_run(t: Trajectory, role: str, t0: float) -> None:
+    """Everything a finished run leaves behind besides its response: the trace file, the
+    run metrics, the drift window, and the capture line."""
     t.save(state.trace_dir)
-    RUNS.labels(role=t.agent, terminated=t.terminated.value).inc()
-    STEPS.labels(role=t.agent).observe(t.n_steps)
-    LATENCY.labels(role=t.agent).observe(time.perf_counter() - t0)
-    COST.labels(role=t.agent).inc(t.cost_usd)
+    RUNS.labels(role=role, terminated=t.terminated.value).inc()
+    TERMINATIONS.labels(terminated=t.terminated.value).inc()
+    STEPS.labels(role=role).observe(t.n_steps)
+    LATENCY.labels(role=role).observe(time.perf_counter() - t0)
+    COST.labels(role=role).inc(t.cost_usd)
     for p in t.proposed_actions:
-        PROPOSALS.labels(role=t.agent, tool=p.tool).inc()
-    return _response(t)
+        PROPOSALS.labels(role=role, tool=p.tool).inc()
+    summary = state.monitor.observe(t)
+    _observe_drift()
+    _capture(summary)
+
+
+def _observe_drift() -> None:
+    snap = state.monitor.snapshot()
+    DRIFT_CAP.set(snap.cap_rate)
+    DRIFT_ERR.set(snap.error_rate)
+    DRIFT_LEVEL.set({"warming_up": -1, "ok": 0, "watch": 1, "alert": 2}[snap.level])
+    if snap.steps_psi is not None:
+        DRIFT_PSI.labels(feature="steps").set(snap.steps_psi)
+        DRIFT_PSI.labels(feature="cost").set(snap.cost_psi or 0.0)
+    if snap.level == "alert":
+        # The deployment alarms on this message for every service; same line, same alarm.
+        log.warning(
+            "drift_alert",
+            extra=log_fields(
+                role=state.role,
+                cap_rate=snap.cap_rate,
+                error_rate=snap.error_rate,
+                steps_psi=snap.steps_psi,
+                cost_psi=snap.cost_psi,
+                window=snap.window,
+                threshold=ALERT,
+                reasons=snap.reasons,
+            ),
+        )
+
+
+def _capture(summary: RunSummary) -> None:
+    if state.capture is None:
+        return
+    state.capture.parent.mkdir(parents=True, exist_ok=True)
+    with state.capture.open("a", encoding="utf-8") as f:
+        f.write(summary.model_dump_json() + "\n")
+
+
+@app.get("/drift")
+def drift() -> dict[str, Any]:
+    """The behaviour window: termination mix, tool error rate, steps and cost against the
+    baseline."""
+    return state.monitor.snapshot().as_dict()
 
 
 @app.get("/metrics")
