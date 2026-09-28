@@ -240,6 +240,32 @@ def test_service_serves_latest_reports_drift_and_captures(served):
     assert len(lines) == 6 and {"tags", "priority", "model_version", "format"} <= set(lines[0])
 
 
+@pytest.fixture
+def shadowed(benchmarked_tiny, tmp_path, monkeypatch):
+    """The served artifact as its own shadow: the two int8 graphs cannot disagree."""
+    out, _ = benchmarked_tiny
+    promote(out.parent, out.name, policy=PERMISSIVE, summary_path=tmp_path / "prod.json")
+    monkeypatch.setenv("NW_SEMANTIC_ARTIFACT", str(out.parent / "latest"))
+    monkeypatch.setenv("NW_SEMANTIC_SHADOW_ARTIFACT", str(out))  # the version directory
+    monkeypatch.delenv("NW_INDEX", raising=False)
+    monkeypatch.setenv("NW_SEMANTIC_CAPTURE", str(tmp_path / "predictions.jsonl"))
+    with TestClient(service.app) as c:
+        yield c, out, tmp_path / "predictions.jsonl"
+
+
+def test_shadow_scores_every_request_and_capture_records_it(shadowed):
+    c, out, capture = shadowed
+    assert c.get("/version").json()["shadow_version"] == out.name
+    for i in range(6):
+        r = c.post("/classify", json={"subject": "Login broken", "body": f"cannot sign in {i}"})
+        assert r.status_code == 200 and "shadow" not in r.json()  # never served
+    text = c.get("/metrics").text
+    assert 'nw_semantic_shadow_total{agree="true"} 6.0' in text
+    assert 'nw_semantic_shadow_total{agree="false"}' not in text
+    lines = [json.loads(line) for line in capture.read_text().splitlines()]
+    assert len(lines) == 6 and all(x["shadow_priority"] == x["priority"] for x in lines)
+
+
 # ----- backtest and the card ------------------------------------------------------------
 def test_backtest_reports_agreement_and_metrics(benchmarked_tiny, s3_rows):
     out, _ = benchmarked_tiny

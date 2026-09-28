@@ -17,8 +17,10 @@ Endpoints:
 `NW_SEMANTIC_ARTIFACT` is a version directory, `latest`, a flat directory holding
 `metadata.json`, or the root `artifacts/semantic`, which means `latest`: the served model
 is the one the promotion gate chose. Environment, all optional: NW_QUANTIZED (1, the int8
-graph), NW_SEMANTIC_CAPTURE (a JSONL file of requests and predictions for backtests),
-NW_SEMANTIC_DRIFT_WINDOW, NW_SEMANTIC_DRIFT_MIN, NW_SEMANTIC_DRIFT_EVERY.
+graph), NW_SEMANTIC_SHADOW_ARTIFACT (a second artifact, the same shapes of path, scored on
+every request with its int8 graph, agreement counted, never served), NW_SEMANTIC_CAPTURE (a
+JSONL file of requests and predictions for backtests), NW_SEMANTIC_DRIFT_WINDOW,
+NW_SEMANTIC_DRIFT_MIN, NW_SEMANTIC_DRIFT_EVERY.
 """
 
 from __future__ import annotations
@@ -55,6 +57,7 @@ INFO = Gauge("nw_semantic_model_info", "Model version", ["version", "format"])
 PREDICTIONS = Counter("nw_semantic_predictions_total", "Predictions by priority", ["priority"])
 DRIFT = Gauge("nw_semantic_drift_psi", "Population stability index against training", ["feature"])
 DRIFT_LEVEL = Gauge("nw_semantic_drift_level", "0 ok, 1 watch, 2 alert, -1 warming up")
+SHADOW = Counter("nw_semantic_shadow_total", "Shadow model comparisons", ["agree"])
 
 
 class TicketIn(BaseModel):
@@ -82,6 +85,8 @@ class State:
     version = "unknown"
     fmt = "none"
     metadata: dict = {}
+    shadow = None
+    shadow_version: str | None = None
     ready = False
     monitor: SemanticDriftMonitor = SemanticDriftMonitor(None)
     drift_every: int = 50
@@ -92,21 +97,26 @@ class State:
 state = State()
 
 
-def load_all(artifact: Path, index_dir: Path | None, quantized: bool) -> None:
+def _encoder(artifact: Path, quantized: bool) -> tuple:
+    """The graph the service runs from one resolved artifact: its tokenizer, the int8 graph
+    when it exists, the metadata and the file name. The served slot and the shadow slot
+    load the same way."""
     from transformers import AutoTokenizer
 
     from nw.semantic.export import OnnxEncoder
 
-    artifact = resolve(artifact, serve=True)
     meta = json.loads((artifact / "metadata.json").read_text())
     tok_dir = artifact / "tokenizer"
-    state.tokenizer = AutoTokenizer.from_pretrained(
-        str(tok_dir) if tok_dir.exists() else meta["base"]
-    )
+    tokenizer = AutoTokenizer.from_pretrained(str(tok_dir) if tok_dir.exists() else meta["base"])
     file = (
         "model.int8.onnx" if quantized and (artifact / "model.int8.onnx").exists() else "model.onnx"
     )
-    state.onnx = OnnxEncoder(artifact / file, state.tokenizer, meta["max_length"])
+    return OnnxEncoder(artifact / file, tokenizer, meta["max_length"]), tokenizer, meta, file
+
+
+def load_all(artifact: Path, index_dir: Path | None, quantized: bool) -> None:
+    artifact = resolve(artifact, serve=True)
+    state.onnx, state.tokenizer, meta, file = _encoder(artifact, quantized)
     state.thresholds = np.load(artifact / "tag_thresholds.npy")
     state.version, state.fmt = meta["version"], file
     state.metadata = {k: v for k, v in meta.items() if k not in ("metrics", "tags", "history")}
@@ -116,13 +126,13 @@ def load_all(artifact: Path, index_dir: Path | None, quantized: bool) -> None:
         state.index = TicketIndex.load(index_dir)
         state.embedder = Embedder(json.loads((index_dir / "metadata.json").read_text())["embedder"])
     state.onnx.run(["probe"])
-    _configure_mlops(artifact)
+    _configure_mlops(artifact, quantized)
     state.ready = True
 
 
-def _configure_mlops(artifact: Path) -> None:
-    """Drift baseline from the artifact's data profile and an optional capture file. Both
-    are best effort: the service classifies without them."""
+def _configure_mlops(artifact: Path, quantized: bool) -> None:
+    """Drift baseline from the artifact's data profile, an optional shadow artifact, and an
+    optional capture file. All three are best effort: the service classifies without them."""
     profile_path = artifact / "data_profile.json"
     profile = json.loads(profile_path.read_text()) if profile_path.exists() else None
     state.monitor = SemanticDriftMonitor(
@@ -134,6 +144,18 @@ def _configure_mlops(artifact: Path) -> None:
     state.seen = 0
     if not state.monitor.enabled:
         log.info("drift monitoring off: no data_profile.json in the artifact")
+    shadow = os.environ.get("NW_SEMANTIC_SHADOW_ARTIFACT")
+    state.shadow, state.shadow_version = None, None
+    if shadow:
+        try:
+            encoder, _, meta, file = _encoder(resolve(shadow, serve=True), quantized)
+            encoder.run(["probe"])
+            state.shadow, state.shadow_version = encoder, meta["version"]
+            log.info("shadow model loaded", extra=log_fields(version=meta["version"], format=file))
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "shadow model failed to load", extra=log_fields(artifact=shadow, error=str(exc))
+            )
     capture = os.environ.get("NW_SEMANTIC_CAPTURE")
     state.capture = Path(capture) if capture else None
 
@@ -195,7 +217,12 @@ def readyz() -> dict[str, str]:
 def version() -> dict:
     if not state.ready:
         raise HTTPException(503, "model not loaded")
-    return {"model_version": state.version, "format": state.fmt, "metadata": state.metadata}
+    return {
+        "model_version": state.version,
+        "format": state.fmt,
+        "metadata": state.metadata,
+        "shadow_version": state.shadow_version,
+    }
 
 
 @app.get("/drift")
@@ -229,7 +256,23 @@ def _observe(ticket: TicketIn, priority: str, tags: list[str]) -> None:
             )
 
 
-def _capture(ticket: TicketIn, result: Classification) -> None:
+def _shadow(text: str, priority: str) -> str | None:
+    """The shadow artifact's priority for the same text: counted against the served one,
+    logged when it differs, never returned to the caller."""
+    if state.shadow is None:
+        return None
+    _, prio_logits, _ = state.shadow.run([text])
+    other = PRIORITIES[int(prio_logits[0].argmax())]
+    SHADOW.labels(agree=str(other == priority).lower()).inc()
+    if other != priority:
+        log.info(
+            "shadow_disagreement",
+            extra=log_fields(served=priority, shadow=other, shadow_version=state.shadow_version),
+        )
+    return other
+
+
+def _capture(ticket: TicketIn, result: Classification, shadow: str | None) -> None:
     if state.capture is None:
         return
     record = {
@@ -241,6 +284,7 @@ def _capture(ticket: TicketIn, result: Classification) -> None:
         "priority_scores": result.priority_scores,
         "model_version": result.model_version,
         "format": result.format,
+        "shadow_priority": shadow,
     }
     state.capture.parent.mkdir(parents=True, exist_ok=True)
     with state.capture.open("a", encoding="utf-8") as f:
@@ -279,7 +323,7 @@ def classify(ticket: TicketIn) -> Classification:
     )
     PREDICTIONS.labels(priority=result.priority).inc()
     _observe(ticket, result.priority, tags)
-    _capture(ticket, result)
+    _capture(ticket, result, _shadow(text, result.priority))
     log.info(
         "classify",
         extra=log_fields(priority=result.priority, n_tags=len(tags), n_similar=len(similar)),
