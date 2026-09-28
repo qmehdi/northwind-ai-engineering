@@ -1,0 +1,69 @@
+# A release is a tag. `make release VERSION=x.y.z` bumps pyproject, moves the changelog's
+# Unreleased section under the version, commits and tags `vx.y.z`; pushing the tag runs
+# this workflow, which:
+#
+# - checks the tag against pyproject.toml, so a tag never claims a version the package
+#   does not carry (`x-nw-version` on every response comes from that field);
+# - publishes a GitHub release whose body is that version's CHANGELOG.md section;
+# - when the repository variable NW_IMAGE_REGISTRY is set, retags the images the `image`
+#   workflow pushed for the tagged commit (`sha-<commit>`) as `vx.y.z`. A retag is a
+#   manifest operation: nothing is rebuilt, and the cosign signature on the digest still
+#   verifies. Without the variable, or without a pushed image for the commit, the step
+#   prints a warning and the release still succeeds; registry secrets are never required.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+  packages: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: The tag must match pyproject.toml
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          PY=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)
+          test "$VERSION" = "$PY" || { echo "tag v$VERSION but pyproject.toml says $PY"; exit 1; }
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "COMMIT=$(git rev-parse "${GITHUB_REF_NAME}^{commit}")" >> "$GITHUB_ENV"
+      - name: Release notes from CHANGELOG.md
+        run: python3 scripts/release.py notes "$VERSION" > release-notes.md && cat release-notes.md
+      - uses: softprops/action-gh-release@v3
+        with:
+          name: v${{ env.VERSION }}
+          body_path: release-notes.md
+      - name: Registry host
+        id: registry
+        if: vars.NW_IMAGE_REGISTRY != ''
+        env:
+          REGISTRY: ${{ vars.NW_IMAGE_REGISTRY }}
+        run: echo "host=${REGISTRY%%/*}" >> "$GITHUB_OUTPUT"
+      - name: Registry login
+        if: vars.NW_IMAGE_REGISTRY != ''
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ steps.registry.outputs.host }}
+          username: ${{ steps.registry.outputs.host == 'ghcr.io' && github.actor || secrets.NW_REGISTRY_USERNAME }}
+          password: ${{ steps.registry.outputs.host == 'ghcr.io' && secrets.GITHUB_TOKEN || secrets.NW_REGISTRY_PASSWORD }}
+      - name: Tag the commit's images with the version
+        if: vars.NW_IMAGE_REGISTRY != ''
+        env:
+          REGISTRY: ${{ vars.NW_IMAGE_REGISTRY }}
+        run: |
+          for image in nw-triage nw-semantic nw-policy nw-agent nw-mcp; do
+            src="$REGISTRY/$image:sha-$COMMIT"
+            if docker buildx imagetools inspect "$src" >/dev/null 2>&1; then
+              docker buildx imagetools create -t "$REGISTRY/$image:v$VERSION" "$src"
+              echo "tagged $REGISTRY/$image:v$VERSION"
+            else
+              echo "::warning::$src was never pushed; nothing to tag for $image"
+            fi
+          done
+      - name: No registry configured
+        if: vars.NW_IMAGE_REGISTRY == ''
+        run: echo "::notice::NW_IMAGE_REGISTRY is not set; release published, no image tags"

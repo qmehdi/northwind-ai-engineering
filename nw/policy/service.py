@@ -16,6 +16,11 @@ startup; nw_policy_index_stale and one `index_stale` warning), NW_POLICY_MIN_SCO
 NW_POLICY_RERANK, NW_POLICY_CACHE_TTL_S (0 is off) and NW_POLICY_CACHE_SIZE,
 NW_POLICY_FEEDBACK (JSONL path), NW_POLICY_CAPTURE (JSONL of every /ask),
 NW_POLICY_DRIFT_WINDOW, NW_POLICY_DRIFT_MIN, NW_POLICY_DRIFT_EVERY.
+
+Input screening: with NW_GUARDRAIL_ID (Bedrock Guardrails) or NW_MODEL_ARMOR_TEMPLATE (Model
+Armor) set, `/ask` screens the question before retrieval and refuses with reason `screened`
+when it is blocked. The question is redacted before it is cached, logged or sent to the
+model; the original text is kept nowhere.
 """
 
 from __future__ import annotations
@@ -33,18 +38,23 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel, Field
 
+from nw.agent.screen import Screener, from_env
+from nw.api import install_version_headers, mount_versioned, version_fields
 from nw.auth import install_api_key
 from nw.config import ModelRole, settings
 from nw.llm import LLMClient, prompts
 from nw.llm.providers import make_provider
 from nw.logging import bind_correlation_id, configure_logging, get_logger, log_fields
-from nw.policy.answer import ANSWER_PROMPT, Answer, answer
+from nw.metrics_export import start_metrics_export
+from nw.policy.answer import ANSWER_PROMPT, SCREENED, Answer, answer, refusal, safe_question
 from nw.policy.cache import ResponseCache
 from nw.policy.feedback import DEFAULT_PATH as FEEDBACK_DEFAULT
 from nw.policy.feedback import FeedbackIn, append_feedback
 from nw.policy.manifest import is_stale
 from nw.policy.monitor import ALERT, PolicyDriftMonitor
+from nw.policy.redact import redact_fields
 from nw.policy.retrieval import PolicyIndex
+from nw.ratelimit import install_rate_limit
 from nw.telemetry import configure_tracing, instrument_app
 
 log = get_logger("nw.policy.service")
@@ -93,6 +103,7 @@ class State:
     drift_every: int = 50
     seen: int = 0
     answers: OrderedDict[str, dict[str, Any]] = OrderedDict()
+    screener: Screener | None = None  # None screens nothing; the lifespan sets it from env
 
 
 state = State()
@@ -101,6 +112,7 @@ state = State()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging(os.environ.get("NW_LOG_FORMAT", "json"))
+    start_metrics_export("policy")
     index_dir = Path(os.environ.get("NW_POLICY_INDEX", "artifacts/policy"))
     state.min_score = float(os.environ.get("NW_POLICY_MIN_SCORE", "0.0"))
     try:
@@ -166,12 +178,19 @@ def _configure_llmops() -> None:
     state.drift_every = int(os.environ.get("NW_POLICY_DRIFT_EVERY", "50"))
     state.seen = 0
     state.answers = OrderedDict()
+    state.screener = from_env()
+    if state.screener.name != "none":
+        log.info("input screening on", extra=log_fields(screener=state.screener.name))
     if not state.monitor.enabled:
         log.info("drift monitoring off: no baseline in the index manifest")
 
 
 app = FastAPI(title="Northwind policy service", version="1.1", lifespan=lifespan)
+# Starlette runs the last-added middleware first: the key check runs before the limiter
+# (which buckets by key id) and the version headers land on their 401 and 429 too.
+install_rate_limit(app)
 install_api_key(app)
+install_version_headers(app)
 configure_tracing("northwind-policy")
 instrument_app(app)
 
@@ -221,6 +240,9 @@ def version() -> dict[str, Any]:
         "min_score": state.min_score,
         "cache": state.cache.stats(),
         "drift_baseline": bool(state.monitor.enabled),
+        "screener": state.screener.name if state.screener else "none",
+        "config_hash": settings().config_hash(),
+        **version_fields(),
     }
 
 
@@ -298,6 +320,7 @@ def _capture(resp: AskResponse, req: Ask, top_confidence: float, latency_ms: flo
         "model_id": resp.model_id,
         "latency_ms": round(latency_ms, 1),
     }
+    record = redact_fields(record, "question", "reason")
     state.capture.parent.mkdir(parents=True, exist_ok=True)
     with state.capture.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
@@ -310,6 +333,23 @@ async def ask(req: Ask) -> AskResponse:
         raise HTTPException(503, "index not loaded")
     t0 = time.perf_counter()
     model_id = _model_id()
+    # From here on only the redacted question exists: it is what the cache key, the model,
+    # the feedback record and the capture line see. The original is not kept.
+    req = req.model_copy(update={"question": safe_question(req.question)})
+    if state.screener is not None:
+        verdict = state.screener.screen(req.question)
+        if not verdict.allowed:
+            REQUESTS.labels(outcome=SCREENED).inc()
+            resp = AskResponse(
+                **refusal(SCREENED).model_dump(), answer_id=uuid.uuid4().hex, model_id=model_id
+            )
+            _remember(resp, req, 0.0)
+            _capture(resp, req, 0.0, (time.perf_counter() - t0) * 1000)
+            log.warning(
+                "ask screened",
+                extra=log_fields(screener=verdict.screener, reason=verdict.reason),
+            )
+            return resp
     key = ResponseCache.key(
         req.question,
         req.audience,
@@ -371,7 +411,12 @@ def feedback(fb: FeedbackIn) -> dict[str, Any]:
     if known is None:
         raise HTTPException(404, "unknown or expired answer_id")
     FEEDBACK.labels(verdict=fb.verdict).inc()
-    record = {"answer_id": fb.answer_id, "verdict": fb.verdict, "note": fb.note, **known}
+    record = redact_fields(
+        {"answer_id": fb.answer_id, "verdict": fb.verdict, "note": fb.note, **known},
+        "note",
+        "question",
+        "text",
+    )
     if state.feedback_path is not None:
         append_feedback(state.feedback_path, record)
     log.info(
@@ -393,3 +438,6 @@ def feedback(fb: FeedbackIn) -> dict[str, Any]:
 @app.get("/metrics")
 def metrics() -> Response:
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+mount_versioned(app)  # /v1/... is the API; the bare paths are deprecated aliases for one release

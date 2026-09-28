@@ -17,7 +17,8 @@ with 503 and leaves readiness alone (the platform keeps the instance, the operat
 the spend); NW_AGENT_MAX_CONCURRENT_RUNS (default 4) bounds runs in flight, 429 beyond it;
 NW_AGENT_CAPTURE appends one JSON line per run; NW_AGENT_BASELINE points the drift monitor
 at a baseline other than data/golden/agent_baseline.json; NW_AGENT_DRIFT_WINDOW and
-NW_AGENT_DRIFT_MIN size the window.
+NW_AGENT_DRIFT_MIN size the window; NW_AGENT_MAX_TOTAL_TOKENS caps the tokens one resolver
+run may spend (input plus output), stopping it with BUDGET.
 """
 
 from __future__ import annotations
@@ -48,11 +49,15 @@ from nw.agent.orchestrator import (
 from nw.agent.tools import Observation, ToolRegistry
 from nw.agent.trace import Trajectory
 from nw.agent.version import describe
+from nw.api import install_version_headers, mount_versioned, version_fields
 from nw.auth import install_api_key
 from nw.config import ModelRole, settings
 from nw.llm import LLMClient
 from nw.llm.providers import make_provider
 from nw.logging import bind_correlation_id, configure_logging, get_logger, log_fields
+from nw.metrics_export import start_metrics_export
+from nw.policy.redact import redact
+from nw.ratelimit import install_rate_limit
 from nw.telemetry import configure_tracing, instrument_app
 
 log = get_logger("nw.agent.service")
@@ -99,6 +104,7 @@ class State:
     baseline: dict[str, Any] | None = None
     capture: Path | None = None
     max_runs: int = 4
+    max_total_tokens: int | None = None
 
     def __init__(self) -> None:
         # Mutable per instance: tests build a fresh State and must not share a window.
@@ -142,12 +148,15 @@ def configure_agentops() -> None:
         log.info("drift PSI off: no agent baseline with per-case steps and costs")
     capture = os.environ.get("NW_AGENT_CAPTURE")
     state.capture = Path(capture) if capture else None
+    tokens = os.environ.get("NW_AGENT_MAX_TOTAL_TOKENS", "").strip()
+    state.max_total_tokens = int(tokens) if tokens else None
     state.slots = None  # created lazily on the serving loop, see _slots
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging(os.environ.get("NW_LOG_FORMAT", "json"))
+    start_metrics_export("agent")
     state.role = os.environ.get("NW_AGENT_ROLE", "triage")
     state.trace_dir = Path(os.environ.get("NW_TRACE_DIR", "artifacts/traces"))
     try:
@@ -185,7 +194,11 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Northwind agent", version="1.0", lifespan=lifespan)
+# Starlette runs the last-added middleware first: the key check runs before the limiter
+# (which buckets by key id) and the version headers land on their 401 and 429 too.
+install_rate_limit(app)
 install_api_key(app)
+install_version_headers(app)
 configure_tracing("northwind-agent")
 instrument_app(app)
 
@@ -244,6 +257,12 @@ def version() -> dict[str, Any]:
     )
     info["disabled"] = _disabled()
     info["max_concurrent_runs"] = _slots_limit()
+    info["max_total_tokens"] = state.max_total_tokens
+    s = settings()
+    info["config_hash"] = s.config_hash()
+    info["fallbacks"] = {r.value: m for r, m in s.fallback.items()}
+    info["resilience"] = state.client.meter.resilience() if state.client else None
+    info.update(version_fields())
     return info
 
 
@@ -315,6 +334,8 @@ async def run(req: SpecialistRequest) -> SpecialistResponse:
             )
         elif state.role in SPECIALISTS:
             assert state.registry is not None
+            if req.max_total_tokens is None and state.max_total_tokens is not None:
+                req = req.model_copy(update={"max_total_tokens": state.max_total_tokens})
             _, t = await run_specialist(
                 state.role, req, state.registry, state.client, screener=state.screener
             )
@@ -329,6 +350,7 @@ async def run(req: SpecialistRequest) -> SpecialistResponse:
                 budget_usd=req.budget_usd,
                 agent_name=state.role,
                 screener=state.screener,
+                max_total_tokens=state.max_total_tokens,
             )
         finish_run(t, state.role, t0)
         return _response(t)
@@ -419,8 +441,10 @@ def _capture(summary: RunSummary) -> None:
     if state.capture is None:
         return
     state.capture.parent.mkdir(parents=True, exist_ok=True)
+    # The summary holds counts and ids, no free text; the line still passes through
+    # redaction so a field added later cannot put an email on disk.
     with state.capture.open("a", encoding="utf-8") as f:
-        f.write(summary.model_dump_json() + "\n")
+        f.write(redact(summary.model_dump_json()).text + "\n")
 
 
 @app.get("/drift")
@@ -433,3 +457,6 @@ def drift() -> dict[str, Any]:
 @app.get("/metrics")
 def metrics() -> Response:
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+mount_versioned(app)  # /v1/... is the API; the bare paths are deprecated aliases for one release

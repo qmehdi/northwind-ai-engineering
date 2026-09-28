@@ -44,6 +44,27 @@ make preflight            # paste the table into the cohort channel
 
 After each session, that session's solution is published on the branch `solutions/session-NN`.
 
+## Versioning
+
+Everything that changes an answer has a version, and each lives in one place:
+
+| What | Version | Where |
+| --- | --- | --- |
+| Code | git commit; a release is a `vX.Y.Z` tag cut with `make release VERSION=X.Y.Z` | `CHANGELOG.md`, the `release` workflow |
+| Package | `pyproject.toml` `version`, read back as `nw.__version__`; every response carries `x-nw-version` | `nw/__init__.py` |
+| API | `/v1/...` routes, `x-api-version` on every response, `api_version` in `/version`; the bare paths are deprecated aliases for one release | `nw/api.py`, snapshots in `docs/openapi/`, checked by `scripts/openapi_snapshot.py --check` |
+| Images | base images pinned by digest in the `Dockerfile`; built images tagged `sha-<commit>` by the `image` workflow and `vX.Y.Z` by `release`, signed with cosign keyless | `Dockerfile`, `.github/workflows/image.yml` |
+| Models and artifacts | a timestamped version directory per candidate with a model card, `latest` pointing at the promoted one; `/version` and `nw_*_model_info` report it | `artifacts/triage`, `artifacts/semantic`, the `promote` modules |
+| Prompts | `name@hash` per registered prompt, on every answer and in every evaluation report | `nw/llm/prompts`, `make prompts` |
+| Indexes | the manifest with the corpus hash, the embedder and the prompt versions at build; `nw_policy_index_stale` when the corpus moved on | `artifacts/policy/manifest.json`, `make check-index` |
+| Agent | one hash over the system prompt, the tool specs and the model ids, on every trajectory | `nw/agent/version.py` |
+| Data | `dataset_version` (CalVer) with sha256 and row counts per file; CI fails when data changes without it | `data/MANIFEST.json`, `python -m nw.data_manifest --check` |
+| Infrastructure | the CDK app and the Terraform modules in git, pinned CDK CLI and provider versions, a synth review test on the aws track | `deploy/aws`, `deploy/gcp`, `make session06` |
+
+## Security
+
+`docs/SECURITY.md` is the threat model: each threat, the control, and the file or stack where it lives. The five system decisions behind it are in `docs/adr/`. Report a vulnerability as that document says, not in a public issue.
+
 ## Data and licence
 
 Every ticket, account and policy document here is synthetic, generated for the course; nothing is real customer data. The ticket schema and label mix are modelled on the public Hugging Face dataset Tobi-Bueck/customer-support-tickets (CC BY-NC 4.0), of which no rows are shipped. See `data/README.md`.

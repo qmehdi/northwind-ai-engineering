@@ -1,0 +1,525 @@
+{
+ "components": {
+  "schemas": {
+   "HTTPValidationError": {
+    "properties": {
+     "detail": {
+      "items": {
+       "$ref": "#/components/schemas/ValidationError"
+      },
+      "title": "Detail",
+      "type": "array"
+     }
+    },
+    "title": "HTTPValidationError",
+    "type": "object"
+   },
+   "RouteRequest": {
+    "properties": {
+     "account_id": {
+      "default": "NW-00000",
+      "title": "Account Id",
+      "type": "string"
+     },
+     "budget_usd": {
+      "default": 0.1,
+      "exclusiveMinimum": 0.0,
+      "maximum": 5.0,
+      "title": "Budget Usd",
+      "type": "number"
+     },
+     "max_steps": {
+      "default": 6,
+      "maximum": 20.0,
+      "minimum": 1.0,
+      "title": "Max Steps",
+      "type": "integer"
+     },
+     "max_total_tokens": {
+      "anyOf": [
+       {
+        "minimum": 1000.0,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Max Total Tokens"
+     },
+     "subject": {
+      "default": "",
+      "title": "Subject",
+      "type": "string"
+     },
+     "task": {
+      "minLength": 3,
+      "title": "Task",
+      "type": "string"
+     },
+     "ticket_id": {
+      "default": "T-000000",
+      "title": "Ticket Id",
+      "type": "string"
+     }
+    },
+    "required": [
+     "task"
+    ],
+    "title": "RouteRequest",
+    "type": "object"
+   },
+   "SpecialistRequest": {
+    "properties": {
+     "budget_usd": {
+      "default": 0.1,
+      "exclusiveMinimum": 0.0,
+      "maximum": 5.0,
+      "title": "Budget Usd",
+      "type": "number"
+     },
+     "max_steps": {
+      "default": 6,
+      "maximum": 20.0,
+      "minimum": 1.0,
+      "title": "Max Steps",
+      "type": "integer"
+     },
+     "max_total_tokens": {
+      "anyOf": [
+       {
+        "minimum": 1000.0,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Max Total Tokens"
+     },
+     "task": {
+      "minLength": 3,
+      "title": "Task",
+      "type": "string"
+     }
+    },
+    "required": [
+     "task"
+    ],
+    "title": "SpecialistRequest",
+    "type": "object"
+   },
+   "SpecialistResponse": {
+    "properties": {
+     "cost_usd": {
+      "title": "Cost Usd",
+      "type": "number"
+     },
+     "final": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Final"
+     },
+     "proposed_actions": {
+      "items": {
+       "additionalProperties": true,
+       "type": "object"
+      },
+      "title": "Proposed Actions",
+      "type": "array"
+     },
+     "run_id": {
+      "title": "Run Id",
+      "type": "string"
+     },
+     "steps": {
+      "title": "Steps",
+      "type": "integer"
+     },
+     "terminated": {
+      "title": "Terminated",
+      "type": "string"
+     }
+    },
+    "required": [
+     "run_id",
+     "final",
+     "terminated",
+     "steps",
+     "cost_usd",
+     "proposed_actions"
+    ],
+    "title": "SpecialistResponse",
+    "type": "object"
+   },
+   "ValidationError": {
+    "properties": {
+     "ctx": {
+      "title": "Context",
+      "type": "object"
+     },
+     "input": {
+      "title": "Input"
+     },
+     "loc": {
+      "items": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "integer"
+        }
+       ]
+      },
+      "title": "Location",
+      "type": "array"
+     },
+     "msg": {
+      "title": "Message",
+      "type": "string"
+     },
+     "type": {
+      "title": "Error Type",
+      "type": "string"
+     }
+    },
+    "required": [
+     "loc",
+     "msg",
+     "type"
+    ],
+    "title": "ValidationError",
+    "type": "object"
+   }
+  }
+ },
+ "info": {
+  "title": "Northwind agent",
+  "version": "1.0"
+ },
+ "openapi": "3.1.0",
+ "paths": {
+  "/drift": {
+   "get": {
+    "deprecated": true,
+    "description": "Deprecated alias of `/v1/drift`, kept for one release. Call `/v1/drift`.\n\nThe behaviour window: termination mix, tool error rate, steps and cost against the\nbaseline.",
+    "operationId": "drift_drift_get",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "additionalProperties": true,
+         "title": "Response Drift Drift Get",
+         "type": "object"
+        }
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "Drift",
+    "tags": [
+     "deprecated"
+    ]
+   }
+  },
+  "/healthz": {
+   "get": {
+    "operationId": "healthz_healthz_get",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "additionalProperties": {
+          "type": "string"
+         },
+         "title": "Response Healthz Healthz Get",
+         "type": "object"
+        }
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "Healthz"
+   }
+  },
+  "/metrics": {
+   "get": {
+    "operationId": "metrics_metrics_get",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "Metrics"
+   }
+  },
+  "/readyz": {
+   "get": {
+    "description": "Readiness is about the process, not the operator's decision: the kill switch does not\nfail it, so the platform keeps the instance while runs are refused.",
+    "operationId": "readyz_readyz_get",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "additionalProperties": {
+          "type": "string"
+         },
+         "title": "Response Readyz Readyz Get",
+         "type": "object"
+        }
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "Readyz"
+   }
+  },
+  "/route": {
+   "post": {
+    "deprecated": true,
+    "description": "Deprecated alias of `/v1/route`, kept for one release. Call `/v1/route`.\n\nCapstone endpoint: Project 1 first, then the cheapest loop that will do.",
+    "operationId": "route_ticket_route_post",
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/RouteRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/SpecialistResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Route Ticket",
+    "tags": [
+     "deprecated"
+    ]
+   }
+  },
+  "/run": {
+   "post": {
+    "deprecated": true,
+    "description": "Deprecated alias of `/v1/run`, kept for one release. Call `/v1/run`.",
+    "operationId": "run_run_post",
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/SpecialistRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/SpecialistResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Run",
+    "tags": [
+     "deprecated"
+    ]
+   }
+  },
+  "/v1/drift": {
+   "get": {
+    "description": "The behaviour window: termination mix, tool error rate, steps and cost against the\nbaseline.",
+    "operationId": "drift_v1_drift_get",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "additionalProperties": true,
+         "title": "Response Drift V1 Drift Get",
+         "type": "object"
+        }
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "Drift"
+   }
+  },
+  "/v1/route": {
+   "post": {
+    "description": "Capstone endpoint: Project 1 first, then the cheapest loop that will do.",
+    "operationId": "route_ticket_v1_route_post",
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/RouteRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/SpecialistResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Route Ticket"
+   }
+  },
+  "/v1/run": {
+   "post": {
+    "operationId": "run_v1_run_post",
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/SpecialistRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/SpecialistResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Run"
+   }
+  },
+  "/v1/version": {
+   "get": {
+    "operationId": "version_v1_version_get",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "additionalProperties": true,
+         "title": "Response Version V1 Version Get",
+         "type": "object"
+        }
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "Version"
+   }
+  },
+  "/version": {
+   "get": {
+    "deprecated": true,
+    "description": "Deprecated alias of `/v1/version`, kept for one release. Call `/v1/version`.",
+    "operationId": "version_version_get",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "additionalProperties": true,
+         "title": "Response Version Version Get",
+         "type": "object"
+        }
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "Version",
+    "tags": [
+     "deprecated"
+    ]
+   }
+  }
+ }
+}

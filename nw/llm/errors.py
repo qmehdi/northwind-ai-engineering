@@ -26,6 +26,22 @@ class RetryableError(LLMError):
         self.status = status
 
 
+class RequestTimeout(RetryableError):
+    """The call did not answer within the request timeout. Retryable: the next attempt may."""
+
+    def __init__(self, message: str, *, timeout_s: float, request_id: str | None = None) -> None:
+        super().__init__(message, request_id=request_id, status=None)
+        self.timeout_s = timeout_s
+
+
+class CircuitOpenError(RetryableError):
+    """Every candidate model for the role has an open circuit: skipped without a call."""
+
+    def __init__(self, message: str, *, models: list[str]) -> None:
+        super().__init__(message, status=None)
+        self.models = models
+
+
 class TerminalError(LLMError):
     """Bad request, auth, not found, validation: retrying cannot help."""
 
@@ -46,3 +62,7 @@ class SpendCapExceeded(TerminalError):
 
 class StructuredOutputError(TerminalError):
     """The model could not produce output matching the schema, even after repair."""
+
+
+class TokenBudgetExceeded(TerminalError):
+    """A per-request token budget (`max_total_tokens`) was used up before this call."""

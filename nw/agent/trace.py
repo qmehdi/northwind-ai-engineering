@@ -56,7 +56,9 @@ class Trajectory(BaseModel):
     tools_called: list[str] = Field(default_factory=list)
     correlation_id: str | None = None
     agent_version: str | None = None  # hash of prompt, tool specs and model ids, see version.py
+    model_id: str | None = None  # the model the role resolved to when the run started
     resumed_from: str | None = None  # the run whose proposal this run executed with approval
+    tokens_total: int = 0  # input plus output over every model call in the run
 
     @property
     def n_steps(self) -> int:
@@ -79,9 +81,10 @@ def replay(t: Trajectory, width: int = 110) -> str:
         f"run {t.run_id}  agent={t.agent}  terminated={t.terminated.value}  "
         f"steps={t.n_steps}  cost={t.cost_usd:.4f} USD"
     ]
-    if t.agent_version or t.resumed_from:
+    if t.agent_version or t.model_id or t.resumed_from:
         lines.append(
-            f"agent_version={t.agent_version or '?'}"
+            f"agent_version={t.agent_version or '?'}  model_id={t.model_id or '?'}"
+            + (f"  tokens={t.tokens_total}" if t.tokens_total else "")
             + (f"  resumed_from={t.resumed_from}" if t.resumed_from else "")
         )
     lines.append(f"task: {t.task[:width]}")

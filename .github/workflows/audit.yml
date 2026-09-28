@@ -1,0 +1,57 @@
+# The standing audits: dependencies, secrets, and the two contracts a change can break
+# without a test failing (the API shape and the data). Weekly, because a CVE lands
+# between commits, and on every pull request.
+#
+# - dependencies: pip-audit over the locked, exported requirement set (every extra), no
+#   resolution and no pip, so the audited set is exactly what `uv sync --locked` installs.
+#   Fails on any known vulnerability.
+# - secrets: gitleaks over the whole history. GITLEAKS_LICENSE is only needed on an
+#   organization-owned repository; a personal one runs with GITHUB_TOKEN alone.
+# - contracts: the OpenAPI snapshots in docs/openapi must be compatible with the apps
+#   (scripts/openapi_snapshot.py --check) and data/MANIFEST.json must match the data
+#   (python -m nw.data_manifest --check).
+name: audit
+on:
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"   # Mondays 06:00 UTC
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  dependencies:
+    name: pip-audit against the lock
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - run: uv python install 3.12
+      - name: The locked set, every extra, as pinned requirements
+        run: uv export --frozen --no-dev --all-extras --no-emit-project --no-hashes -o requirements.txt
+      - name: Drop local version labels (torch +cpu from the PyTorch index has no PyPI record)
+        run: sed -i -E 's/==([0-9][^+ ;]*)\+[A-Za-z0-9.]+/==\1/' requirements.txt
+      - name: pip-audit (no resolution, no pip; the pins are the lock)
+        run: uv run --with pip-audit pip-audit -r requirements.txt --no-deps --disable-pip --strict --progress-spinner off
+  secrets:
+    name: gitleaks over the history
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+  contracts:
+    name: OpenAPI snapshots and the data manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - run: uv python install 3.12
+      - run: uv sync --locked --extra dev --extra dl --extra agents --extra agents-aws --extra agents-gcp
+      - name: The committed OpenAPI specs must be compatible with the apps
+        run: uv run python scripts/openapi_snapshot.py --check
+      - name: The data must match its manifest
+        run: uv run python -m nw.data_manifest --check

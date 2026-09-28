@@ -56,6 +56,7 @@ class SpecialistRequest(BaseModel):
     task: str = Field(min_length=3)
     max_steps: int = Field(default=6, ge=1, le=20)
     budget_usd: float = Field(default=0.10, gt=0, le=5)
+    max_total_tokens: int | None = Field(default=None, ge=1000)
 
 
 class SpecialistResponse(BaseModel):
@@ -95,6 +96,7 @@ async def run_specialist(
         budget_usd=req.budget_usd,
         agent_name=role,
         screener=screener,
+        max_total_tokens=req.max_total_tokens,
     )
     resp = SpecialistResponse(
         run_id=t.run_id,

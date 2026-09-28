@@ -1,0 +1,356 @@
+{
+ "components": {
+  "schemas": {
+   "HTTPValidationError": {
+    "properties": {
+     "detail": {
+      "items": {
+       "$ref": "#/components/schemas/ValidationError"
+      },
+      "title": "Detail",
+      "type": "array"
+     }
+    },
+    "title": "HTTPValidationError",
+    "type": "object"
+   },
+   "TicketIn": {
+    "properties": {
+     "body": {
+      "maxLength": 20000,
+      "minLength": 1,
+      "title": "Body",
+      "type": "string"
+     },
+     "subject": {
+      "default": "",
+      "maxLength": 500,
+      "title": "Subject",
+      "type": "string"
+     }
+    },
+    "required": [
+     "body"
+    ],
+    "title": "TicketIn",
+    "type": "object"
+   },
+   "TriageResult": {
+    "properties": {
+     "confidence": {
+      "title": "Confidence",
+      "type": "number"
+     },
+     "model_version": {
+      "title": "Model Version",
+      "type": "string"
+     },
+     "priority": {
+      "pattern": "^P[0-3]$",
+      "title": "Priority",
+      "type": "string"
+     },
+     "probabilities": {
+      "additionalProperties": {
+       "type": "number"
+      },
+      "title": "Probabilities",
+      "type": "object"
+     },
+     "rule": {
+      "title": "Rule",
+      "type": "string"
+     }
+    },
+    "required": [
+     "priority",
+     "probabilities",
+     "confidence",
+     "rule",
+     "model_version"
+    ],
+    "title": "TriageResult",
+    "type": "object"
+   },
+   "ValidationError": {
+    "properties": {
+     "ctx": {
+      "title": "Context",
+      "type": "object"
+     },
+     "input": {
+      "title": "Input"
+     },
+     "loc": {
+      "items": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "integer"
+        }
+       ]
+      },
+      "title": "Location",
+      "type": "array"
+     },
+     "msg": {
+      "title": "Message",
+      "type": "string"
+     },
+     "type": {
+      "title": "Error Type",
+      "type": "string"
+     }
+    },
+    "required": [
+     "loc",
+     "msg",
+     "type"
+    ],
+    "title": "ValidationError",
+    "type": "object"
+   }
+  }
+ },
+ "info": {
+  "title": "Northwind triage",
+  "version": "1.0"
+ },
+ "openapi": "3.1.0",
+ "paths": {
+  "/drift": {
+   "get": {
+    "deprecated": true,
+    "description": "Deprecated alias of `/v1/drift`, kept for one release. Call `/v1/drift`.\n\nThe current drift snapshot: PSI of text length and predicted priority against training.",
+    "operationId": "drift_drift_get",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "additionalProperties": true,
+         "title": "Response Drift Drift Get",
+         "type": "object"
+        }
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "Drift",
+    "tags": [
+     "deprecated"
+    ]
+   }
+  },
+  "/healthz": {
+   "get": {
+    "operationId": "healthz_healthz_get",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "additionalProperties": {
+          "type": "string"
+         },
+         "title": "Response Healthz Healthz Get",
+         "type": "object"
+        }
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "Healthz"
+   }
+  },
+  "/metrics": {
+   "get": {
+    "operationId": "metrics_metrics_get",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "Metrics"
+   }
+  },
+  "/readyz": {
+   "get": {
+    "operationId": "readyz_readyz_get",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "additionalProperties": {
+          "type": "string"
+         },
+         "title": "Response Readyz Readyz Get",
+         "type": "object"
+        }
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "Readyz"
+   }
+  },
+  "/triage": {
+   "post": {
+    "deprecated": true,
+    "description": "Deprecated alias of `/v1/triage`, kept for one release. Call `/v1/triage`.",
+    "operationId": "triage_triage_post",
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/TicketIn"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/TriageResult"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Triage",
+    "tags": [
+     "deprecated"
+    ]
+   }
+  },
+  "/v1/drift": {
+   "get": {
+    "description": "The current drift snapshot: PSI of text length and predicted priority against training.",
+    "operationId": "drift_v1_drift_get",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "additionalProperties": true,
+         "title": "Response Drift V1 Drift Get",
+         "type": "object"
+        }
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "Drift"
+   }
+  },
+  "/v1/triage": {
+   "post": {
+    "operationId": "triage_v1_triage_post",
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/TicketIn"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/TriageResult"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Triage"
+   }
+  },
+  "/v1/version": {
+   "get": {
+    "operationId": "version_v1_version_get",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "additionalProperties": true,
+         "title": "Response Version V1 Version Get",
+         "type": "object"
+        }
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "Version"
+   }
+  },
+  "/version": {
+   "get": {
+    "deprecated": true,
+    "description": "Deprecated alias of `/v1/version`, kept for one release. Call `/v1/version`.",
+    "operationId": "version_version_get",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "additionalProperties": true,
+         "title": "Response Version Version Get",
+         "type": "object"
+        }
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "Version",
+    "tags": [
+     "deprecated"
+    ]
+   }
+  }
+ }
+}

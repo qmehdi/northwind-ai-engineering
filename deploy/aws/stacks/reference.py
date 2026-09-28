@@ -25,7 +25,7 @@ from aws_cdk import aws_logs as logs
 from aws_cdk import aws_s3vectors as s3v
 from constructs import Construct
 
-from stacks.common import MODEL_IDS, bedrock_invoke_policy, image
+from stacks.common import MODEL_IDS, bedrock_invoke_policy, image, prefix
 from stacks.session_path import SessionPath
 
 # The gateway target below is named `northwind-tools`; the gateway exposes every tool of an
@@ -64,18 +64,33 @@ def cedar_policies(account: str) -> dict[str, str]:
 
 class ReferenceStack(Stack):
     def __init__(
-        self, scope: Construct, id: str, *, budget_usd: float, alert_email: str | None, **kw
+        self,
+        scope: Construct,
+        id: str,
+        *,
+        budget_usd: float,
+        alert_email: str | None,
+        stage: str = "",
+        **kw,
     ) -> None:
         super().__init__(scope, id, **kw)
         self.path = SessionPath(
-            self, "Session", region=self.region, budget_usd=budget_usd, alert_email=alert_email
+            self,
+            "Session",
+            region=self.region,
+            budget_usd=budget_usd,
+            alert_email=alert_email,
+            stage=stage,
         )
+        pre = prefix(stage)  # northwind or northwind-<stage>
+        under = pre.replace("-", "_")  # runtime and policy engine names allow no hyphen
+        camel = "Northwind" + stage.capitalize()  # role names, account-wide
 
         # ----- guardrail -------------------------------------------------------
         guardrail = bedrock.CfnGuardrail(
             self,
             "Guardrail",
-            name="northwind-support",
+            name=f"{pre}-support",
             blocked_input_messaging="This request was blocked by Northwind's safety policy.",
             blocked_outputs_messaging="The response was blocked by Northwind's safety policy.",
             content_policy_config=bedrock.CfnGuardrail.ContentPolicyConfigProperty(
@@ -111,14 +126,14 @@ class ReferenceStack(Stack):
             self,
             "GuardrailVersion",
             guardrail_identifier=guardrail.attr_guardrail_id,
-            description="northwind-support v1",
+            description=f"{pre}-support v1",
         )
 
         # ----- S3 Vectors: the managed retriever ---------------------------------
         vector_bucket = s3v.CfnVectorBucket(
             self,
             "PolicyVectors",
-            vector_bucket_name=f"northwind-policy-{self.account}-{self.region}",
+            vector_bucket_name=f"{pre}-policy-{self.account}-{self.region}",
         )
         s3v.CfnIndex(
             self,
@@ -134,7 +149,7 @@ class ReferenceStack(Stack):
         runtime_role = iam.Role(
             self,
             "RuntimeExecutionRole",
-            role_name=f"NorthwindBedrockAgentCoreRuntime-{self.region}",
+            role_name=f"{camel}BedrockAgentCoreRuntime-{self.region}",
             assumed_by=iam.ServicePrincipal(
                 "bedrock-agentcore.amazonaws.com",
                 conditions={
@@ -170,7 +185,7 @@ class ReferenceStack(Stack):
             iam.PolicyStatement(
                 actions=["logs:PutResourcePolicy"],
                 resources=[
-                    f"arn:aws:logs:{self.region}:{self.account}:log-group:/aws/bedrock-agentcore/runtimes/northwind*"
+                    f"arn:aws:logs:{self.region}:{self.account}:log-group:/aws/bedrock-agentcore/runtimes/{pre}*"
                 ],
             )
         )
@@ -216,7 +231,7 @@ class ReferenceStack(Stack):
                 ],
                 resources=[
                     f"arn:aws:bedrock-agentcore:{self.region}:{self.account}:workload-identity-directory/default",
-                    f"arn:aws:bedrock-agentcore:{self.region}:{self.account}:workload-identity-directory/default/workload-identity/northwind*",
+                    f"arn:aws:bedrock-agentcore:{self.region}:{self.account}:workload-identity-directory/default/workload-identity/{under}*",
                 ],
             )
         )
@@ -256,11 +271,12 @@ class ReferenceStack(Stack):
             "NW_VECTOR_INDEX": "policy-chunks",
             "NW_API_KEY_SECRET_ARN": self.path.api_key.secret_arn,
             "NW_TRACE_EXPORT": "xray",
+            "NW_STAGE": stage,
         }
         tools_runtime = ac.CfnRuntime(
             self,
             "ToolsRuntime",
-            agent_runtime_name="northwind_tools",
+            agent_runtime_name=f"{under}_tools",
             role_arn=runtime_role.role_arn,
             agent_runtime_artifact=ac.CfnRuntime.AgentRuntimeArtifactProperty(
                 container_configuration=ac.CfnRuntime.ContainerConfigurationProperty(
@@ -281,7 +297,7 @@ class ReferenceStack(Stack):
         agent_runtime = ac.CfnRuntime(
             self,
             "AgentRuntime",
-            agent_runtime_name="northwind_resolver",
+            agent_runtime_name=f"{under}_resolver",
             role_arn=runtime_role.role_arn,
             agent_runtime_artifact=ac.CfnRuntime.AgentRuntimeArtifactProperty(
                 container_configuration=ac.CfnRuntime.ContainerConfigurationProperty(
@@ -307,7 +323,7 @@ class ReferenceStack(Stack):
         engine = ac.CfnPolicyEngine(
             self,
             "PolicyEngine",
-            name="northwind_tools",
+            name=f"{under}_tools",
             description="Authorises tool calls through the Northwind gateway",
         )
         for name, statement in cedar_policies(self.account).items():
@@ -329,7 +345,7 @@ class ReferenceStack(Stack):
         gateway_role = iam.Role(
             self,
             "GatewayRole",
-            role_name=f"NorthwindBedrockAgentCoreGateway-{self.region}",
+            role_name=f"{camel}BedrockAgentCoreGateway-{self.region}",
             assumed_by=iam.ServicePrincipal(
                 "bedrock-agentcore.amazonaws.com",
                 conditions={
@@ -377,7 +393,7 @@ class ReferenceStack(Stack):
         gateway = ac.CfnGateway(
             self,
             "Gateway",
-            name="northwind-tools",
+            name=f"{pre}-tools",
             role_arn=gateway_role.role_arn,
             authorizer_type="AWS_IAM",
             protocol_type="MCP",
@@ -423,7 +439,7 @@ class ReferenceStack(Stack):
         logs.LogGroup(
             self,
             "RuntimeLogs",
-            log_group_name="/aws/bedrock-agentcore/runtimes/northwind",
+            log_group_name=f"/aws/bedrock-agentcore/runtimes/{pre}",
             retention=logs.RetentionDays.ONE_MONTH,
             removal_policy=RemovalPolicy.DESTROY,
         )

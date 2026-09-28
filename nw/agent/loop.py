@@ -59,8 +59,12 @@ async def run_agent(
     agent_name: str = "resolver",
     max_tokens: int = 1024,
     screener: Screener | None = None,
+    max_total_tokens: int | None = None,
 ) -> Trajectory:
-    """One span per run so the whole trajectory reads as a tree in the trace viewer."""
+    """One span per run so the whole trajectory reads as a tree in the trace viewer.
+
+    `max_total_tokens` is the run's token budget, input plus output over every model call;
+    the loop stops with BUDGET before the call that would follow exhausting it."""
     with span("agent.run", **{"nw.agent": agent_name}) as run_span:
         t = await _run_agent(
             task,
@@ -74,9 +78,12 @@ async def run_agent(
             agent_name=agent_name,
             max_tokens=max_tokens,
             screener=screener,
+            max_total_tokens=max_total_tokens,
         )
         run_span.set_attribute("nw.run_id", t.run_id)
         run_span.set_attribute("nw.agent_version", t.agent_version or "")
+        run_span.set_attribute("nw.model_id", t.model_id or "")
+        run_span.set_attribute("nw.tokens_total", t.tokens_total)
         run_span.set_attribute("nw.terminated", t.terminated.value)
         run_span.set_attribute("nw.steps", len(t.steps))
         run_span.set_attribute("nw.cost_usd", t.cost_usd)
@@ -96,10 +103,12 @@ async def _run_agent(
     agent_name: str = "resolver",
     max_tokens: int = 1024,
     screener: Screener | None = None,
+    max_total_tokens: int | None = None,
 ) -> Trajectory:
     run_id = uuid.uuid4().hex[:10]
     t = Trajectory(run_id=run_id, agent=agent_name, task=task, correlation_id=correlation_id())
-    t.agent_version = agent_version(system, registry.specs(), {role.value: client.model_for(role)})
+    t.model_id = client.model_for(role)
+    t.agent_version = agent_version(system, registry.specs(), {role.value: t.model_id})
     spent_before = client.spend_usd
     if screener is not None:
         verdict = screener.screen(task)
@@ -138,8 +147,10 @@ async def _run_agent(
             run_id=run_id,
             agent=agent_name,
             agent_version=t.agent_version,
+            model_id=t.model_id,
             terminated=t.terminated.value,
             steps=t.n_steps,
+            tokens=t.tokens_total,
             cost_usd=round(t.cost_usd, 5),
             tools=t.tools_called,
         ),

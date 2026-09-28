@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
+from typing import Any
 
 from nw.llm.errors import SpendCapExceeded
 from nw.llm.prices import price_for
@@ -41,6 +42,10 @@ class CostRecord:
     usage: Usage
     cost_usd: float
     correlation_id: str | None = None
+    role: str | None = None
+    fallback: bool = False  # the fallback model answered, not the role's primary
+    attempts: int = 1  # provider round trips this completion took, retries included
+    skipped: tuple[str, ...] = ()  # models skipped because their circuit was open
 
 
 @dataclass
@@ -79,7 +84,16 @@ class CostMeter:
             self._reserved_usd = max(0.0, self._reserved_usd - estimate_usd)
 
     def record(
-        self, request_id: str, model: str, usage: Usage, correlation_id: str | None = None
+        self,
+        request_id: str,
+        model: str,
+        usage: Usage,
+        correlation_id: str | None = None,
+        *,
+        role: str | None = None,
+        fallback: bool = False,
+        attempts: int = 1,
+        skipped: tuple[str, ...] = (),
     ) -> CostRecord:
         rec = CostRecord(
             request_id=request_id,
@@ -87,10 +101,36 @@ class CostMeter:
             usage=usage,
             cost_usd=cost_usd(model, usage),
             correlation_id=correlation_id,
+            role=role,
+            fallback=fallback,
+            attempts=attempts,
+            skipped=skipped,
         )
         with self._lock:
             self.records.append(rec)
         return rec
+
+    @property
+    def fallback_count(self) -> int:
+        return sum(1 for r in self.records if r.fallback)
+
+    @property
+    def retry_count(self) -> int:
+        """Provider round trips beyond the first, over every completion."""
+        return sum(r.attempts - 1 for r in self.records)
+
+    def resilience(self) -> dict[str, Any]:
+        """Fallbacks, retries and breaker skips as counts, for a log line or `/version`."""
+        skipped: dict[str, int] = {}
+        for r in self.records:
+            for m in r.skipped:
+                skipped[m] = skipped.get(m, 0) + 1
+        return {
+            "completions": len(self.records),
+            "fallbacks": self.fallback_count,
+            "retries": self.retry_count,
+            "breaker_skips": skipped,
+        }
 
     def by_model(self) -> dict[str, float]:
         out: dict[str, float] = {}

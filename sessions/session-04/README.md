@@ -23,4 +23,4 @@ Files you edit in this session:
 
 Files you read but do not edit: `build_index.py` and `manifest.py` (the manifest and the stale check), `service.py` (cache, feedback, drift, capture), `cache.py`, `feedback.py`, `monitor.py`, `nw/llm/prompts` (the registry), the rest of `evaluate.py`, and `.github/workflows/eval-gate.yml`.
 
-Environment for the service, all optional: `NW_POLICY_CACHE_TTL_S` (0 is off) and `NW_POLICY_CACHE_SIZE`, `NW_POLICY_FEEDBACK`, `NW_POLICY_CAPTURE`, `NW_POLICY_CORPUS`, `NW_POLICY_DRIFT_WINDOW`, `NW_POLICY_DRIFT_MIN`, `NW_POLICY_DRIFT_EVERY`.
+Environment for the service, all optional: `NW_POLICY_CACHE_TTL_S` (0 is off) and `NW_POLICY_CACHE_SIZE`, `NW_POLICY_FEEDBACK`, `NW_POLICY_CAPTURE`, `NW_POLICY_CORPUS`, `NW_POLICY_DRIFT_WINDOW`, `NW_POLICY_DRIFT_MIN`, `NW_POLICY_DRIFT_EVERY`. Input screening on `/ask`: `NW_GUARDRAIL_ID` (with `NW_GUARDRAIL_VERSION`, Bedrock Guardrails) or `NW_MODEL_ARMOR_TEMPLATE` (Model Armor); a blocked question is refused with reason `screened`. The question is redacted before it reaches the screener, the cache, the model or a log line.

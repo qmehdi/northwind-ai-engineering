@@ -20,7 +20,7 @@ def suppress_known(stack: Stack) -> None:
             },
             {
                 "id": "AwsSolutions-IAM4",
-                "reason": "AWSLambdaBasicExecutionRole is the documented Lambda logging policy and AWSXrayWriteOnlyPolicy is the policy AWS documents for the X-Ray OTLP endpoint.",
+                "reason": "AWSLambdaBasicExecutionRole is the documented Lambda logging policy, AWSXrayWriteOnlyPolicy is the policy AWS documents for the X-Ray OTLP endpoint, and AWSCodeDeployRoleForLambdaLimited is the policy the CDK LambdaDeploymentGroup attaches to CodeDeploy's service role (alias updates and alarm reads, no wildcard writes).",
             },
             {
                 "id": "AwsSolutions-SNS3",

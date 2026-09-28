@@ -8,6 +8,10 @@ Three rules the model does not get to break:
 The system prompt is registered in `nw.llm.prompts` and every Answer carries its
 `prompt_version` (`policy.answer@<hash>`), so a faithfulness number in a report can always
 be traced to the exact prompt that produced it.
+
+The question is redacted (`nw.policy.redact`) before it is put in the prompt: an email
+address or an account id a support agent pasted in never reaches the model, and the
+service logs the redacted text, never the original.
 """
 
 from __future__ import annotations
@@ -19,9 +23,11 @@ from pydantic import BaseModel, Field
 from nw.config import ModelRole
 from nw.llm import LLMClient
 from nw.llm.prompts import register
+from nw.policy.redact import redact
 from nw.policy.retrieval import Retrieved
 
 REFUSAL = "I cannot answer that from Northwind's current policies. Please contact support."
+SCREENED = "screened"  # the refusal reason when the input screener blocked the question
 
 
 class Draft(BaseModel):
@@ -70,6 +76,24 @@ def build_context(retrieved: list[Retrieved], budget_tokens: int = 2500) -> tupl
 def weak_retrieval(retrieved: list[Retrieved], min_score: float) -> bool:
     """Refuse when the best hit's confidence (one scale for every retriever) is below the bar."""
     return not retrieved or retrieved[0].confidence < min_score
+
+
+def refusal(reason: str, *, context_ids: list[str] | None = None) -> Answer:
+    """A refusal decided before any model call: screened input, or nothing to retrieve."""
+    return Answer(
+        text=REFUSAL,
+        citations=[],
+        confidence=0.0,
+        refused=True,
+        reason=reason,
+        context_ids=context_ids or [],
+        prompt_version=ANSWER_PROMPT.version,
+    )
+
+
+def safe_question(question: str) -> str:
+    """The question as the prompt carries it: identifiers replaced by stable tokens."""
+    return redact(question).text
 
 
 async def answer(

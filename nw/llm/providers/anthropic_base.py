@@ -13,7 +13,7 @@ from typing import Any
 
 import anthropic
 
-from nw.llm.errors import ContentFilteredError, RetryableError, TerminalError
+from nw.llm.errors import ContentFilteredError, RequestTimeout, RetryableError, TerminalError
 from nw.llm.types import Completion, Message, StopReason, ToolCall, ToolSpec, Usage
 
 # Models that reject sampling parameters. Sending temperature to these is a 400.
@@ -162,12 +162,18 @@ def classify(exc: Exception) -> RetryableError | TerminalError:
         return RetryableError(
             "rate limited", request_id=request_id, retry_after_s=retry_after, status=429
         )
+    if isinstance(exc, anthropic.APITimeoutError):
+        # The SDK client was built with `timeout=request_timeout_s`; this is that timeout.
+        timeout = getattr(getattr(exc, "request", None), "extensions", {}).get("timeout")
+        seconds = _timeout_seconds(timeout)
+        return RequestTimeout(
+            f"request timed out ({exc})", timeout_s=seconds, request_id=request_id
+        )
     if isinstance(
         exc,
         anthropic.OverloadedError
         | anthropic.InternalServerError
         | anthropic.ServiceUnavailableError
-        | anthropic.APITimeoutError
         | anthropic.APIConnectionError,
     ):
         status = getattr(exc, "status_code", None)
@@ -177,6 +183,14 @@ def classify(exc: Exception) -> RetryableError | TerminalError:
             return RetryableError(str(exc), request_id=request_id, status=exc.status_code)
         return TerminalError(str(exc), request_id=request_id, status=exc.status_code)
     return TerminalError(str(exc), request_id=request_id)
+
+
+def _timeout_seconds(timeout: Any) -> float:
+    """httpx stores the timeout on the request as a dict of phases; take the read phase."""
+    if isinstance(timeout, dict):
+        value = timeout.get("read") or timeout.get("pool")
+        return float(value) if value else 0.0
+    return float(timeout) if isinstance(timeout, int | float) else 0.0
 
 
 def _retry_after(exc: anthropic.APIStatusError) -> float | None:

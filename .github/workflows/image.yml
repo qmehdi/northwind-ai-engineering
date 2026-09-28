@@ -1,0 +1,121 @@
+# The supply chain gate for the service images. The triage image stands in for the four:
+# they share the Dockerfile, the lock and the package, so a vulnerable base layer or a bad
+# wheel shows up here first.
+#
+# - pull requests that touch the Dockerfile, the lock or the package: build, scan with
+#   Trivy (CRITICAL and HIGH with a fix available fail the job), write an SBOM with Syft
+#   and keep it as a run artifact.
+# - main: the same, then push to the registry named by the repository variable
+#   NW_IMAGE_REGISTRY (`ghcr.io/<owner>`, or `<account>.dkr.ecr.<region>.amazonaws.com/<ns>`)
+#   tagged `sha-<commit>`, and sign the pushed digest with cosign keyless through the
+#   job's GitHub OIDC identity (`permissions: id-token: write`). With the variable unset
+#   the push and the signature are skipped with a notice and the job passes: the gate
+#   never depends on a registry existing.
+#
+# Registry credentials: ghcr.io uses GITHUB_TOKEN (packages: write). Any other registry
+# reads the repository secrets NW_REGISTRY_USERNAME and NW_REGISTRY_PASSWORD (for ECR: an
+# `aws ecr get-login-password` token is short-lived, so use OIDC there instead; see
+# deploy/aws/README.md).
+#
+# CI trains nothing, so the build gets an empty artifacts/triage/latest: the image is a
+# supply chain object here, scanned and signed, never served. Verify a signature with
+#   cosign verify --certificate-identity-regexp 'github.com/<owner>/<repo>' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com <registry>/nw-triage@<digest>
+name: image
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - uv.lock
+      - pyproject.toml
+      - nw/**
+      - .github/workflows/image.yml
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - uv.lock
+      - pyproject.toml
+      - nw/**
+      - .github/workflows/image.yml
+  workflow_dispatch:
+env:
+  IMAGE: nw-triage
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Placeholder artifact (CI trains nothing; the image is scanned, not served)
+        run: |
+          mkdir -p artifacts/triage/latest
+          echo '{"version": "ci-placeholder"}' > artifacts/triage/latest/metadata.json
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}:ci
+          build-args: |
+            APP=nw.triage.service:app
+            ARTIFACTS=triage
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Trivy (CRITICAL and HIGH with a fix available fail the build)
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:ci
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+      - name: SBOM with Syft (SPDX JSON, kept as a run artifact)
+        uses: anchore/sbom-action@v0.24.2
+        with:
+          image: ${{ env.IMAGE }}:ci
+          format: spdx-json
+          output-file: sbom.spdx.json
+          artifact-name: sbom-${{ env.IMAGE }}.spdx.json
+          upload-artifact: true
+      - name: Registry host
+        id: registry
+        if: github.event_name == 'push' && vars.NW_IMAGE_REGISTRY != ''
+        env:
+          REGISTRY: ${{ vars.NW_IMAGE_REGISTRY }}
+        run: echo "host=${REGISTRY%%/*}" >> "$GITHUB_OUTPUT"
+      - name: Registry login
+        if: github.event_name == 'push' && vars.NW_IMAGE_REGISTRY != ''
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ steps.registry.outputs.host }}
+          username: ${{ steps.registry.outputs.host == 'ghcr.io' && github.actor || secrets.NW_REGISTRY_USERNAME }}
+          password: ${{ steps.registry.outputs.host == 'ghcr.io' && secrets.GITHUB_TOKEN || secrets.NW_REGISTRY_PASSWORD }}
+      - name: Push (same build, from the cache)
+        id: push
+        if: github.event_name == 'push' && vars.NW_IMAGE_REGISTRY != ''
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ vars.NW_IMAGE_REGISTRY }}/${{ env.IMAGE }}:sha-${{ github.sha }}
+          build-args: |
+            APP=nw.triage.service:app
+            ARTIFACTS=triage
+          cache-from: type=gha
+      - uses: sigstore/cosign-installer@v4
+        if: github.event_name == 'push' && vars.NW_IMAGE_REGISTRY != ''
+      - name: Sign the pushed digest (keyless, GitHub OIDC, recorded in Rekor)
+        if: github.event_name == 'push' && vars.NW_IMAGE_REGISTRY != ''
+        env:
+          REF: ${{ vars.NW_IMAGE_REGISTRY }}/${{ env.IMAGE }}@${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "$REF"
+      - name: No registry configured
+        if: github.event_name == 'push' && vars.NW_IMAGE_REGISTRY == ''
+        run: echo "::notice::NW_IMAGE_REGISTRY is not set; the image was built, scanned and inventoried, not pushed or signed"

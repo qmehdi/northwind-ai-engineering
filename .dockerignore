@@ -14,3 +14,6 @@ artifacts/traces*
 artifacts/*/model.onnx
 artifacts/*/checkpoint.pt
 artifacts/escalations.jsonl
+artifacts/semantic-flat-*/
+artifacts/*/predictions.jsonl
+artifacts/*/runs.jsonl

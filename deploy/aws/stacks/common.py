@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from aws_cdk import Stack
@@ -24,6 +25,23 @@ MODEL_IDS = {
     "judge": "anthropic.claude-opus-5",
     "economy": "anthropic.claude-haiku-4-5",
 }
+
+# A stage lets one account hold dev, staging and prod side by side: every name that must be
+# unique in the account gets the stage after `northwind`. Empty means the names the guide
+# uses. Seven characters at most, so the longest derived name (the GCP service account
+# `northwind-<stage>-agent-engine`, 30 characters) fits on both tracks with the same word.
+STAGE_RE = re.compile(r"^[a-z0-9]{0,7}$")
+
+
+def check_stage(stage: str) -> str:
+    if not STAGE_RE.match(stage):
+        raise ValueError(f"stage {stage!r} must match {STAGE_RE.pattern}: lowercase, at most 7")
+    return stage
+
+
+def prefix(stage: str) -> str:
+    return f"northwind-{stage}" if stage else "northwind"
+
 
 SERVICES = {
     # name: (asgi app, artifacts baked in, hf models, cpu vcpu, memory gb)
@@ -78,14 +96,16 @@ def image(
     )
 
 
-def alerts_topic(scope: Construct, email: str | None) -> sns.Topic:
-    topic = sns.Topic(scope, "Alerts", display_name="northwind-alerts")
+def alerts_topic(scope: Construct, email: str | None, *, stage: str = "") -> sns.Topic:
+    topic = sns.Topic(scope, "Alerts", display_name=f"{prefix(stage)}-alerts")
     if email:
         topic.add_subscription(subs.EmailSubscription(email))
     return topic
 
 
-def monthly_budget(scope: Construct, *, limit_usd: float, email: str | None) -> budgets.CfnBudget:
+def monthly_budget(
+    scope: Construct, *, limit_usd: float, email: str | None, stage: str = ""
+) -> budgets.CfnBudget:
     """A cost budget with 50, 80 and 100 percent actual-spend alerts. The account-level
     alarm the PRD asks for; participants create it in their own account in Session 6."""
     subscribers = (
@@ -113,7 +133,7 @@ def monthly_budget(scope: Construct, *, limit_usd: float, email: str | None) -> 
         scope,
         "MonthlyBudget",
         budget=budgets.CfnBudget.BudgetDataProperty(
-            budget_name="northwind-monthly",
+            budget_name=f"{prefix(stage)}-monthly",
             budget_type="COST",
             time_unit="MONTHLY",
             budget_limit=budgets.CfnBudget.SpendProperty(amount=limit_usd, unit="USD"),

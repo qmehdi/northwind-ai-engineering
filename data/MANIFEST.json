@@ -1,0 +1,198 @@
+{
+ "dataset_version": "2026.09.0",
+ "written_at": "2026-09-28T09:30:21+00:00",
+ "licence": "Synthetic, generated for the course and for the cohort's use. No row of the reference dataset Tobi-Bueck/customer-support-tickets (CC BY-NC 4.0) is included.",
+ "provenance": "The schema and the label distributions are modelled on the public dataset Tobi-Bueck/customer-support-tickets on Hugging Face (English subset), which has three priority levels: high 39 percent, medium 41 percent, low 20 percent.",
+ "files": {
+  "accounts.json": {
+   "sha256": "dde9ecd13fe7d80b413cf0ab31336ce25332aba832704ed327eadf0f51d2004d",
+   "bytes": 57144,
+   "rows": 240
+  },
+  "adversarial/tickets.jsonl": {
+   "sha256": "6572d28719e450a728242296028e7fa87eda11ecdb101144b9b86a6eaa62476c",
+   "bytes": 7016,
+   "rows": 15
+  },
+  "golden/agent_baseline.json": {
+   "sha256": "d9a6629d7efe13ad9362615ffd5433acf7b219d68998745864dc94e032ba221a",
+   "bytes": 2425,
+   "rows": 7
+  },
+  "golden/baseline.json": {
+   "sha256": "9424eabe7a96c978a4daa6071d9fceac8ef97e74107c7e3603f93746ba09b818",
+   "bytes": 46466,
+   "rows": 3
+  },
+  "golden/judge_calibration.jsonl": {
+   "sha256": "c65d6c74c7c0e7dce26e24b468484457c8a0158fc41d2f84d36c341b28e806e7",
+   "bytes": 20712,
+   "rows": 30
+  },
+  "golden/policy_qa.jsonl": {
+   "sha256": "028a395d80f5093827e5d7767ec26e386ed135db65b986c44aba109c05ac2d6d",
+   "bytes": 35610,
+   "rows": 77
+  },
+  "golden/semantic_production.json": {
+   "sha256": "144da44971c35918e03c55695b1cd65b1966f9bffcd92f4b914d5712110c21e7",
+   "bytes": 785,
+   "rows": 6
+  },
+  "golden/triage_production.json": {
+   "sha256": "d3ba626946957907754fc065c218eaccd3f676fb92e398ebe27158db7b84a68f",
+   "bytes": 346,
+   "rows": 5
+  },
+  "policies/acceptable-use.md": {
+   "sha256": "c01003882274121fa7deacab14b18244a03939a01ca81f6d88ae1f3aaf3b9ac6",
+   "bytes": 6112,
+   "rows": 50
+  },
+  "policies/account-verification-internal.md": {
+   "sha256": "534c6492d848e44c10cf21c2fb9a9caf3a0199b2945973e5532a0ccd54052ef2",
+   "bytes": 5186,
+   "rows": 47
+  },
+  "policies/admin-console.md": {
+   "sha256": "8c1c7aaeb6a5e812de6058c8caf9f21af91e6e2123f5fb8d4ccdef27c60221e7",
+   "bytes": 5334,
+   "rows": 46
+  },
+  "policies/api-rate-limits-2024.md": {
+   "sha256": "a077384077724a18e8d672ec994ff48b6ea23f855e50084e00b8cd0e187f8c00",
+   "bytes": 4604,
+   "rows": 34
+  },
+  "policies/api-rate-limits.md": {
+   "sha256": "e7d2ebe5b97d4f3190a662813a90bd4e77e8819066690cd8bd706051b82bf0c6",
+   "bytes": 5290,
+   "rows": 49
+  },
+  "policies/customer-security-commitments.md": {
+   "sha256": "9a0846ce412d07a3cc60f1f253b614cadccd0ccd1ffba5eb4ed08f7e3c1c0d83",
+   "bytes": 5196,
+   "rows": 48
+  },
+  "policies/dashboards-performance.md": {
+   "sha256": "929da3dca585d7473b824d20399950f4d4106b0b790203631628dfb633e0d19f",
+   "bytes": 5751,
+   "rows": 53
+  },
+  "policies/data-pipelines-ops.md": {
+   "sha256": "9ead027153cb0212b424771efab1ef885d875d034a6f455fc0c01cf477fb8443",
+   "bytes": 5542,
+   "rows": 50
+  },
+  "policies/data-retention.md": {
+   "sha256": "78f9dd022568ecb258f2d4770bbb624581c2eff4a2427f1ab29c598f05fb6196",
+   "bytes": 5449,
+   "rows": 50
+  },
+  "policies/deprecations-2025.md": {
+   "sha256": "6bf7ab2c365daa9d8f577799b3a51b3ba01214ccdb0c8b3b5fbdc92bea343c79",
+   "bytes": 4924,
+   "rows": 45
+  },
+  "policies/escalation-matrix.md": {
+   "sha256": "b4e9cb11d18c0d147792e5770f3b0a8c479182684de2835dbcdce6c54c4e609d",
+   "bytes": 6080,
+   "rows": 46
+  },
+  "policies/gdpr-data-residency.md": {
+   "sha256": "b4844acbc19c8c8a5f8511854307fffc46fddbda9b5b68198f4704aa6b522d0a",
+   "bytes": 6049,
+   "rows": 43
+  },
+  "policies/index.json": {
+   "sha256": "ee0c82817309aa3d8174e7c2628d4ef90552e5e2d99473b031aa55b64d837781",
+   "bytes": 5726,
+   "rows": 28
+  },
+  "policies/integrations-slack-jira.md": {
+   "sha256": "ca1915811a198bd5d03b71610ed73efd2fa8c545003bd60d28ba0a1d92d424ce",
+   "bytes": 5686,
+   "rows": 59
+  },
+  "policies/maintenance-windows.md": {
+   "sha256": "c83d78440d7faa3e608c04e926e6766abc1bf1a0e873fc1c3453a78938b92c6a",
+   "bytes": 5537,
+   "rows": 47
+  },
+  "policies/mfa-policy.md": {
+   "sha256": "15ca3b606441968e25ab5df57ffea4bf3e9f9db720e0a3f5541f2349ce3c6677",
+   "bytes": 5556,
+   "rows": 47
+  },
+  "policies/mobile-app-support.md": {
+   "sha256": "1a99ee551ae690c6508a4231dff56a0c8d452f6edae83a6df33b2bbb49160e14",
+   "bytes": 5546,
+   "rows": 59
+  },
+  "policies/notifications-alerting.md": {
+   "sha256": "8235925ca9b8aefbf7e0d5c32bfb78fbff5a7e592050640e7619afd561beb0b7",
+   "bytes": 6009,
+   "rows": 50
+  },
+  "policies/outage-communication.md": {
+   "sha256": "9c1459f585530e196df893cdf1bb087b3d26dbd2575850e2a1e75b27bb9dd6e0",
+   "bytes": 5422,
+   "rows": 44
+  },
+  "policies/plans-and-entitlements.md": {
+   "sha256": "c360ba9f72ba366ed43fe2c3df83b8d82c39d4aa6c185048fc83e41278d8da40",
+   "bytes": 6218,
+   "rows": 53
+  },
+  "policies/refund-approval-internal.md": {
+   "sha256": "590f512834809ddf59b40dfcffa377d5453fbc58d4919d66e7122a8aeb2010ef",
+   "bytes": 5248,
+   "rows": 44
+  },
+  "policies/refunds-2024.md": {
+   "sha256": "dc82f3952212001208c15e8f4d7dabd86df7233bfb12190193aeba8cd89c9a2b",
+   "bytes": 5127,
+   "rows": 47
+  },
+  "policies/refunds-2025.md": {
+   "sha256": "44518014ff07d6b83012937a9e97efc110a138bb1e7bb1bfcd996d6577894b18",
+   "bytes": 5115,
+   "rows": 39
+  },
+  "policies/security-incident-response.md": {
+   "sha256": "54c182b6f89a6638fa247d3c4b428f37bb250f1ec0859c4b7c54251a485c3291",
+   "bytes": 5965,
+   "rows": 57
+  },
+  "policies/sla-2023.md": {
+   "sha256": "d3620545fc35b4dcd5a17e26ac0e2bef36c9a540cb546a7528181c515bede72c",
+   "bytes": 4437,
+   "rows": 45
+  },
+  "policies/sla-2025.md": {
+   "sha256": "16ba700557c2948586391332287fec73a7823b757627b8f053cb0ac4405bb05f",
+   "bytes": 5686,
+   "rows": 56
+  },
+  "policies/sso-setup.md": {
+   "sha256": "04f807887965cfbdc92fb891fb62ff6a40fd81c02cceb011cb92db7641f32e6f",
+   "bytes": 6006,
+   "rows": 57
+  },
+  "policies/storage-quotas.md": {
+   "sha256": "32d1186a083c8f6af371458f70339f0b254aa1df9e40d43798a28ef4c55a5c2b",
+   "bytes": 4471,
+   "rows": 46
+  },
+  "policies/support-hours-channels.md": {
+   "sha256": "890ca5a2e851783d97951c8dc9d2fec133bfb2a7f2793c023c757002c90eff23",
+   "bytes": 4467,
+   "rows": 52
+  },
+  "tickets.jsonl": {
+   "sha256": "308ad1151d5c322bf6def6f5acd4ed467469c4f50d1e7d0e3ecb1ad82e717541",
+   "bytes": 10257707,
+   "rows": 7950
+  }
+ }
+}

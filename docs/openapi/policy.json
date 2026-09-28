@@ -1,0 +1,529 @@
+{
+ "components": {
+  "schemas": {
+   "Ask": {
+    "properties": {
+     "audience": {
+      "default": "customer",
+      "pattern": "^(customer|internal)$",
+      "title": "Audience",
+      "type": "string"
+     },
+     "k": {
+      "default": 8,
+      "maximum": 20.0,
+      "minimum": 1.0,
+      "title": "K",
+      "type": "integer"
+     },
+     "question": {
+      "maxLength": 2000,
+      "minLength": 3,
+      "title": "Question",
+      "type": "string"
+     }
+    },
+    "required": [
+     "question"
+    ],
+    "title": "Ask",
+    "type": "object"
+   },
+   "AskResponse": {
+    "description": "An Answer plus what the service adds: an id to give feedback on, the model that\nanswered, and whether it came from the cache.",
+    "properties": {
+     "answer_id": {
+      "title": "Answer Id",
+      "type": "string"
+     },
+     "cached": {
+      "default": false,
+      "title": "Cached",
+      "type": "boolean"
+     },
+     "citations": {
+      "items": {
+       "type": "string"
+      },
+      "title": "Citations",
+      "type": "array"
+     },
+     "confidence": {
+      "title": "Confidence",
+      "type": "number"
+     },
+     "context_ids": {
+      "items": {
+       "type": "string"
+      },
+      "title": "Context Ids",
+      "type": "array"
+     },
+     "dropped_citations": {
+      "items": {
+       "type": "string"
+      },
+      "title": "Dropped Citations",
+      "type": "array"
+     },
+     "model_id": {
+      "title": "Model Id",
+      "type": "string"
+     },
+     "prompt_version": {
+      "default": "",
+      "title": "Prompt Version",
+      "type": "string"
+     },
+     "reason": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Reason"
+     },
+     "refused": {
+      "title": "Refused",
+      "type": "boolean"
+     },
+     "text": {
+      "title": "Text",
+      "type": "string"
+     }
+    },
+    "required": [
+     "text",
+     "citations",
+     "confidence",
+     "refused",
+     "context_ids",
+     "answer_id",
+     "model_id"
+    ],
+    "title": "AskResponse",
+    "type": "object"
+   },
+   "FeedbackIn": {
+    "properties": {
+     "answer_id": {
+      "maxLength": 64,
+      "minLength": 8,
+      "title": "Answer Id",
+      "type": "string"
+     },
+     "note": {
+      "default": "",
+      "maxLength": 2000,
+      "title": "Note",
+      "type": "string"
+     },
+     "verdict": {
+      "enum": [
+       "helpful",
+       "wrong",
+       "unsafe"
+      ],
+      "title": "Verdict",
+      "type": "string"
+     }
+    },
+    "required": [
+     "answer_id",
+     "verdict"
+    ],
+    "title": "FeedbackIn",
+    "type": "object"
+   },
+   "HTTPValidationError": {
+    "properties": {
+     "detail": {
+      "items": {
+       "$ref": "#/components/schemas/ValidationError"
+      },
+      "title": "Detail",
+      "type": "array"
+     }
+    },
+    "title": "HTTPValidationError",
+    "type": "object"
+   },
+   "ValidationError": {
+    "properties": {
+     "ctx": {
+      "title": "Context",
+      "type": "object"
+     },
+     "input": {
+      "title": "Input"
+     },
+     "loc": {
+      "items": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "integer"
+        }
+       ]
+      },
+      "title": "Location",
+      "type": "array"
+     },
+     "msg": {
+      "title": "Message",
+      "type": "string"
+     },
+     "type": {
+      "title": "Error Type",
+      "type": "string"
+     }
+    },
+    "required": [
+     "loc",
+     "msg",
+     "type"
+    ],
+    "title": "ValidationError",
+    "type": "object"
+   }
+  }
+ },
+ "info": {
+  "title": "Northwind policy service",
+  "version": "1.1"
+ },
+ "openapi": "3.1.0",
+ "paths": {
+  "/ask": {
+   "post": {
+    "deprecated": true,
+    "description": "Deprecated alias of `/v1/ask`, kept for one release. Call `/v1/ask`.",
+    "operationId": "ask_ask_post",
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/Ask"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/AskResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Ask",
+    "tags": [
+     "deprecated"
+    ]
+   }
+  },
+  "/drift": {
+   "get": {
+    "deprecated": true,
+    "description": "Deprecated alias of `/v1/drift`, kept for one release. Call `/v1/drift`.\n\nPSI of the top-hit confidence and of answer length, and the refusal rate, against the\nbaseline the index manifest carries.",
+    "operationId": "drift_drift_get",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "additionalProperties": true,
+         "title": "Response Drift Drift Get",
+         "type": "object"
+        }
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "Drift",
+    "tags": [
+     "deprecated"
+    ]
+   }
+  },
+  "/feedback": {
+   "post": {
+    "deprecated": true,
+    "description": "Deprecated alias of `/v1/feedback`, kept for one release. Call `/v1/feedback`.\n\nRecord a verdict on an answer. Wrong and unsafe verdicts are golden-set candidates:\n`python -m nw.policy.feedback --to-golden` prints them.",
+    "operationId": "feedback_feedback_post",
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/FeedbackIn"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "additionalProperties": true,
+         "title": "Response Feedback Feedback Post",
+         "type": "object"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Feedback",
+    "tags": [
+     "deprecated"
+    ]
+   }
+  },
+  "/healthz": {
+   "get": {
+    "operationId": "healthz_healthz_get",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "additionalProperties": {
+          "type": "string"
+         },
+         "title": "Response Healthz Healthz Get",
+         "type": "object"
+        }
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "Healthz"
+   }
+  },
+  "/metrics": {
+   "get": {
+    "operationId": "metrics_metrics_get",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "Metrics"
+   }
+  },
+  "/readyz": {
+   "get": {
+    "operationId": "readyz_readyz_get",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "additionalProperties": {
+          "anyOf": [
+           {
+            "type": "string"
+           },
+           {
+            "type": "integer"
+           }
+          ]
+         },
+         "title": "Response Readyz Readyz Get",
+         "type": "object"
+        }
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "Readyz"
+   }
+  },
+  "/v1/ask": {
+   "post": {
+    "operationId": "ask_v1_ask_post",
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/Ask"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/AskResponse"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Ask"
+   }
+  },
+  "/v1/drift": {
+   "get": {
+    "description": "PSI of the top-hit confidence and of answer length, and the refusal rate, against the\nbaseline the index manifest carries.",
+    "operationId": "drift_v1_drift_get",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "additionalProperties": true,
+         "title": "Response Drift V1 Drift Get",
+         "type": "object"
+        }
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "Drift"
+   }
+  },
+  "/v1/feedback": {
+   "post": {
+    "description": "Record a verdict on an answer. Wrong and unsafe verdicts are golden-set candidates:\n`python -m nw.policy.feedback --to-golden` prints them.",
+    "operationId": "feedback_v1_feedback_post",
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/FeedbackIn"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "additionalProperties": true,
+         "title": "Response Feedback V1 Feedback Post",
+         "type": "object"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Feedback"
+   }
+  },
+  "/v1/version": {
+   "get": {
+    "description": "Everything that decides what an answer looks like: the index manifest and whether the\ncorpus has moved on, the prompt versions now loaded against those at build, the model.",
+    "operationId": "version_v1_version_get",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "additionalProperties": true,
+         "title": "Response Version V1 Version Get",
+         "type": "object"
+        }
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "Version"
+   }
+  },
+  "/version": {
+   "get": {
+    "deprecated": true,
+    "description": "Deprecated alias of `/v1/version`, kept for one release. Call `/v1/version`.\n\nEverything that decides what an answer looks like: the index manifest and whether the\ncorpus has moved on, the prompt versions now loaded against those at build, the model.",
+    "operationId": "version_version_get",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "additionalProperties": true,
+         "title": "Response Version Version Get",
+         "type": "object"
+        }
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "Version",
+    "tags": [
+     "deprecated"
+    ]
+   }
+  }
+ }
+}

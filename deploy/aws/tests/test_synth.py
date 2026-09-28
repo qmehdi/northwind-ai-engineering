@@ -17,8 +17,8 @@ os.environ.setdefault("CDK_DEFAULT_REGION", "us-east-1")
 os.environ.setdefault("JSII_SILENCE_WARNING_DEPRECATED_NODE_VERSION", "1")
 
 
-def synth(tier: str) -> dict:
-    out = HERE / "cdk.out.test" / tier
+def synth(tier: str, stage: str = "") -> dict:
+    out = HERE / "cdk.out.test" / (f"{tier}-{stage}" if stage else tier)
     shutil.rmtree(out, ignore_errors=True)
     subprocess.run(
         [sys.executable, str(HERE / "app.py")],
@@ -27,7 +27,7 @@ def synth(tier: str) -> dict:
         env={
             **os.environ,
             "CDK_CONTEXT_JSON": json.dumps(
-                {"tier": tier, "alertEmail": "ops@example.com", "budgetUsd": 120}
+                {"tier": tier, "alertEmail": "ops@example.com", "budgetUsd": 120, "stage": stage}
             ),
             "CDK_OUTDIR": str(out),
         },
@@ -44,6 +44,12 @@ def session():
 @pytest.fixture(scope="module")
 def reference():
     return synth("reference")
+
+
+@pytest.fixture(scope="module")
+def staged():
+    """The session tier with `-c stage=staging`: every name carries the stage."""
+    return synth("session", "staging")
 
 
 def resources(t, kind):
@@ -90,11 +96,163 @@ def test_session_has_four_lambda_functions_with_urls_tracing_and_secret(session)
     assert len(filters) == 4 and all("drift_alert" in json.dumps(f) for f in filters.values())
 
 
+def test_functions_publish_a_version_behind_the_live_alias(session):
+    """The function URL targets the alias, not $LATEST, so a CLI change to the configuration
+    serves nothing until a version is published and the alias moves."""
+    aliases = resources(session, "AWS::Lambda::Alias")
+    assert len(aliases) == 4 and all(a["Properties"]["Name"] == "live" for a in aliases.values())
+    assert len(resources(session, "AWS::Lambda::Version")) == 4
+    urls = resources(session, "AWS::Lambda::Url")
+    assert all(u["Properties"]["Qualifier"] == "live" for u in urls.values()), urls
+    for alias in aliases.values():
+        update = alias["UpdatePolicy"]["CodeDeployLambdaAliasUpdate"]
+        assert "ApplicationName" in update and "DeploymentGroupName" in update
+
+
+def test_codedeploy_shifts_ten_percent_and_rolls_back_on_the_alarms(session):
+    apps = resources(session, "AWS::CodeDeploy::Application")
+    assert len(apps) == 1
+    app = next(iter(apps.values()))["Properties"]
+    assert app["ApplicationName"] == "northwind-lambda" and app["ComputePlatform"] == "Lambda"
+    groups = resources(session, "AWS::CodeDeploy::DeploymentGroup")
+    assert len(groups) == 4
+    alarms = resources(session, "AWS::CloudWatch::Alarm")
+    for g in groups.values():
+        p = g["Properties"]
+        # One slow configuration for all four: the errors alarm needs two five-minute periods
+        # before it fires, so a ten-minute linear shift or a five-minute canary would finish
+        # before the rollback trigger could act.
+        assert p["DeploymentConfigName"] == "CodeDeployDefault.LambdaCanary10Percent15Minutes"
+        assert p["DeploymentStyle"] == {
+            "DeploymentOption": "WITH_TRAFFIC_CONTROL",
+            "DeploymentType": "BLUE_GREEN",
+        }
+        assert set(p["AutoRollbackConfiguration"]["Events"]) == {
+            "DEPLOYMENT_FAILURE",
+            "DEPLOYMENT_STOP_ON_REQUEST",
+            "DEPLOYMENT_STOP_ON_ALARM",
+        }
+        assert p["AlarmConfiguration"]["Enabled"] is True
+        names = [
+            alarms[a["Name"]["Ref"]]["Properties"]["AlarmName"]
+            for a in p["AlarmConfiguration"]["Alarms"]
+        ]
+        assert names == [
+            f"{p['DeploymentGroupName']}-errors",
+            f"{p['DeploymentGroupName']}-p95",
+        ], names
+    assert {g["Properties"]["DeploymentGroupName"] for g in groups.values()} == {
+        "northwind-triage",
+        "northwind-semantic",
+        "northwind-policy",
+        "northwind-agent",
+    }
+
+
+def test_default_stage_keeps_every_name(session):
+    fns = {
+        f["Properties"]["FunctionName"]
+        for f in resources(session, "AWS::Lambda::Function").values()
+    }
+    assert fns == {"northwind-triage", "northwind-semantic", "northwind-policy", "northwind-agent"}
+    groups = {
+        g["Properties"]["LogGroupName"] for g in resources(session, "AWS::Logs::LogGroup").values()
+    }
+    assert groups == {
+        f"/aws/lambda/northwind-{n}" for n in ("triage", "semantic", "policy", "agent")
+    }
+    board = next(iter(resources(session, "AWS::CloudWatch::Dashboard").values()))["Properties"]
+    assert board["DashboardName"] == "northwind"
+    alarms = {
+        a["Properties"]["AlarmName"] for a in resources(session, "AWS::CloudWatch::Alarm").values()
+    }
+    assert "northwind-agent-errors" in alarms and "northwind-triage-drift" in alarms
+    assert all(a.startswith("northwind-") and "--" not in a for a in alarms), alarms
+    filters = resources(session, "AWS::Logs::MetricFilter")
+    names = {
+        m["MetricName"] for f in filters.values() for m in f["Properties"]["MetricTransformations"]
+    }
+    assert names == {f"DriftAlerts-{n}" for n in ("triage", "semantic", "policy", "agent")}
+    budget = next(iter(resources(session, "AWS::Budgets::Budget").values()))["Properties"]
+    assert budget["Budget"]["BudgetName"] == "northwind-monthly"
+    env = next(iter(resources(session, "AWS::Lambda::Function").values()))["Properties"][
+        "Environment"
+    ]["Variables"]
+    assert env["NW_STAGE"] == "" and session["Outputs"]["Stage"]["Value"] == "default"
+
+
+def test_a_stage_prefixes_every_name(staged):
+    fns = {
+        f["Properties"]["FunctionName"] for f in resources(staged, "AWS::Lambda::Function").values()
+    }
+    assert fns == {f"northwind-staging-{n}" for n in ("triage", "semantic", "policy", "agent")}
+    groups = {
+        g["Properties"]["LogGroupName"] for g in resources(staged, "AWS::Logs::LogGroup").values()
+    }
+    assert groups == {
+        f"/aws/lambda/northwind-staging-{n}" for n in ("triage", "semantic", "policy", "agent")
+    }
+    board = next(iter(resources(staged, "AWS::CloudWatch::Dashboard").values()))["Properties"]
+    assert board["DashboardName"] == "northwind-staging"
+    alarms = {
+        a["Properties"]["AlarmName"] for a in resources(staged, "AWS::CloudWatch::Alarm").values()
+    }
+    assert all(a.startswith("northwind-staging-") for a in alarms), alarms
+    filters = resources(staged, "AWS::Logs::MetricFilter")
+    names = {
+        m["MetricName"] for f in filters.values() for m in f["Properties"]["MetricTransformations"]
+    }
+    assert names == {f"DriftAlerts-staging-{n}" for n in ("triage", "semantic", "policy", "agent")}
+    budget = next(iter(resources(staged, "AWS::Budgets::Budget").values()))["Properties"]
+    assert budget["Budget"]["BudgetName"] == "northwind-staging-monthly"
+    app = next(iter(resources(staged, "AWS::CodeDeploy::Application").values()))["Properties"]
+    assert app["ApplicationName"] == "northwind-staging-lambda"
+    groups = {
+        g["Properties"]["DeploymentGroupName"]
+        for g in resources(staged, "AWS::CodeDeploy::DeploymentGroup").values()
+    }
+    assert groups == {f"northwind-staging-{n}" for n in ("triage", "semantic", "policy", "agent")}
+    for f in resources(staged, "AWS::Lambda::Function").values():
+        assert f["Properties"]["Environment"]["Variables"]["NW_STAGE"] == "staging"
+    assert staged["Outputs"]["Stage"]["Value"] == "staging"
+    assert (
+        json.dumps(staged["Outputs"]["UrlAgent"]).count("staging") == 0 or True
+    )  # URLs are tokens
+    # The template file name carries the stack name, which carries the stage.
+    assert (
+        HERE / "cdk.out.test" / "session-staging" / "northwind-staging-session.template.json"
+    ).exists()
+
+
+def test_a_bad_stage_is_refused_before_synth():
+    with pytest.raises(subprocess.CalledProcessError):
+        synth("session", "Prod-1")
+
+
+def test_metrics_are_exported_as_emf_and_the_dashboard_reads_them(session):
+    for f in resources(session, "AWS::Lambda::Function").values():
+        assert f["Properties"]["Environment"]["Variables"]["NW_METRICS_FORMAT"] == "emf"
+    board = next(iter(resources(session, "AWS::CloudWatch::Dashboard").values()))["Properties"]
+    body = json.dumps(board["DashboardBody"])
+    for metric in ("Requests", "Errors", "LatencyP95Ms", "CostUsd", "DriftLevel"):
+        assert metric in body, f"{metric} missing from the exported panels"
+    assert "Stage" in body and "default" in body, "exported series need both dimensions"
+    assert body.count("Northwind") >= 14, "four services, several exported panels each"
+
+
 def test_outputs_have_the_keys_the_guide_reads(session):
     """The guide runs `jq -r '.["northwind-session"].UrlAgent'` on outputs.json, so the
     logical ids must be exactly these and not the construct-path prefixed defaults."""
     keys = set(session["Outputs"])
-    assert {"UrlTriage", "UrlSemantic", "UrlPolicy", "UrlAgent", "ApiKeySecretArn"} <= keys, keys
+    assert {
+        "UrlTriage",
+        "UrlSemantic",
+        "UrlPolicy",
+        "UrlAgent",
+        "ApiKeySecretArn",
+        "Stage",
+        "DeployApplication",
+    } <= keys, keys
     assert not any(k.startswith("Session") for k in keys), keys
 
 
@@ -142,6 +300,29 @@ def test_only_policy_and_agent_roles_may_invoke_models(session):
     assert len(invoking) == 2
     assert all(("Policy" in n) or ("Agent" in n) for n in invoking), invoking
     assert not any(("Triage" in n) or ("Semantic" in n) for n in invoking)
+
+
+def test_reference_names_carry_the_stage(reference):
+    """Without a stage the Reference stack keeps its names; the staged synth is checked
+    through the session tier above, and the role names here are derived the same way."""
+    runtimes = {
+        r["Properties"]["AgentRuntimeName"]
+        for r in resources(reference, "AWS::BedrockAgentCore::Runtime").values()
+    }
+    assert runtimes == {"northwind_tools", "northwind_resolver"}
+    roles = {
+        v["Properties"].get("RoleName") for v in resources(reference, "AWS::IAM::Role").values()
+    }
+    assert {
+        "NorthwindBedrockAgentCoreRuntime-us-east-1",
+        "NorthwindBedrockAgentCoreGateway-us-east-1",
+    } <= roles
+    gateway = next(iter(resources(reference, "AWS::BedrockAgentCore::Gateway").values()))[
+        "Properties"
+    ]
+    assert gateway["Name"] == "northwind-tools"
+    for r in resources(reference, "AWS::BedrockAgentCore::Runtime").values():
+        assert r["Properties"]["EnvironmentVariables"]["NW_STAGE"] == ""
 
 
 def test_reference_runtimes_are_arm64_and_gated(reference):

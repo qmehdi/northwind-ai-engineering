@@ -13,14 +13,16 @@ good retrieval is a different bug from a bad answer from bad retrieval:
     uv run python -m nw.policy.evaluate --no-judge          # Workhorse only, about 1 USD
     uv run python -m nw.policy.evaluate --retrieval-only    # no model at all, free: CI
 
-Every row and the report carry the prompt versions, the corpus hash and the index manifest,
-so a moved number can be traced to the prompt, the corpus or the model that moved it.
+Every row and the report carry the prompt versions, the corpus hash, the golden set hash
+and the index manifest, so a moved number can be traced to the prompt, the corpus, the
+cases or the model that moved it.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import statistics
 import sys
@@ -229,11 +231,23 @@ def comparability(current: dict[str, Any], baseline: dict[str, Any]) -> list[str
             f"baseline was measured on corpus {b_corpus}, this run on {c_corpus}: "
             "retrieval numbers are not comparable, regenerate the baseline"
         )
+    b_golden, c_golden = baseline.get("golden_sha256_12"), current.get("golden_sha256_12")
+    if b_golden and c_golden and b_golden != c_golden:
+        notes.append(
+            f"baseline was measured on golden set {b_golden}, this run on {c_golden}: "
+            "the cases moved, so the numbers are not comparable, regenerate the baseline"
+        )
     b_prompts, c_prompts = baseline.get("prompt_versions") or {}, current.get("prompt_versions")
     for name, h in (c_prompts or {}).items():
         if name in b_prompts and b_prompts[name] != h:
             notes.append(f"prompt {name} changed since the baseline: {b_prompts[name]} -> {h}")
     return notes
+
+
+def golden_sha(path: Path) -> str:
+    """Twelve hex characters over the golden file's bytes: a case added, edited or removed
+    changes it, and a baseline measured on other cases says so."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:12]
 
 
 def load_cases(path: Path) -> list[EvalCase]:
@@ -307,6 +321,7 @@ async def main_async(args: argparse.Namespace) -> int:
         else ("judged" if args.judge else "no_judge"),
         "prompt_versions": prompts.versions(),
         "corpus_sha256_12": corpus_sha(args.corpus) if args.corpus.exists() else None,
+        "golden_sha256_12": golden_sha(args.golden),
         "index_manifest": {k: v for k, v in index.manifest.items() if k != "baseline"},
         "models": {
             "workhorse": s.model_for(ModelRole.WORKHORSE),

@@ -26,4 +26,4 @@ Files you edit in this session:
 
 Files you read but do not edit: `trace.py`, `version.py`, `service.py`, `monitor.py`, `approve.py`, `review.py`, `offline.py`, `mcp_server.py`, `ports/`.
 
-Operator controls on the service, all environment variables: `NW_AGENT_DISABLED=1` (refuse runs, keep readiness), `NW_AGENT_MAX_CONCURRENT_RUNS` (default 4, 429 beyond it), `NW_AGENT_CAPTURE` (one JSON line per run), `NW_AGENT_BASELINE`, `NW_AGENT_DRIFT_WINDOW`, `NW_AGENT_DRIFT_MIN`. Endpoints: `/version`, `/drift`, `/metrics`.
+Operator controls on the service, all environment variables: `NW_AGENT_DISABLED=1` (refuse runs, keep readiness), `NW_AGENT_MAX_CONCURRENT_RUNS` (default 4, 429 beyond it), `NW_AGENT_MAX_TOTAL_TOKENS` (token budget per resolver run, stops with `budget`), `NW_AGENT_CAPTURE` (one JSON line per run), `NW_AGENT_BASELINE`, `NW_AGENT_DRIFT_WINDOW`, `NW_AGENT_DRIFT_MIN`, `NW_ESCALATION_DEDUPE_S` (default 3600: the same ticket is not escalated twice inside the window, 0 turns it off). Endpoints: `/version` (agent version, `model_id`, `config_hash`, fallbacks, resilience counts), `/drift`, `/metrics`.

@@ -36,8 +36,13 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel, Field
 
+from nw.api import install_version_headers, mount_versioned, version_fields
 from nw.auth import install_api_key
+from nw.config import settings
 from nw.logging import bind_correlation_id, configure_logging, get_logger, log_fields
+from nw.metrics_export import start_metrics_export
+from nw.policy.redact import redact_fields
+from nw.ratelimit import install_rate_limit
 from nw.semantic.artifacts import resolve
 from nw.semantic.data import TAGS
 from nw.semantic.monitor import ALERT, SemanticDriftMonitor
@@ -163,6 +168,7 @@ def _configure_mlops(artifact: Path, quantized: bool) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging(os.environ.get("NW_LOG_FORMAT", "json"))
+    start_metrics_export("semantic")
     artifact = Path(os.environ.get("NW_SEMANTIC_ARTIFACT", "artifacts/semantic"))
     index_dir = Path(os.environ["NW_INDEX"]) if os.environ.get("NW_INDEX") else None
     try:
@@ -188,7 +194,11 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Northwind semantic engine", version="1.0", lifespan=lifespan)
+# Starlette runs the last-added middleware first: the key check runs before the limiter
+# (which buckets by key id) and the version headers land on their 401 and 429 too.
+install_rate_limit(app)
 install_api_key(app)
+install_version_headers(app)
 configure_tracing("northwind-semantic")
 instrument_app(app)
 
@@ -222,6 +232,8 @@ def version() -> dict:
         "format": state.fmt,
         "metadata": state.metadata,
         "shadow_version": state.shadow_version,
+        "config_hash": settings().config_hash(),
+        **version_fields(),
     }
 
 
@@ -286,6 +298,7 @@ def _capture(ticket: TicketIn, result: Classification, shadow: str | None) -> No
         "format": result.format,
         "shadow_priority": shadow,
     }
+    record = redact_fields(record, "subject", "body")
     state.capture.parent.mkdir(parents=True, exist_ok=True)
     with state.capture.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
@@ -334,3 +347,6 @@ def classify(ticket: TicketIn) -> Classification:
 @app.get("/metrics")
 def metrics() -> Response:
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+mount_versioned(app)  # /v1/... is the API; the bare paths are deprecated aliases for one release

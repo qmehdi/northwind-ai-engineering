@@ -11,8 +11,21 @@
 # the image reaches the Hub at runtime: HF_MODELS=1 pre-downloads the embedder and
 # reranker at build time into /app/hf. Only the artifacts named in ARTIFACTS reach the
 # final image, selected in their own stage so no layer ever holds the rest.
-FROM python:3.12-slim AS builder
-COPY --from=ghcr.io/astral-sh/uv:0.12.19 /uv /bin/uv
+#
+# Base images are pinned by digest, so a rebuild next month produces the same layers and
+# a tag moved upstream cannot change what ships. Each digest is the multi-arch index
+# (linux/amd64 and linux/arm64 resolve from it). Fetched 2026-09-28 with
+# `docker buildx imagetools inspect <image>`; refresh them on purpose, with a changelog line.
+#   python:3.12-slim  index sha256:f77ac9e4...  amd64 sha256:44ff437b...  arm64 sha256:950206c3...
+#   uv:0.12.19        index sha256:04d046b1...  amd64 sha256:d46db4c7...  arm64 sha256:de342e01...
+#   lambda-adapter    index sha256:17cfd08e...  amd64 sha256:9d6b29a4...  arm64 sha256:98d6d1dc...
+ARG PYTHON_IMAGE=python:3.12-slim@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f
+ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.12.19@sha256:04d046b13e60d6bcec73cbc5e1cad25d680dea90c8573340950a0ac2d1aef424
+ARG LAMBDA_ADAPTER_IMAGE=public.ecr.aws/awsguru/aws-lambda-adapter:1.1.0@sha256:17cfd08eff1dfea3f6a9a1e9c65fdac80aa4919b6085e746615530f43f57d2f1
+FROM ${UV_IMAGE} AS uv
+FROM ${LAMBDA_ADAPTER_IMAGE} AS lambda-adapter
+FROM ${PYTHON_IMAGE} AS builder
+COPY --from=uv /uv /bin/uv
 WORKDIR /app
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never
 COPY pyproject.toml uv.lock .python-version ./
@@ -22,13 +35,13 @@ RUN uv sync --frozen --no-dev --extra dl --extra agents --extra agents-aws --ext
 
 # Pick the artifacts this service needs. Training checkpoints and the fp32 ONNX graph
 # never ship; the int8 graph and the indexes do.
-FROM python:3.12-slim AS artifacts
+FROM ${PYTHON_IMAGE} AS artifacts
 ARG ARTIFACTS="triage"
 COPY artifacts/ /src/
 RUN mkdir -p /out && for a in $ARTIFACTS; do cp -r "/src/$a" "/out/$a"; done \
     && rm -f /out/*/model.onnx /out/*/checkpoint.pt /out/*/best.pt /out/*/*/model.onnx /out/*/*/checkpoint.pt /out/*/*/best.pt
 
-FROM python:3.12-slim AS runtime
+FROM ${PYTHON_IMAGE} AS runtime
 ARG APP=nw.triage.service:app
 ARG HF_MODELS=0
 ARG PORT=8000
@@ -36,7 +49,7 @@ ARG PORT=8000
 # same uvicorn process serves behind a Lambda function URL. Readiness waits on /readyz
 # and async init lets model loading run past Lambda's 10 second init window.
 ARG LAMBDA=0
-COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:1.1.0 /lambda-adapter /tmp/lambda-adapter
+COPY --from=lambda-adapter /lambda-adapter /tmp/lambda-adapter
 RUN if [ "$LAMBDA" = "1" ]; then mkdir -p /opt/extensions && mv /tmp/lambda-adapter /opt/extensions/lambda-adapter; else rm -f /tmp/lambda-adapter; fi
 ENV AWS_LWA_PORT=${PORT} AWS_LWA_READINESS_CHECK_PATH=/readyz AWS_LWA_ASYNC_INIT=true AWS_LWA_INVOKE_MODE=buffered
 RUN useradd --create-home --uid 10001 nw && mkdir -p /app/hf /tmp/traces && chown -R nw:nw /app /tmp/traces

@@ -31,6 +31,9 @@ The Session 1 spend cap of 10 USD per session is set in `.env`; the Session 4 ju
 | X-Ray with Transaction Search | 0.35 USD per GB of spans, 1 percent indexed free, 100,000 traces free per month | a few MB | 0 |
 | CloudWatch Logs ingestion | 0.50 USD per GB after 5 GB free per month | a few MB of JSON logs | 0 |
 | Drift alarms: a metric filter per function on the `drift_alert` log line | metric filters are free; four custom metrics sit inside the ten free ones | 4 filters, 4 alarms | 0 |
+| Exported service metrics (EMF lines, `Northwind` namespace) | 0.30 USD per custom metric per month after 10 free, prorated by the hour and charged only when a line is written (CloudWatch pricing, fetched 2026-09-28) | 31 series across the four functions (6 each for triage and semantic, 7 for policy, 12 for the agent), written only while a function is invoked: about 2 hours in the session | 0.03 USD in the session; 0 idle, since a frozen function writes nothing; up to 6.30 USD a month under constant traffic |
+| CodeDeploy: an application, four deployment groups, the canary shifts | no charge for deployments to Lambda (CodeDeploy pricing, fetched 2026-09-28) | every `cdk deploy` and `deploy_aws.sh rollout` | 0 |
+| Published versions and the `live` alias per function | free; a version keeps its image reference, nothing extra is stored | | 0 |
 | CloudWatch dashboard, alarms, SNS, Budgets | free tier | | 0 |
 | NAT gateway and data transfer | | none by design: no VPC, function URLs, responses of a few KB | 0 |
 | Cold start | billed as ordinary duration | first request after idle, measured in Step 6 | 20 to 40 seconds for the agent image |
@@ -76,6 +79,8 @@ Argus, the reference project this course borrows from, cost about 400 USD a mont
 | Secret Manager, the API key | 0.06 USD per active secret version per month after six free, 0.03 USD per 10,000 access operations after 10,000 free | one version, read at startup | 0 |
 | Cloud Monitoring, Trace, Logging | free tier | | 0 |
 | Drift alerts: one log-based metric over the northwind services and one alert policy | free | | 0 |
+| Exported service metrics: 20 log-based metrics (requests, errors, p95, cost, drift per service) and four p95 alert policies | user-defined log-based metrics are Cloud Monitoring custom metrics, charged by bytes ingested after 150 MiB per billing account per month, then 0.2580 USD per MiB (Cloud Monitoring pricing, fetched 2026-09-28) | one point per field per minute of activity, a few KB a day | 0 |
+| Cloud Run traffic split (`CANARY=10`), revision tags | free | | 0 |
 | **During the 2-hour session** | | | **under 0.20 USD** |
 | **Idle per day** | | min instances 0 | **0** |
 | Cold start | | first request after idle, measured in Step 6 | 20 to 40 seconds for the agent image |
@@ -96,6 +101,19 @@ Credit to request per participant for the GCP track: 20 USD of model spend plus 
 | After `make destroy` | | | 0 |
 
 Vertex AI Vector Search was rejected as the managed retriever because it bills per serving node-hour with a floor of several hundred USD a month for a modest index.
+
+## The network edge, priced but not deployed
+
+Lambda function URLs and a public Cloud Run service have no throttling and no WAF; the course's mitigation is the in-service rate limiter per API key (`nw/ratelimit.py`). The production options, list prices fetched on 2026-09-28:
+
+| Option | Rate | For the course's volume |
+| --- | --- | --- |
+| AWS API Gateway HTTP API in front of the functions, with usage plans on REST | 1.00 USD per million requests (HTTP API, first 300 million); 3.50 USD per million (REST API); 1 million calls free per month for 12 months | 0 |
+| AWS WAF on API Gateway or CloudFront | 5.00 USD per web ACL per month, 1.00 USD per rule per month, 0.60 USD per million requests | about 8 USD per month for one ACL with three rules |
+| CloudFront in front of a function URL (origin access control) | Free plan: 1 million requests and 100 GB a month at 0 USD; Pro 15 USD per month; Business 200; Premium 1,000 | 0 on the Free plan |
+| GCP Cloud Armor Standard on a load balancer | 0.006849315 USD per hour per security policy (about 5 USD per month), 0.001369863 USD per hour per rule (about 1 USD per month), 0.75 USD per million requests (globally scoped policies), 0.60 (regional) | about 8 USD per month for one policy with three rules |
+| GCP external Application Load Balancer in front of Cloud Run | 0.025 USD per hour for the first five forwarding rules (about 18 USD per month), 0.008 USD per GiB inbound processed | about 18 USD per month, the largest fixed cost on either track |
+| GCP API Gateway in front of Cloud Run | 0 for the first 2 million calls per month per billing account, 3.00 USD per million from 2 million to 1 billion | 0 |
 
 ## Validation run budget
 

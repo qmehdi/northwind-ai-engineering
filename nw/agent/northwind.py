@@ -10,12 +10,17 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from nw.agent.tools import ToolRegistry
+
+HTTP_TIMEOUT_S = 30.0  # a deployed specialist answers in seconds or not at all
+MODEL_TOOL_TIMEOUT_S = 120.0  # the in-process tools load a model on first call
+ESCALATION_DEDUPE_DEFAULT_S = 3600
 
 
 class SearchPolicies(BaseModel):
@@ -65,6 +70,34 @@ class Escalate(BaseModel):
 ESCALATION_QUEUE = Path(os.environ.get("NW_ESCALATION_QUEUE", "artifacts/escalations.jsonl"))
 
 
+def escalation_dedupe_s() -> float:
+    """How long the same ticket stays escalated: a second escalate call inside this window
+    returns the earlier proposal instead of queueing a duplicate. `NW_ESCALATION_DEDUPE_S`,
+    default one hour, 0 turns it off."""
+    return float(os.environ.get("NW_ESCALATION_DEDUPE_S", str(ESCALATION_DEDUPE_DEFAULT_S)))
+
+
+def recent_escalation(ticket_id: str, *, now: float | None = None) -> dict[str, Any] | None:
+    """The newest queued escalation for `ticket_id` inside the dedupe window, or None. A
+    record without a timestamp (written before the window existed) is never a match."""
+    window = escalation_dedupe_s()
+    if window <= 0 or not ESCALATION_QUEUE.exists():
+        return None
+    now = time.time() if now is None else now
+    latest: dict[str, Any] | None = None
+    for line in ESCALATION_QUEUE.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        ts = rec.get("ts")
+        if rec.get("ticket_id") == ticket_id and ts is not None and now - float(ts) <= window:
+            latest = rec
+    return latest
+
+
 def load_accounts(path: Path) -> dict[str, dict[str, Any]]:
     return {a["account_id"]: a for a in json.loads(path.read_text())}
 
@@ -74,6 +107,7 @@ def build_registry(
     *,
     accounts_path: Path = Path("data/accounts.json"),
     artifacts: Path = Path("artifacts"),
+    http_client: Any = None,
 ) -> ToolRegistry:
     reg = ToolRegistry()
     accounts = load_accounts(accounts_path) if accounts_path.exists() else {}
@@ -104,13 +138,24 @@ def build_registry(
         idempotent=False,
     )
     def escalate(args: Escalate) -> dict[str, Any]:
+        earlier = recent_escalation(args.ticket_id)
+        if earlier is not None:
+            # Idempotent: a retried step or a second agent must not page twice for one ticket.
+            return {
+                "queued": False,
+                "duplicate": True,
+                "reason": f"{args.ticket_id} was escalated to {earlier.get('tier')} "
+                f"{int(time.time() - float(earlier['ts']))}s ago; not queued again",
+                "earlier": earlier,
+            }
+        record = {"ts": time.time(), **args.model_dump()}
         ESCALATION_QUEUE.parent.mkdir(parents=True, exist_ok=True)
         with ESCALATION_QUEUE.open("a") as f:
-            f.write(json.dumps(args.model_dump()) + "\n")
+            f.write(json.dumps(record) + "\n")
         return {"queued": True, **args.model_dump()}
 
     if backend == "http":
-        _register_http(reg)
+        _register_http(reg, client=http_client)
     elif backend == "local":
         _register_local(reg, artifacts)
     elif backend == "none":
@@ -129,6 +174,7 @@ def _register_local(reg: ToolRegistry, artifacts: Path) -> None:
         "search_policies",
         "Search Northwind's current customer-facing policies. Returns passages with ids, "
         "sections and effective dates.",
+        timeout_s=MODEL_TOOL_TIMEOUT_S,
     )
     def search_policies(args: SearchPolicies) -> list[dict[str, Any]]:
         if "policy" not in state:
@@ -153,6 +199,7 @@ def _register_local(reg: ToolRegistry, artifacts: Path) -> None:
         "classify_urgency",
         "Score a ticket's priority P0 to P3 with the calibrated triage model. Returns "
         "priority, probabilities and the rule that fired.",
+        timeout_s=MODEL_TOOL_TIMEOUT_S,
     )
     def classify_urgency(args: ClassifyUrgency) -> dict[str, Any]:
         if "triage" not in state:
@@ -162,7 +209,9 @@ def _register_local(reg: ToolRegistry, artifacts: Path) -> None:
         return state["triage"].predict([args.model_dump()])[0].model_dump()
 
     @reg.tool(
-        "classify_semantic", "Tag a ticket with topics and a priority using the semantic engine."
+        "classify_semantic",
+        "Tag a ticket with topics and a priority using the semantic engine.",
+        timeout_s=MODEL_TOOL_TIMEOUT_S,
     )
     def classify_semantic(args: ClassifySemantic) -> dict[str, Any]:
         if "semantic" not in state:
@@ -195,6 +244,7 @@ def _register_local(reg: ToolRegistry, artifacts: Path) -> None:
     @reg.tool(
         "find_similar_tickets",
         "Find past tickets similar to this one, with how they were answered.",
+        timeout_s=MODEL_TOOL_TIMEOUT_S,
     )
     def find_similar_tickets(args: SimilarTickets) -> list[dict[str, Any]]:
         if "index" not in state:
@@ -214,21 +264,34 @@ def _register_local(reg: ToolRegistry, artifacts: Path) -> None:
         ]
 
 
-def _register_http(reg: ToolRegistry) -> None:
+def transient_http(exc: BaseException) -> bool:
+    """What earns the one retry on the HTTP backend: a 5xx from the specialist, or no
+    answer at all (connection refused, reset, read timeout). A 4xx is our request being
+    wrong and is returned to the model unchanged."""
+    import httpx
 
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= 500
+    return isinstance(exc, httpx.TransportError)
+
+
+def _register_http(reg: ToolRegistry, client: Any = None) -> None:
     urls = {
         "policy": os.environ.get("NW_POLICY_URL", "http://localhost:8003"),
         "triage": os.environ.get("NW_TRIAGE_URL", "http://localhost:8001"),
         "semantic": os.environ.get("NW_SEMANTIC_URL", "http://localhost:8002"),
     }
-    from nw.auth import service_client
+    if client is None:
+        from nw.auth import service_client
 
-    client = service_client(timeout=30)
+        client = service_client(timeout=HTTP_TIMEOUT_S)
+    http = {"timeout_s": HTTP_TIMEOUT_S, "attempts": 2, "retry_if": transient_http}
 
     @reg.tool(
         "search_policies",
         "Search Northwind's current customer-facing policies. Returns an answer with "
         "citations, or a refusal.",
+        **http,
     )
     async def search_policies(args: SearchPolicies) -> dict[str, Any]:
         r = await client.post(f"{urls['policy']}/ask", json={"question": args.query, "k": args.k})
@@ -236,7 +299,9 @@ def _register_http(reg: ToolRegistry) -> None:
         return r.json()
 
     @reg.tool(
-        "classify_urgency", "Score a ticket's priority P0 to P3 with the calibrated triage model."
+        "classify_urgency",
+        "Score a ticket's priority P0 to P3 with the calibrated triage model.",
+        **http,
     )
     async def classify_urgency(args: ClassifyUrgency) -> dict[str, Any]:
         r = await client.post(f"{urls['triage']}/triage", json=args.model_dump())
@@ -246,6 +311,7 @@ def _register_http(reg: ToolRegistry) -> None:
     @reg.tool(
         "classify_semantic",
         "Tag a ticket with topics and a priority, and list similar past tickets.",
+        **http,
     )
     async def classify_semantic(args: ClassifySemantic) -> dict[str, Any]:
         r = await client.post(f"{urls['semantic']}/classify", json={**args.model_dump(), "k": 3})

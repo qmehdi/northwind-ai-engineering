@@ -8,7 +8,8 @@
 
 locals {
   registry       = "${var.region}-docker.pkg.dev/${var.project}/northwind"
-  api_key_secret = "northwind-api-key" # created by the session tier
+  prefix         = var.stage == "" ? "northwind" : "northwind-${var.stage}"
+  api_key_secret = "${local.prefix}-api-key" # created by the session tier
   # The Session path services the Agent Engine resolver calls as HTTP tools.
   session_services = toset(["policy", "triage", "semantic"])
 }
@@ -19,7 +20,7 @@ data "google_cloud_run_v2_service" "session" {
   for_each = local.session_services
   project  = var.project
   location = var.region
-  name     = "northwind-${each.key}"
+  name     = "${local.prefix}-${each.key}"
 }
 
 resource "google_project_service" "apis" {
@@ -34,7 +35,7 @@ resource "google_project_service" "apis" {
 resource "google_model_armor_template" "support" {
   project     = var.project
   location    = var.region
-  template_id = "northwind-support"
+  template_id = "${local.prefix}-support"
 
   filter_config {
     pi_and_jailbreak_filter_settings {
@@ -75,8 +76,8 @@ resource "google_model_armor_template" "support" {
 
 resource "google_service_account" "agent_engine" {
   project      = var.project
-  account_id   = "northwind-agent-engine"
-  display_name = "Northwind resolver on Agent Engine"
+  account_id   = "${local.prefix}-agent-engine"
+  display_name = "Northwind resolver on Agent Engine${var.stage == "" ? "" : " (${var.stage})"}"
 }
 
 resource "google_project_iam_member" "agent_engine_models" {
@@ -119,6 +120,7 @@ module "mcp" {
   env            = { NW_MCP_HOST = "0.0.0.0", NW_MCP_PORT = "8000" }
   public         = false
   api_key_secret = local.api_key_secret
+  stage          = var.stage
 }
 
 resource "google_cloud_run_v2_service_iam_member" "mcp_invoker" {
@@ -140,7 +142,7 @@ resource "google_cloud_run_v2_service_iam_member" "mcp_invoker" {
 resource "google_vertex_ai_reasoning_engine" "resolver" {
   project      = var.project
   region       = var.region
-  display_name = "northwind-resolver"
+  display_name = "${local.prefix}-resolver"
   description  = "Northwind support resolution agent"
 
   spec {
@@ -206,7 +208,11 @@ resource "google_vertex_ai_reasoning_engine" "resolver" {
       }
       env {
         name  = "OTEL_SERVICE_NAME"
-        value = "northwind-resolver-agent-engine"
+        value = "${local.prefix}-resolver-agent-engine"
+      }
+      env {
+        name  = "NW_STAGE"
+        value = var.stage
       }
       env {
         name  = "NW_AGENT_ROLE"
@@ -260,7 +266,7 @@ resource "google_vertex_ai_reasoning_engine" "resolver" {
 resource "google_sql_database_instance" "pgvector" {
   count               = var.enable_pgvector ? 1 : 0
   project             = var.project
-  name                = "northwind-pgvector"
+  name                = "${local.prefix}-pgvector"
   region              = var.region
   database_version    = "POSTGRES_16"
   deletion_protection = false

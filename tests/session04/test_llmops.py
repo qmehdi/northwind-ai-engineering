@@ -207,6 +207,7 @@ async def test_cli_report_records_versions_corpus_and_mode(
     assert report["mode"] == "retrieval_only"
     assert report["prompt_versions"]["policy.answer"] == ANSWER_PROMPT.hash
     assert report["corpus_sha256_12"] == manifest["corpus_sha256_12"]
+    assert report["golden_sha256_12"] == evaluate_mod.golden_sha(golden)
     assert (
         report["index_manifest"]["chunks"] == manifest["chunks"]
         and "baseline" not in report["index_manifest"]

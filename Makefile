@@ -1,4 +1,4 @@
-.PHONY: setup setup-aws check test lint fmt preflight session01 session02 data-check train-triage runs promote-triage backtest-triage mlflow-ui serve-triage image-triage images up up-observability down session03 train-semantic export-semantic benchmark runs-semantic promote-semantic backtest-semantic index serve-semantic session04 index-policy eval-policy check-index prompts eval-policy-free feedback-policy calibrate-judge serve-policy session05 agent-eval agent-gate agent-gate-offline approve review replay specialists agent-eval-strands agent-eval-adk mcp
+.PHONY: setup setup-aws rollout-aws deployments-aws rotate-key release openapi check-openapi data-manifest check-data audit check test lint fmt preflight session01 session02 data-check train-triage runs promote-triage backtest-triage mlflow-ui serve-triage image-triage images up up-observability down session03 train-semantic export-semantic benchmark runs-semantic promote-semantic backtest-semantic index serve-semantic session04 index-policy eval-policy check-index prompts eval-policy-free feedback-policy calibrate-judge serve-policy session05 agent-eval agent-gate agent-gate-offline approve review replay specialists agent-eval-strands agent-eval-adk mcp
 
 setup:            ## Create the virtualenv and install everything, deep learning and agents included
 	uv sync --extra dev --extra dl --extra agents --extra agents-aws --extra agents-gcp --extra mlops
@@ -151,6 +151,33 @@ mcp:              ## The tool registry as an MCP server on :8020
 
 # ----- Session 6: deployment. Read deploy/COSTS.md before any of these. -----
 TIER ?= session
+CANARY ?= 0
+
+release:          ## Cut a release: bump pyproject, move Unreleased in the changelog, relock, commit, tag (VERSION=x.y.z)
+	@test -n "$(VERSION)" || { echo "usage: make release VERSION=x.y.z"; exit 1; }
+	uv run python scripts/release.py cut $(VERSION)
+	uv lock
+	git add pyproject.toml uv.lock CHANGELOG.md
+	git commit -m "release: v$(VERSION)"
+	git tag -a "v$(VERSION)" -m "v$(VERSION)"
+	@echo "now: git push origin main v$(VERSION)"
+
+openapi:          ## Refresh docs/openapi/*.json from the apps
+	uv run python scripts/openapi_snapshot.py
+
+check-openapi:    ## Exit 1 when an app breaks its committed OpenAPI snapshot (CI)
+	uv run python scripts/openapi_snapshot.py --check
+
+data-manifest:    ## Rewrite data/MANIFEST.json (bumps the dataset version when files changed)
+	uv run python -m nw.data_manifest
+
+check-data:       ## Exit 1 when data/ changed without the manifest (CI)
+	uv run python -m nw.data_manifest --check
+
+audit:            ## pip-audit over the locked set, every extra
+	uv export --frozen --no-dev --all-extras --no-emit-project --no-hashes -o requirements.txt
+	sed -i.bak -E 's/==([0-9][^+ ;]*)\+[A-Za-z0-9.]+/==\1/' requirements.txt && rm -f requirements.txt.bak
+	uv run --with pip-audit pip-audit -r requirements.txt --no-deps --disable-pip --strict
 
 setup-aws:        ## AWS track: the CDK virtualenv and the pinned CDK CLI (Node 22 or later, Docker running)
 	uv venv deploy/aws/.venv -p 3.12 && uv pip install -p deploy/aws/.venv/bin/python -r deploy/aws/requirements.txt
@@ -178,8 +205,17 @@ destroy-aws:      ## AWS: delete the tier's stack
 images-gcp:       ## GCP: build and push every image to Artifact Registry
 	scripts/images_gcp.sh
 
-deploy-gcp:       ## GCP: validate, plan, apply. TIER=session|reference
-	TIER=$(TIER) scripts/deploy_gcp.sh deploy
+deploy-gcp:       ## GCP: validate, plan, apply. TIER=session|reference; CANARY=10 puts the newest revision on 10 percent
+	TIER=$(TIER) NW_CANARY=$(CANARY) scripts/deploy_gcp.sh deploy
+
+rollout-aws:      ## AWS: publish $$LATEST of one function and shift the live alias through CodeDeploy. SERVICE=agent
+	scripts/deploy_aws.sh rollout $(SERVICE)
+
+deployments-aws:  ## AWS: the last five CodeDeploy deployments of one function. SERVICE=agent
+	scripts/deploy_aws.sh deployments $(SERVICE)
+
+rotate-key:       ## Rotate the cohort API key and roll every service. TRACK=aws|gcp
+	TRACK=$(TRACK) scripts/rotate_key.sh
 
 plan-gcp:         ## GCP: plan only
 	TIER=$(TIER) scripts/deploy_gcp.sh plan
