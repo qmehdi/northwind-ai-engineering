@@ -140,16 +140,16 @@ tests/session06/test_data_manifest.py::test_manifest_records_hashes_rows_licence
 tests/session06/test_data_manifest.py::test_rewrite_bumps_the_version_only_when_data_changed
 tests/session06/test_data_manifest.py::test_the_committed_manifest_matches_the_repository_data
 tests/session06/test_openapi_snapshot.py::test_additive_changes_pass
-tests/session06/test_openapi_snapshot.py::test_breaking_changes_are_named[became
-tests/session06/test_openapi_snapshot.py::test_breaking_changes_are_named[became
-tests/session06/test_openapi_snapshot.py::test_breaking_changes_are_named[changed
-tests/session06/test_openapi_snapshot.py::test_breaking_changes_are_named[new
-tests/session06/test_openapi_snapshot.py::test_breaking_changes_are_named[removed
-tests/session06/test_openapi_snapshot.py::test_breaking_changes_are_named[removed
-tests/session06/test_openapi_snapshot.py::test_breaking_changes_are_named[removed
-tests/session06/test_openapi_snapshot.py::test_breaking_changes_are_named[removed
-tests/session06/test_openapi_snapshot.py::test_breaking_changes_are_named[removed
-tests/session06/test_openapi_snapshot.py::test_breaking_changes_are_named[removed
+tests/session06/test_openapi_snapshot.py::test_breaking_changes_are_named[became optional-<lambda>]
+tests/session06/test_openapi_snapshot.py::test_breaking_changes_are_named[became required-<lambda>]
+tests/session06/test_openapi_snapshot.py::test_breaking_changes_are_named[changed type-<lambda>]
+tests/session06/test_openapi_snapshot.py::test_breaking_changes_are_named[new required field-<lambda>]
+tests/session06/test_openapi_snapshot.py::test_breaking_changes_are_named[removed operation-<lambda>]
+tests/session06/test_openapi_snapshot.py::test_breaking_changes_are_named[removed parameter-<lambda>]
+tests/session06/test_openapi_snapshot.py::test_breaking_changes_are_named[removed path-<lambda>]
+tests/session06/test_openapi_snapshot.py::test_breaking_changes_are_named[removed property-<lambda>]
+tests/session06/test_openapi_snapshot.py::test_breaking_changes_are_named[removed response-<lambda>]
+tests/session06/test_openapi_snapshot.py::test_breaking_changes_are_named[removed schema-<lambda>]
 tests/session06/test_openapi_snapshot.py::test_committed_snapshots_match_the_apps
 tests/session06/test_publish_vectors.py::test_publish_upserts_every_chunk_by_id
 tests/session06/test_release.py::test_bump_rewrites_the_version_line_only

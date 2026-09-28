@@ -13,4 +13,4 @@ jobs:
       - run: uv sync --locked --extra dev --extra dl --extra agents --extra agents-aws --extra agents-gcp
       - run: uv run ruff check .
       - run: uv run ruff format --check .
-      - run: uv run pytest -q $(cat tests/skeleton-green.txt)
+      - run: uv run pytest -q @tests/skeleton-green.txt
