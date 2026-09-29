@@ -77,6 +77,29 @@ class Reranker(Protocol):
     def score(self, query: str, texts: list[str]) -> list[float]: ...
 
 
+class Retriever(Protocol):
+    """What the policy service needs from whatever retrieves: the in-process `PolicyIndex`,
+    or `nw.platform.retrievers.PlatformRetriever` over the platform's vector store."""
+
+    chunks: list[Chunk]
+    manifest: dict[str, Any]
+
+    @property
+    def manifest_hash(self) -> str: ...
+
+    def retrieve(
+        self,
+        query: str,
+        *,
+        k: int = 8,
+        candidates: int = 30,
+        hybrid: bool = True,
+        rerank: bool = True,
+        current_only: bool = True,
+        audience: str = "customer",
+    ) -> list[Retrieved]: ...
+
+
 class CrossEncoderReranker:
     def __init__(self, name: str = DEFAULT_RERANKER) -> None:
         from sentence_transformers import CrossEncoder

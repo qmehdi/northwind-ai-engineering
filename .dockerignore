@@ -6,6 +6,8 @@ __pycache__
 data/tickets.jsonl
 data/policies/
 data/golden/
+!data/golden/triage_production.json
+!data/golden/semantic_production.json
 docs/
 notebooks/
 tests/

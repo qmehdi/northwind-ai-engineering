@@ -289,3 +289,14 @@ def test_model_card_renders_from_metadata_alone(trained_tiny):
     assert (
         card.startswith("# Model card") and "| P0 recall |" in card and "Tag thresholds" not in card
     )
+
+
+def test_registered_model_is_the_tenants_when_a_tenant_is_set(monkeypatch, tmp_path):
+    from nw.semantic import tracking
+
+    monkeypatch.chdir(tmp_path)  # no .env here
+    monkeypatch.delenv("NW_TENANT", raising=False)
+    monkeypatch.delenv("NW_ENVIRONMENT", raising=False)
+    assert tracking.registered_model_name() == "northwind-semantic"
+    monkeypatch.setenv("NW_TENANT", "alice")
+    assert tracking.registered_model_name() == "northwind-alice-semantic"

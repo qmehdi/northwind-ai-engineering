@@ -1,0 +1,71 @@
+# The live triage service, deployed by Cloud Deploy (Knative serving shape). Placeholders are
+# filled at release time; the image digest comes from the release's --images flag.
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: @ENVIRONMENT@-live-triage
+  labels:
+    environment: @ENVIRONMENT@
+    area: live
+    course: ai-engineering
+  annotations:
+    run.googleapis.com/ingress: all
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "3"
+        run.googleapis.com/startup-cpu-boost: "true"
+    spec:
+      serviceAccountName: @LIVE_SA@
+      containerConcurrency: 20
+      timeoutSeconds: 300
+      containers:
+        - image: nw-triage
+          ports:
+            - containerPort: 8000
+          resources:
+            limits:
+              cpu: "1"
+              memory: 3Gi
+          env:
+            - name: NW_TRACK
+              value: gcp
+            - name: NW_GCP_PROJECT
+              value: "@PROJECT@"
+            - name: NW_GCP_REGION
+              value: global
+            - name: NW_GCP_RUN_REGION
+              value: "@REGION@"
+            - name: NW_ENVIRONMENT
+              value: "@ENVIRONMENT@"
+            - name: NW_TENANT
+              value: live
+            - name: NW_LOG_FORMAT
+              value: json
+            - name: NW_TRACE_EXPORT
+              value: cloudtrace
+            - name: NW_METRICS_FORMAT
+              value: json
+            - name: OTEL_SERVICE_NAME
+              value: "@ENVIRONMENT@-live-triage"
+            - name: NW_GATEWAY_URL
+              value: https://@ENVIRONMENT@-gateway-@PROJECT@.@REGION@.run.app
+            - name: NW_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: @ENVIRONMENT@-api-key
+                  key: latest
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            periodSeconds: 30

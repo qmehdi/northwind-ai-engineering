@@ -139,5 +139,25 @@
   0.08848400000000001,
   0.08532399999999996,
   0.05951599999999996
- ]
+ ],
+ "tiers": {
+  "tool": {
+   "max_invalid_argument_rate": 0.1,
+   "max_error_rate_per_tool": 0.2,
+   "min_calls": 3
+  },
+  "turn": {
+   "min_pass_rate": 0.8,
+   "min_judge_mean": 3.5
+  },
+  "session": {
+   "max_pass_drop": 1,
+   "max_extra_steps": 2.0,
+   "max_cap_rate": 0.2
+  },
+  "system": {
+   "min_escalation_correct_rate": 1.0,
+   "max_cost_ratio": 1.5
+  }
+ }
 }

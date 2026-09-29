@@ -155,10 +155,17 @@ class Exporter:
         fmt: str = "json",
         registry: CollectorRegistry = REGISTRY,
         stream: TextIO | None = None,
+        tenant: str = "",
+        environment: str = "",
     ) -> None:
         self.service = service
         self.series = SERIES[service]
         self.stage = stage
+        # The tenant and environment of a cohort platform (ADR 0009): plain fields on the
+        # line, never dimensions, so the metric cardinality stays what the allowlist says
+        # and the log-based metrics can still filter or group by them.
+        self.tenant = tenant
+        self.environment = environment
         self.fmt = fmt
         self.registry = registry
         self.stream = stream
@@ -240,6 +247,8 @@ class Exporter:
                 # A dimension value cannot be empty; the CDK dashboard uses the same word.
                 "Stage": self.stage or "default",
                 "msg": MESSAGE,
+                "tenant": self.tenant,
+                "environment": self.environment,
             }
             line.update({emf_name(k): v for k, v in fields.items()})
             return line
@@ -248,6 +257,8 @@ class Exporter:
             "severity": "INFO",
             "service": self.service,
             "stage": self.stage,
+            "tenant": self.tenant,
+            "environment": self.environment,
             "ts": now_ms,
             **fields,
         }
@@ -300,6 +311,8 @@ def start_metrics_export(
         fmt=env.get("NW_METRICS_FORMAT", "json"),
         registry=registry,
         stream=stream,
+        tenant=env.get("NW_TENANT", "") or "solo",
+        environment=env.get("NW_ENVIRONMENT", "") or "northwind",
     )
     task = asyncio.get_running_loop().create_task(
         _run(exporter, interval), name=f"metrics-export-{name}"

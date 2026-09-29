@@ -1,19 +1,35 @@
-# One Cloud Run v2 service from a course image, with a dedicated service account,
-# readiness on /readyz, request-based billing, and no public invoker unless asked.
+# One Cloud Run v2 service from a course image with its own service account, readiness on
+# /readyz, request-based billing, and no public invoker unless asked. Used for every tenant
+# service and for the gateway-facing pieces of the platform; the live services are created by
+# Cloud Deploy from deploy/gcp/platform/delivery, not by this module.
 #
-# Traffic: with canary_percent 0 (the default) the newest ready revision takes all traffic
-# under the tag `latest`. With canary_percent N the newest revision takes N percent under
-# `latest` and the revision that was serving before this apply keeps the rest under
-# `stable`; both tags get their own URL (https://latest---<service url>) so either can be
-# probed directly. Promote with canary_percent 0 again, or roll back with
+# Traffic: with canary_percent 0 the newest ready revision takes all traffic under the tag
+# `latest`. With N the newest revision takes N percent under `latest` and the revision that was
+# serving before keeps the rest under `stable`. Promote with 0 again, or roll back with
 # `gcloud run services update-traffic <service> --to-tags stable=100`.
-variable "name" { type = string }
+variable "name" {
+  type        = string
+  description = "Full service name, already prefixed (northwind-alice-triage)"
+}
+variable "account_id" {
+  type        = string
+  description = "Service account id, at most 30 characters (nw-alice-triage)"
+}
 variable "project" { type = string }
 variable "region" { type = string }
 variable "image" { type = string }
+variable "labels" {
+  type    = map(string)
+  default = {}
+}
 variable "env" {
   type    = map(string)
   default = {}
+}
+variable "secret_env" {
+  type        = map(string)
+  default     = {}
+  description = "Environment variable name to Secret Manager secret id; the latest version is injected at instance start"
 }
 variable "cpu" {
   type    = string
@@ -36,52 +52,34 @@ variable "public" {
   default = false
 }
 variable "timeout" {
-  type        = number
-  default     = 120
-  description = "Request timeout in seconds; the agent needs 300 for a multi-step resolution"
+  type    = number
+  default = 120
 }
 variable "invoke_models" {
   type        = bool
   default     = false
-  description = "Grant roles/aiplatform.user so the service can call Claude on Vertex AI"
+  description = "Grant roles/aiplatform.user so the service can call the Agent Platform directly (the gateway is the normal path)"
 }
-variable "api_key_secret" {
-  type        = string
-  default     = ""
-  description = "Secret Manager secret id holding the service API key; injected as NW_API_KEY at runtime"
-}
-variable "stage" {
-  type        = string
-  default     = ""
-  description = "Put after `northwind` in every name so dev, staging and prod can share a project; empty keeps the guide's names"
-  validation {
-    condition     = can(regex("^[a-z0-9]{0,7}$", var.stage))
-    error_message = "stage is lowercase letters and digits, at most 7 characters, so northwind-<stage>-agent-engine fits a 30 character service account id."
-  }
+variable "buckets_read" {
+  type        = list(string)
+  default     = []
+  description = "Buckets the service reads model artifacts from"
 }
 variable "canary_percent" {
-  type        = number
-  default     = 0
-  description = "Traffic share for the newest revision; 0 sends everything to it, N keeps 100 minus N on the previously serving revision under the tag `stable`"
+  type    = number
+  default = 0
   validation {
     condition     = var.canary_percent >= 0 && var.canary_percent <= 100
     error_message = "canary_percent is between 0 and 100."
   }
 }
 
-locals {
-  prefix  = var.stage == "" ? "northwind" : "northwind-${var.stage}"
-  service = "${local.prefix}-${var.name}"
-}
-
 resource "google_service_account" "svc" {
   project      = var.project
-  account_id   = local.service
-  display_name = "Northwind ${var.name} service${var.stage == "" ? "" : " (${var.stage})"}"
+  account_id   = var.account_id
+  display_name = var.name
 }
 
-# Least privilege: only services that call a model get aiplatform.user, and nothing gets
-# a project-wide editor role. Logs and traces are written through the default agents.
 resource "google_project_iam_member" "aiplatform" {
   count   = var.invoke_models ? 1 : 0
   project = var.project
@@ -101,12 +99,24 @@ resource "google_project_iam_member" "metrics" {
   member  = "serviceAccount:${google_service_account.svc.email}"
 }
 
-# The API key is read by Cloud Run from Secret Manager at revision start and handed to the
-# container as an environment variable. Only this service account may read this one secret.
-resource "google_secret_manager_secret_iam_member" "api_key" {
-  count     = var.api_key_secret == "" ? 0 : 1
+resource "google_project_iam_member" "logs" {
+  project = var.project
+  role    = "roles/logging.logWriter"
+  member  = "serviceAccount:${google_service_account.svc.email}"
+}
+
+resource "google_storage_bucket_iam_member" "read" {
+  for_each = toset(var.buckets_read)
+  bucket   = each.value
+  role     = "roles/storage.objectViewer"
+  member   = "serviceAccount:${google_service_account.svc.email}"
+}
+
+# Only this service account may read the secrets it is handed.
+resource "google_secret_manager_secret_iam_member" "secrets" {
+  for_each  = var.secret_env
   project   = var.project
-  secret_id = var.api_key_secret
+  secret_id = each.value
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${google_service_account.svc.email}"
 }
@@ -117,21 +127,23 @@ data "google_cloud_run_v2_service" "current" {
   count    = var.canary_percent > 0 ? 1 : 0
   project  = var.project
   location = var.region
-  name     = local.service
+  name     = var.name
 }
 
 resource "google_cloud_run_v2_service" "svc" {
-  depends_on          = [google_secret_manager_secret_iam_member.api_key]
+  depends_on          = [google_secret_manager_secret_iam_member.secrets]
   project             = var.project
-  name                = local.service
+  name                = var.name
   location            = var.region
   ingress             = "INGRESS_TRAFFIC_ALL"
   deletion_protection = false
+  labels              = var.labels
 
   template {
     service_account                  = google_service_account.svc.email
     timeout                          = "${var.timeout}s"
     max_instance_request_concurrency = 20
+    labels                           = var.labels
 
     scaling {
       min_instance_count = var.min_instances
@@ -162,11 +174,8 @@ resource "google_cloud_run_v2_service" "svc" {
           NW_LOG_FORMAT     = "json",
           PORT              = "8000",
           NW_TRACE_EXPORT   = "cloudtrace",
-          OTEL_SERVICE_NAME = local.service,
-          # One `metrics_snapshot` JSON line per minute of activity; the log-based metrics in
-          # the session tier turn its fields into Cloud Monitoring series.
+          OTEL_SERVICE_NAME = var.name,
           NW_METRICS_FORMAT = "json",
-          NW_STAGE          = var.stage,
         }, var.env)
         content {
           name  = env.key
@@ -175,9 +184,9 @@ resource "google_cloud_run_v2_service" "svc" {
       }
 
       dynamic "env" {
-        for_each = var.api_key_secret == "" ? [] : [var.api_key_secret]
+        for_each = var.secret_env
         content {
-          name = "NW_API_KEY"
+          name = env.key
           value_source {
             secret_key_ref {
               secret  = env.value
@@ -207,6 +216,14 @@ resource "google_cloud_run_v2_service" "svc" {
         }
       }
     }
+  }
+
+  # After the first apply the platform client owns the container's environment: a registry
+  # deploy rewrites NW_MODEL_URI on the tenant's service (nw/platform/gcp.py) and Terraform must
+  # not put the old value back. To change an env value from Terraform, replace the service:
+  #   terraform apply -replace='module.serving.module.service["alice-triage"].google_cloud_run_v2_service.svc'
+  lifecycle {
+    ignore_changes = [template[0].containers[0].env]
   }
 
   traffic {

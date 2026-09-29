@@ -1,0 +1,34 @@
+# Scrapes every course service's /metrics (open, no key: nw/auth.py) plus the platform boxes
+# that expose Prometheus text. Service names are compose DNS names; every course service
+# listens on 8000 inside the network.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+scrape_configs:
+  - job_name: northwind
+    static_configs:
+      - targets: [triage:8000]
+        labels: { service: triage }
+      - targets: [semantic:8000]
+        labels: { service: semantic }
+      - targets: [policy:8000]
+        labels: { service: policy }
+      - targets: [resolver:8000]
+        labels: { service: resolver }
+      - targets: [agent:8000]
+        labels: { service: agent }
+      - targets: [agent-triage:8000]
+        labels: { service: agent-triage }
+      - targets: [agent-policy:8000]
+        labels: { service: agent-policy }
+      - targets: [agent-resolution:8000]
+        labels: { service: agent-resolution }
+  - job_name: qdrant
+    static_configs:
+      - targets: [qdrant:6333]
+  - job_name: otel-collector
+    static_configs:
+      - targets: [otel-collector:8888]
+  - job_name: prometheus
+    static_configs:
+      - targets: [localhost:9090]

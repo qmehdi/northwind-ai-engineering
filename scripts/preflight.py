@@ -1,14 +1,17 @@
-"""Preflight: prove the machine is ready before Session 1, not during it.
+"""Preflight: prove the machine is ready before the first session, not during it.
 
 Prints one PASS/FAIL table. Exit code is 1 if anything required failed.
 Run with `make preflight`. Paste the table into the cohort channel 48 hours
-before Session 1.
+before the first session.
 
 Checks:
 - Python version and virtualenv
 - uv, Docker, git
 - the track's CLI is authenticated (aws sts get-caller-identity / gcloud auth list)
-- one real round trip per model role on aws or gcp tracks (spends a fraction of a cent)
+- per model role: the model id, the provider and endpoint it resolves to, and whether the
+  model gateway is in the path (no network; `nw.llm.providers.make_provider` decides)
+- one real round trip per model role on the aws and gcp tracks (spends a fraction of a
+  cent) and on the local track against Ollama; NW_PROVIDER=fake skips them
 - the accelerator PyTorch would see (reported, not required; the deep learning part has a fallback)
 - free disk for model weights
 - warned, not required: docker compose, huggingface.co reachable, application default
@@ -79,9 +82,16 @@ def check_accelerator() -> Check:
             return Check("accelerator", True, f"cuda: {name}, {mem:.0f} GB", required=False)
         if torch.backends.mps.is_available():
             return Check("accelerator", True, "mps (Apple silicon)", required=False)
-        return Check("accelerator", True, "cpu only: Session 3 uses the Colab fallback", False)
+        return Check(
+            "accelerator", True, "cpu only: the deep learning part uses the Colab fallback", False
+        )
     except ImportError:
-        return Check("accelerator", True, "torch not installed yet (Session 3 installs it)", False)
+        return Check(
+            "accelerator",
+            True,
+            "torch not installed yet (the deep learning part installs it)",
+            False,
+        )
 
 
 def check_track_auth(track: str, settings) -> list[Check]:
@@ -97,10 +107,41 @@ def check_track_auth(track: str, settings) -> list[Check]:
             Check("gcloud account", code == 0 and bool(out), out[:80]),
             Check("gcp project", bool(settings.gcp_project), proj),
         ]
-    return [Check("track", True, "local: fake provider, no cloud needed")]
+    if settings.provider.value == "fake":
+        return [Check("track", True, "local: fake provider, no cloud needed")]
+    return [Check("track", True, f"local: Ollama at {settings.ollama_url}, no cloud needed")]
 
 
-async def check_round_trips(settings) -> list[Check]:
+def check_routes(settings, provider) -> list[Check]:
+    """Per role: the model id, the provider and endpoint it resolves to, and whether the
+    gateway is in the path. No network: this is what `make_provider` decided."""
+    from nw.config import ModelRole
+    from nw.llm.providers import describe_route
+
+    gateway = "yes" if settings.uses_gateway else "no"
+    return [
+        Check(
+            f"route {role.value}",
+            True,
+            f"{settings.model_for(role)} via {describe_route(provider, settings.model_for(role))}"
+            f", gateway={gateway}",
+            required=False,
+        )
+        for role in ModelRole
+    ]
+
+
+def make_provider_check(settings):
+    """The provider for this configuration, or the Check that says why there is none."""
+    from nw.llm.providers import make_provider
+
+    try:
+        return make_provider(settings), None
+    except Exception as exc:  # noqa: BLE001
+        return None, Check("provider", False, f"{type(exc).__name__}: {exc}")
+
+
+async def check_round_trips(settings, provider) -> list[Check]:
     """One real completion per role, straight through the provider.
 
     Deliberately bypasses LLMClient: that class is the participant's work in
@@ -108,13 +149,8 @@ async def check_round_trips(settings) -> list[Check]:
     """
     from nw.config import ModelRole
     from nw.llm.cost import cost_usd
-    from nw.llm.providers import make_provider
     from nw.llm.types import Message
 
-    try:
-        provider = make_provider(settings)
-    except Exception as exc:  # noqa: BLE001
-        return [Check("provider", False, f"{type(exc).__name__}: {exc}")]
     checks: list[Check] = []
     spend = 0.0
     for role in ModelRole:
@@ -199,8 +235,13 @@ def main() -> int:
         *check_track_auth(track, settings),
         *check_track_tools(track),
     ]
-    if track in {"aws", "gcp"}:
-        checks.extend(asyncio.run(check_round_trips(settings)))
+    provider, failure = make_provider_check(settings)
+    if failure is not None:
+        checks.append(failure)
+    else:
+        checks.extend(check_routes(settings, provider))
+        if settings.provider.value != "fake":
+            checks.extend(asyncio.run(check_round_trips(settings, provider)))
 
     width = max(len(c.name) for c in checks)
     print(f"\nPreflight, track={track}\n")

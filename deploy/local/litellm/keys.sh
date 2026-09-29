@@ -1,0 +1,25 @@
+#!/bin/sh
+# Apply deploy/local/litellm/tenants.tsv to the gateway: one virtual key with a budget per
+# tenant, tagged with the tenant name so /spend reports attribute cost per learner. Idempotent:
+# an existing key is updated, a new one is generated with the value from the file.
+set -eu
+: "${LITELLM_URL:=http://litellm:4000}"
+: "${LITELLM_MASTER_KEY:?}"
+: "${TENANTS_FILE:=/config/tenants.tsv}"
+auth="Authorization: Bearer $LITELLM_MASTER_KEY"
+for i in $(seq 1 60); do
+  if curl -sf "$LITELLM_URL/health/readiness" >/dev/null; then break; fi
+  echo "waiting for the gateway ($i)"; sleep 5
+done
+grep -v '^#' "$TENANTS_FILE" | grep -v '^[[:space:]]*$' | while IFS="$(printf '\t')" read -r name budget key; do
+  body="{\"key\":\"$key\",\"key_alias\":\"tenant-$name\",\"max_budget\":$budget,\"budget_duration\":\"30d\",\"metadata\":{\"tenant\":\"$name\"},\"team_id\":null}"
+  if curl -sf -X POST "$LITELLM_URL/key/generate" -H "$auth" -H "Content-Type: application/json" -d "$body" >/dev/null; then
+    echo "tenant $name: key created, budget $budget USD per 30 days"
+  else
+    curl -sf -X POST "$LITELLM_URL/key/update" -H "$auth" -H "Content-Type: application/json" \
+      -d "{\"key\":\"$key\",\"max_budget\":$budget,\"budget_duration\":\"30d\",\"metadata\":{\"tenant\":\"$name\"}}" >/dev/null \
+      && echo "tenant $name: key updated, budget $budget USD per 30 days" \
+      || { echo "tenant $name: could not create or update the key"; exit 1; }
+  fi
+done
+echo "tenant keys applied"

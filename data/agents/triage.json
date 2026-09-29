@@ -1,0 +1,70 @@
+{
+ "name": "triage",
+ "kind": "specialist",
+ "track": "local",
+ "agent_version": "a957ca5edcc4",
+ "prompt": "system@d9e9c7cda49c",
+ "prompt_hash": "d9e9c7cda49c",
+ "tools_version": "0cbcd148b7ff",
+ "tools": [
+  {
+   "name": "check_entitlement",
+   "version": "7e89ec15b10c",
+   "requires_approval": false
+  },
+  {
+   "name": "classify_semantic",
+   "version": "22bfdabed8be",
+   "requires_approval": false
+  },
+  {
+   "name": "classify_urgency",
+   "version": "9f77abb96bc9",
+   "requires_approval": false
+  },
+  {
+   "name": "lookup_customer",
+   "version": "53aae0c9171c",
+   "requires_approval": false
+  }
+ ],
+ "models": {
+  "workhorse": "gpt-oss:20b"
+ },
+ "use_case": "uc-triage",
+ "owner": "product_owner",
+ "business_outcome": "Every ticket has its customer, plan, priority and tags established before a person reads it.",
+ "risk_class": "low",
+ "oversight": {
+  "actions": "read-only tools",
+  "human": "none in the loop; sampled trace review after the fact (make review)",
+  "approvers": "one"
+ },
+ "data_classes": [
+  "ticket_text",
+  "customer_account",
+  "entitlements"
+ ],
+ "endpoints": [
+  "POST /run",
+  "GET /version",
+  "GET /drift",
+  "GET /metrics"
+ ],
+ "evaluation": {
+  "baseline": null,
+  "agent_version": null,
+  "written_at": null,
+  "cases": null,
+  "success": null,
+  "cost_usd_per_resolution": null,
+  "tiers": {},
+  "note": "no golden set of its own; covered by the contract tests"
+ },
+ "approval": {
+  "state": "approved",
+  "approver": "support-operations"
+ },
+ "runtime_id": null,
+ "written_at": "2026-09-29T07:06:51.442916+00:00"
+}

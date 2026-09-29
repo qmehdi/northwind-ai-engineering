@@ -41,6 +41,16 @@ dl = [
 agents = [
     "mcp>=1.10,<2",
 ]
+# The Local track's platform clients (ADR 0011): MLflow registry and prompts, the Kubeflow
+# Pipelines local runner, Qdrant. `pip` is here because the kfp local runner shells out to it
+# and a uv virtualenv has none; `docker` is what the DockerRunner drives.
+local = [
+    "mlflow>=3.16",
+    "kfp>=2.17",
+    "qdrant-client>=1.19",
+    "docker>=7.1",
+    "pip>=25.0",
+]
 agents-aws = [
     "strands-agents>=1.0",
     "strands-agents-tools>=0.2",
@@ -51,11 +61,30 @@ agents-aws = [
     "opentelemetry-sdk-extension-aws>=2.1",
     "opentelemetry-propagator-aws-xray>=1.0",
 ]
+platform-aws = [
+    # nw/platform/aws.py: SageMaker, Bedrock, AgentCore and the Agent Registry through boto3
+    "boto3>=1.43",
+]
 agents-gcp = [
     "google-adk>=2.10",
     "google-cloud-secret-manager>=2.20",
     "opentelemetry-exporter-gcp-trace>=1.9",
     "opentelemetry-resourcedetector-gcp>=1.9",
+]
+# The training pipelines (ADR 0008, 0011): the Kubeflow SDK for the Local track and Vertex AI
+# Pipelines, the SageMaker SDK v3 for AWS. Both define the same two pipelines over nw/pipelines/steps.
+pipelines = [
+    "kfp>=2.17",
+    "sagemaker-mlops>=1.23",
+]
+platform-gcp = [
+    # nw/platform/gcp.py and scripts/gcp_*.py: Model Registry, Pipelines, endpoints, prompt
+    # management (vertexai.preview.prompts), RAG Engine (vertexai.rag), Agent Engine.
+    "google-cloud-aiplatform>=1.120",
+    "google-cloud-storage>=2.18",
+    "google-cloud-logging>=3.11",
+    "google-cloud-run>=0.10",
+    "google-cloud-secret-manager>=2.20",
 ]
 dev = [
     "pytest>=8.2",
@@ -96,7 +125,9 @@ markers = [
     "session04: Session 4, Project 3 policy-grounded responses",
     "session05: Session 5, Project 4 multi-agent resolution",
     "session06: Session 6, Capstone and deployment",
-    "live: needs cloud credentials and spends money",
+    "live: needs cloud credentials and spends money, or the local compose stack running",
+    "pipelines: the training pipelines, shared steps and both SDK definitions",
+    "slow: takes more than a minute; excluded from the default run with -m 'not slow'",
 ]
 
 # Linux images (Lambda, Cloud Run, AgentCore) get CPU-only PyTorch wheels: the default index

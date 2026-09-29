@@ -19,6 +19,22 @@ from contextlib import contextmanager
 _correlation_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "nw_correlation_id", default=None
 )
+# Fields every line of this process carries: the tenant and the environment of a cohort
+# platform (ADR 0009). Bound once at startup by `nw.serving.identity.bind_identity`.
+_static: dict[str, object] = {}
+
+
+def bind_static_fields(**fields: object) -> None:
+    """Add fields to every log line from now on; a `None` value removes the field."""
+    for key, value in fields.items():
+        if value is None:
+            _static.pop(key, None)
+        else:
+            _static[key] = value
+
+
+def static_fields() -> dict[str, object]:
+    return dict(_static)
 
 
 def correlation_id() -> str | None:
@@ -48,6 +64,7 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "msg": record.getMessage(),
             "correlation_id": correlation_id(),
+            **_static,
         }
         extra = getattr(record, "nw", None)
         if isinstance(extra, dict):
@@ -61,7 +78,8 @@ class TextFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         cid = correlation_id() or "-"
         extra = getattr(record, "nw", None)
-        tail = f" {json.dumps(extra, default=str)}" if isinstance(extra, dict) else ""
+        merged = {**_static, **(extra if isinstance(extra, dict) else {})}
+        tail = f" {json.dumps(merged, default=str)}" if merged else ""
         return f"{record.levelname:<7} {cid} {record.name}: {record.getMessage()}{tail}"
 
 

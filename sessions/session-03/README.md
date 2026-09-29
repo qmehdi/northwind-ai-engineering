@@ -3,7 +3,9 @@
 What you build: Project 2, the semantic understanding engine in `nw/semantic`, inside the same loop as Project 1: the data contract, versioned artifacts, run tracking, a promotion gate fed by the export and the benchmark, a model card, three drift signals in the service, a backtest between versions, and a retraining workflow.
 
 ```bash
-make session03                                              # 28 tests, tiny model, no download
+make session03                                              # 31 tests, tiny model, no download; the skeleton passes 8
+make pipeline-run-local PIPELINE=semantic SET="epochs=6"    # data prep, train, export, benchmark, gate, register
+make pipeline-submit PIPELINE=semantic ARGS="--epochs 2 --min-tag-micro-f1 0.55"   # retraining with a tightened bar
 make data-check                                             # the same contract as Project 1, same file
 make train-semantic                                         # LoRA fine-tune, 2,000 ticket subset, six epochs, about two minutes on Apple silicon; writes artifacts/semantic/<version>/, no gate
 make runs-semantic                                          # the experiment table from artifacts/semantic/runs.jsonl
@@ -16,7 +18,7 @@ make serve-semantic                                         # the service on :80
 make backtest-semantic A=artifacts/semantic/latest B=<dir>  # two versions on the test split, int8 as served
 ```
 
-Run order in the session: `data-check`, `train-semantic`, `runs-semantic`, then `export-semantic`, `benchmark`, `promote-semantic` (the gate passes and `latest` appears), the card and `promotions.jsonl`, optionally the service with `/drift`, a two-epoch `--no-promote` candidate through `backtest-semantic` and the gate (it fails), and the workflow. `python -m nw.semantic.train` without `--no-promote` runs export, benchmark and the gate itself after training.
+Run order in the part: `data-check`, `train-semantic`, `runs-semantic`, then `export-semantic`, `benchmark`, `promote-semantic` (the gate passes and `latest` appears), the card and `promotions.jsonl`, optionally the service with `/drift`, a two-epoch `--no-promote` candidate through `backtest-semantic` and the gate (it fails), and the workflow. `python -m nw.semantic.train` without `--no-promote` runs export, benchmark and the gate itself after training.
 
 Files you edit in this session:
 

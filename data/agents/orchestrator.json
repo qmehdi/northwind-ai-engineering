@@ -1,0 +1,63 @@
+{
+ "name": "orchestrator",
+ "kind": "orchestrator",
+ "track": "local",
+ "agent_version": "d96b9b0ad809",
+ "prompt": "system@4554b9c9dbd4",
+ "prompt_hash": "4554b9c9dbd4",
+ "tools_version": "65a88bddb792",
+ "tools": [
+  {
+   "name": "ask_policy",
+   "version": "f2e61260090f",
+   "requires_approval": false
+  },
+  {
+   "name": "ask_resolution",
+   "version": "2d49db274cc8",
+   "requires_approval": false
+  },
+  {
+   "name": "ask_triage",
+   "version": "d7862e9a0345",
+   "requires_approval": false
+  }
+ ],
+ "models": {
+  "workhorse": "gpt-oss:20b"
+ },
+ "use_case": "uc-orchestrator",
+ "owner": "product_owner",
+ "business_outcome": "The three specialists combined into one reply, each specialist scaling and failing on its own.",
+ "risk_class": "medium",
+ "oversight": {
+  "actions": "may propose an irreversible action",
+  "human": "one reviewer approves each proposal before it executes (make approve)",
+  "approvers": "one"
+ },
+ "data_classes": [
+  "ticket_text"
+ ],
+ "endpoints": [
+  "POST /run",
+  "GET /version",
+  "GET /drift",
+  "GET /metrics"
+ ],
+ "evaluation": {
+  "baseline": null,
+  "agent_version": null,
+  "written_at": null,
+  "cases": null,
+  "success": null,
+  "cost_usd_per_resolution": null,
+  "tiers": {},
+  "note": "no golden set of its own; covered by the contract tests"
+ },
+ "approval": {
+  "state": "approved",
+  "approver": "support-operations"
+ },
+ "runtime_id": null,
+ "written_at": "2026-09-29T07:06:51.440595+00:00"
+}

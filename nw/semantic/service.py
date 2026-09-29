@@ -21,6 +21,14 @@ graph), NW_SEMANTIC_SHADOW_ARTIFACT (a second artifact, the same shapes of path,
 every request with its int8 graph, agreement counted, never served), NW_SEMANTIC_CAPTURE (a
 JSONL file of requests and predictions for backtests), NW_SEMANTIC_DRIFT_WINDOW,
 NW_SEMANTIC_DRIFT_MIN, NW_SEMANTIC_DRIFT_EVERY.
+
+On a platform (ADR 0008) the artifact comes from the registry: `NW_MODEL_URI` (`s3://`,
+`gs://`, `file://` or MLflow `models:/`) is fetched into a temp directory at startup and
+`NW_MODEL_VERSION` names the version served; `NW_SEMANTIC_ARTIFACT` stays the fallback.
+`/version` reports both with the tenant and the environment, which every `drift_alert` line
+carries too. The same app answers the Agent Platform's custom container contract
+(`AIP_HEALTH_ROUTE`, `AIP_PREDICT_ROUTE`, `{"instances": [...]}` in, `{"predictions": [...]}`
+out) for the live Vertex endpoint.
 """
 
 from __future__ import annotations
@@ -36,7 +44,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel, Field
 
-from nw.api import install_version_headers, mount_versioned, version_fields
+from nw.api import UNVERSIONED, install_version_headers, mount_versioned, version_fields
 from nw.auth import install_api_key
 from nw.config import settings
 from nw.logging import bind_correlation_id, configure_logging, get_logger, log_fields
@@ -46,6 +54,9 @@ from nw.ratelimit import install_rate_limit
 from nw.semantic.artifacts import resolve
 from nw.semantic.data import TAGS
 from nw.semantic.monitor import ALERT, SemanticDriftMonitor
+from nw.serving.download import ModelSource, model_source
+from nw.serving.identity import bind_identity, identity
+from nw.serving.vertex import install_vertex_routes
 from nw.telemetry import configure_tracing, instrument_app
 from nw.triage.features import PRIORITIES, ticket_text
 
@@ -97,6 +108,7 @@ class State:
     drift_every: int = 50
     seen: int = 0
     capture: Path | None = None
+    source: ModelSource | None = None  # where the served artifact came from
 
 
 state = State()
@@ -168,8 +180,13 @@ def _configure_mlops(artifact: Path, quantized: bool) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging(os.environ.get("NW_LOG_FORMAT", "json"))
+    bind_identity()
     start_metrics_export("semantic")
-    artifact = Path(os.environ.get("NW_SEMANTIC_ARTIFACT", "artifacts/semantic"))
+    # The registry's artifact when the platform injected NW_MODEL_URI, else the local path.
+    state.source = model_source(
+        fallback=Path(os.environ.get("NW_SEMANTIC_ARTIFACT", "artifacts/semantic"))
+    )
+    artifact = state.source.path
     index_dir = Path(os.environ["NW_INDEX"]) if os.environ.get("NW_INDEX") else None
     try:
         load_all(artifact, index_dir, quantized=os.environ.get("NW_QUANTIZED", "1") == "1")
@@ -227,8 +244,13 @@ def readyz() -> dict[str, str]:
 def version() -> dict:
     if not state.ready:
         raise HTTPException(503, "model not loaded")
+    source = state.source
     return {
-        "model_version": state.version,
+        # The registry's version when the platform pinned one, else the artifact's own.
+        "model_version": source.version if source and source.version else state.version,
+        "artifact_version": state.version,
+        "model_uri": source.uri if source else None,
+        **identity(),
         "format": state.fmt,
         "metadata": state.metadata,
         "shadow_version": state.shadow_version,
@@ -264,6 +286,7 @@ def _observe(ticket: TicketIn, priority: str, tags: list[str]) -> None:
                     window=snap.window,
                     threshold=ALERT,
                     model_version=state.version,
+                    **identity(),
                 ),
             )
 
@@ -304,8 +327,9 @@ def _capture(ticket: TicketIn, result: Classification, shadow: str | None) -> No
         f.write(json.dumps(record) + "\n")
 
 
-@app.post("/classify", response_model=Classification)
-def classify(ticket: TicketIn) -> Classification:
+def classify_ticket(ticket: TicketIn) -> Classification:
+    """One ticket through the graph with every side effect: metrics, drift window, shadow,
+    capture and the log line. Both the course route and the platform route call it."""
     if not state.ready or state.onnx is None or state.thresholds is None:
         REQUESTS.labels(endpoint="classify", outcome="not_ready").inc()
         raise HTTPException(503, "model not loaded")
@@ -344,9 +368,22 @@ def classify(ticket: TicketIn) -> Classification:
     return result
 
 
+@app.post("/classify", response_model=Classification)
+def classify(ticket: TicketIn) -> Classification:
+    return classify_ticket(ticket)
+
+
+def vertex_predict(instances: list[dict], parameters: dict) -> list[dict]:
+    """The Agent Platform contract: every instance is a ticket, every prediction a result."""
+    return [classify_ticket(TicketIn.model_validate(i)).model_dump() for i in instances]
+
+
 @app.get("/metrics")
 def metrics() -> Response:
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
-mount_versioned(app)  # /v1/... is the API; the bare paths are deprecated aliases for one release
+VERTEX_ROUTES = install_vertex_routes(app, vertex_predict, ready=lambda: state.ready)
+# /v1/... is the API; the bare paths are deprecated aliases for one release. The platform's
+# routes are addressed by their configured path and stay out of the mirror.
+mount_versioned(app, exclude=UNVERSIONED | VERTEX_ROUTES)

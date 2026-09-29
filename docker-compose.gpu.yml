@@ -1,0 +1,16 @@
+# gpu profile companion: gives the Ollama container the NVIDIA device and moves the Workhorse
+# to gpt-oss:120b (65 GB of weights: a 80 GB card or a Mac Studio running Ollama natively).
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile platform --profile gpu up -d
+#   make local-up GPU=1
+services:
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+  litellm:
+    environment:
+      NW_GATEWAY_WORKHORSE: ${NW_GATEWAY_WORKHORSE:-ollama_chat/gpt-oss:120b}

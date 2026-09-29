@@ -60,7 +60,7 @@ def test_monitor_warms_up_then_alerts_on_a_shifted_world(ticket_rows):
 
 
 # ----- gate -------------------------------------------------------------------------
-def _summary(version, macro_f1=0.7, p0_recall=0.9, ece=0.08, brier=0.01, sha="d1"):
+def summary(version, macro_f1=0.7, p0_recall=0.9, ece=0.08, brier=0.01, sha="d1"):
     return {
         "version": version,
         "data_sha256_12": sha,
@@ -76,19 +76,19 @@ def _summary(version, macro_f1=0.7, p0_recall=0.9, ece=0.08, brier=0.01, sha="d1
 
 
 def test_gate_first_model_needs_only_the_absolute_bars():
-    assert gate(_summary("v1"), None).passed
-    d = gate(_summary("v1", p0_recall=0.6), None)
+    assert gate(summary("v1"), None).passed
+    d = gate(summary("v1", p0_recall=0.6), None)
     assert not d.passed and "P0 recall" in d.reasons[0]
 
 
 def test_gate_blocks_regressions_and_data_changes():
-    prod = _summary("v1")
-    assert gate(_summary("v2", macro_f1=0.69), prod).passed
-    worse = gate(_summary("v2", macro_f1=0.6), prod)
+    prod = summary("v1")
+    assert gate(summary("v2", macro_f1=0.69), prod).passed
+    worse = gate(summary("v2", macro_f1=0.6), prod)
     assert not worse.passed and any("macro-F1" in r for r in worse.reasons)
-    moved = gate(_summary("v2", sha="d2"), prod)
+    moved = gate(summary("v2", sha="d2"), prod)
     assert not moved.passed and any("test split changed" in r for r in moved.reasons)
-    assert gate(_summary("v2", p0_recall=0.86), prod, GatePolicy(max_p0_recall_drop=0.05)).passed
+    assert gate(summary("v2", p0_recall=0.86), prod, GatePolicy(max_p0_recall_drop=0.05)).passed
 
 
 def test_promote_points_latest_and_records_the_decision(trained, tmp_path):
@@ -109,6 +109,43 @@ def test_run_is_recorded_and_the_card_is_written(trained):
     card = (out / model.version / "MODEL_CARD.md").read_text()
     assert model.version in card and "P0 recall" in card and "drift" in card.lower()
     assert render(model.metadata).startswith("# Model card")
+
+
+def test_registered_model_is_the_tenants_when_a_tenant_is_set(monkeypatch, tmp_path):
+    from nw.triage import tracking
+
+    monkeypatch.delenv("NW_TENANT", raising=False)
+    monkeypatch.delenv("NW_ENVIRONMENT", raising=False)
+    monkeypatch.chdir(tmp_path)  # no .env here
+    assert tracking.registered_model_name() == "northwind-triage"
+    monkeypatch.setenv("NW_TENANT", "alice")
+    assert tracking.registered_model_name() == "northwind-alice-triage"
+    monkeypatch.setenv("NW_ENVIRONMENT", "northwind-dev")
+    assert tracking.registered_model_name() == "northwind-dev-alice-triage"
+
+
+def test_mlflow_registers_under_the_tenant_name(tmp_path, monkeypatch):
+    pytest.importorskip("mlflow")
+    from nw.triage import tracking
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MLFLOW_DISABLE_AGENT_HINT", "1")
+    monkeypatch.setenv("NW_MLFLOW_URI", f"sqlite:///{tmp_path / 'mlflow.db'}")
+    monkeypatch.setenv("NW_TENANT", "alice")
+    monkeypatch.delenv("NW_ENVIRONMENT", raising=False)
+    artifact = tmp_path / "v1"
+    artifact.mkdir()
+    (artifact / "model.joblib").write_bytes(b"m")
+    run = {
+        "version": "v1",
+        "params": {"seed": 0},
+        "metrics": {"test_macro_f1": 0.5},
+        "data_sha256_12": "abc",
+        "git_sha": "def",
+    }
+    logged = tracking._log_to_mlflow(artifact, run)
+    assert logged["registered_model"] == "northwind-alice-triage"
+    assert tracking.set_production_alias("v1") is True
 
 
 def test_by_language_metrics_are_in_the_report(trained):

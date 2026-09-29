@@ -1,7 +1,6 @@
 {
   "app": ".venv/bin/python app.py",
   "context": {
-    "tier": "session",
     "project": "northwind",
     "@aws-cdk/core:newStyleStackSynthesis": true
   }

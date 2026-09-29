@@ -1,10 +1,14 @@
 # The agent's regression gate. Two jobs:
 #
-# - `offline` runs on every dispatch with no credentials: the fifteen adversarial cases go
-#   through the real loop, registry and scorer with a scripted model that follows each
-#   case's expectations, then the gate compares the result with data/golden/agent_baseline.json.
-#   It proves the loop, the tools, the scorer and the gate still agree; it proves nothing
-#   about a model. It costs nothing.
+# - `offline` runs on every dispatch with no credentials. First the two AgentOps checks:
+#   every agent in code has an approved use case whose allowed tools cover what it sees
+#   (`nw.agent.catalog --check`), and every agent card in data/agents matches the code it
+#   describes: tools, prompt hash, version (`nw.agent.registry --check`). Then the fifteen
+#   adversarial cases go through the real loop, registry and scorer with a scripted model
+#   that follows each case's expectations, and the tiered gate (tool, turn, session, system)
+#   compares the result with the bars in data/golden/agent_baseline.json. It proves the
+#   loop, the tools, the scorer, the catalog, the registry and the gate still agree; it
+#   proves nothing about a model. It costs nothing.
 # - `gate` runs against a real track and spends about 2.5 USD per run. It needs cloud
 #   credentials, so it is never part of the push CI: configure an OIDC role for GitHub
 #   Actions in your account and store its ARN as the repository secret AWS_ROLE_ARN (or
@@ -44,7 +48,15 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - run: uv python install 3.12
       - run: uv sync --locked --extra dev --extra agents
-      - name: The adversarial set through the loop with a scripted model, then the gate
+      - name: Every agent in code has an approved use case that allows its tools
+        env:
+          NW_TRACK: local
+        run: uv run python -m nw.agent.catalog --check
+      - name: Every agent card matches the code it describes
+        env:
+          NW_TRACK: local
+        run: uv run python -m nw.agent.registry --check
+      - name: The adversarial set through the loop with a scripted model, then the tiered gate
         env:
           NW_TRACK: local
         run: uv run python -m nw.agent.evaluate --provider fake --gate --out artifacts/agent_eval_offline.json --traces artifacts/traces-offline
@@ -76,7 +88,13 @@ jobs:
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-      - name: Run the adversarial set on the track and apply the gate
+      - name: The catalog and the registry, before any model is paid for
+        env:
+          NW_TRACK: ${{ inputs.track }}
+        run: |
+          uv run python -m nw.agent.catalog --check
+          uv run python -m nw.agent.registry --check
+      - name: Run the adversarial set on the track and apply the tiered gate (plus one Judge call per case)
         env:
           NW_TRACK: ${{ inputs.track }}
           NW_AWS_REGION: us-east-1

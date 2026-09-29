@@ -1,0 +1,103 @@
+# The use case catalog: what the agents are for, registered before anything is built.
+#
+# One entry per agent the course ships. `nw.agent.catalog --check` fails when an agent in
+# code has no approved entry here, or calls a tool its entry does not allow. The catalog is
+# the source of intent; the agent registry (data/agents/*.json) is the source of what runs.
+#
+# Fields
+#   id             the use case id, stable across versions
+#   agent          the agent name in code (the `agent` field on every trajectory)
+#   owner          the lifecycle role that owns the use case (see `nw.agent.catalog --roles`)
+#   business_outcome  what the support desk gets, in one sentence
+#   risk_class     low, medium or high; the oversight each class carries is in nw/agent/catalog.py
+#   allowed_tools  the only tools the agent may see; anything else in code fails the check
+#   data_classes   the data the agent touches, from the list in nw/agent/catalog.py
+#   approval       draft, pending or approved; only approved use cases run
+#   approver       who approved it (a role, a team or a person); high risk needs a co_approver
+
+use_cases:
+  - id: uc-triage
+    agent: triage
+    owner: product_owner
+    business_outcome: Every ticket has its customer, plan, priority and tags established before a person reads it.
+    risk_class: low
+    allowed_tools: [classify_urgency, classify_semantic, lookup_customer, check_entitlement]
+    data_classes: [ticket_text, customer_account, entitlements]
+    approval: approved
+    approver: support-operations
+
+  - id: uc-policy
+    agent: policy
+    owner: product_owner
+    business_outcome: Policy questions are answered from the current corpus with citations, or refused.
+    risk_class: low
+    allowed_tools: [search_policies]
+    data_classes: [ticket_text, policy_corpus]
+    approval: approved
+    approver: support-operations
+
+  - id: uc-resolution
+    agent: resolution
+    owner: product_owner
+    business_outcome: A drafted reply for the support agent, and an escalation proposal only when the priority or the policy requires one.
+    risk_class: medium
+    allowed_tools: [find_similar_tickets, escalate]
+    data_classes: [ticket_text, past_tickets, escalation_queue]
+    approval: approved
+    approver: support-operations
+
+  - id: uc-resolver
+    agent: resolver
+    owner: product_owner
+    business_outcome: One agent resolves a ticket end to end with the Project 1 to 3 services as tools; escalation is proposed, never executed.
+    risk_class: medium
+    allowed_tools:
+      - lookup_customer
+      - check_entitlement
+      - escalate
+      - search_policies
+      - classify_urgency
+      - classify_semantic
+      - find_similar_tickets
+    data_classes: [ticket_text, customer_account, entitlements, policy_corpus, past_tickets, escalation_queue]
+    approval: approved
+    approver: support-operations
+
+  - id: uc-orchestrator
+    agent: orchestrator
+    owner: product_owner
+    business_outcome: The three specialists combined into one reply, each specialist scaling and failing on its own.
+    risk_class: medium
+    allowed_tools: [ask_triage, ask_policy, ask_resolution]
+    data_classes: [ticket_text]
+    approval: approved
+    approver: support-operations
+
+  - id: uc-router
+    agent: router
+    owner: product_owner
+    business_outcome: The cheapest path that resolves a ticket; a confident P0 goes to the duty manager without a model call.
+    risk_class: medium
+    allowed_tools:
+      - lookup_customer
+      - check_entitlement
+      - escalate
+      - search_policies
+      - classify_urgency
+      - classify_semantic
+      - find_similar_tickets
+    data_classes: [ticket_text, customer_account, entitlements, policy_corpus, past_tickets, escalation_queue]
+    approval: approved
+    approver: support-operations
+
+  # Registered before it is built: the catalog exists so this conversation happens first.
+  # No agent in code carries this name, and the check reports it as unbuilt, not as a failure.
+  - id: uc-refund
+    agent: refund
+    owner: product_owner
+    business_outcome: Refunds inside the policy limit are issued without a person; anything else goes to billing.
+    risk_class: high
+    allowed_tools: [lookup_customer, search_policies, escalate]
+    data_classes: [ticket_text, customer_account, policy_corpus, escalation_queue]
+    approval: draft
+    approver: null

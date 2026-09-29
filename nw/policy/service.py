@@ -17,6 +17,13 @@ NW_POLICY_RERANK, NW_POLICY_CACHE_TTL_S (0 is off) and NW_POLICY_CACHE_SIZE,
 NW_POLICY_FEEDBACK (JSONL path), NW_POLICY_CAPTURE (JSONL of every /ask),
 NW_POLICY_DRIFT_WINDOW, NW_POLICY_DRIFT_MIN, NW_POLICY_DRIFT_EVERY.
 
+Retrieval on a platform (ADR 0008): `NW_RETRIEVER=knowledge-base|rag-engine|qdrant` puts dense
+retrieval on the track's vector store through `nw.platform.retrievers.PlatformRetriever` (the
+corpus id from `NW_KNOWLEDGE_BASE_ID`, `NW_RAG_CORPUS` or `NW_QDRANT_COLLECTION`); the default
+`inprocess` keeps the index in `NW_POLICY_INDEX`. `/version` reports the retriever kind and the
+corpus or knowledge base id beside the manifest. The gateway key comes from
+`NW_GATEWAY_KEY_SECRET_ARN` or `NW_GATEWAY_KEY_SECRET_NAME` when `NW_GATEWAY_KEY` is unset.
+
 Input screening: with NW_GUARDRAIL_ID (Bedrock Guardrails) or NW_MODEL_ARMOR_TEMPLATE (Model
 Armor) set, `/ask` screens the question before retrieval and refuses with reason `screened`
 when it is blocked. The question is redacted before it is cached, logged or sent to the
@@ -46,15 +53,19 @@ from nw.llm import LLMClient, prompts
 from nw.llm.providers import make_provider
 from nw.logging import bind_correlation_id, configure_logging, get_logger, log_fields
 from nw.metrics_export import start_metrics_export
+from nw.platform.retrievers import INPROCESS, corpus_id, platform_retriever, retriever_kind
 from nw.policy.answer import ANSWER_PROMPT, SCREENED, Answer, answer, refusal, safe_question
 from nw.policy.cache import ResponseCache
+from nw.policy.chunking import load_chunks
 from nw.policy.feedback import DEFAULT_PATH as FEEDBACK_DEFAULT
 from nw.policy.feedback import FeedbackIn, append_feedback
-from nw.policy.manifest import is_stale
+from nw.policy.manifest import is_stale, read_manifest
 from nw.policy.monitor import ALERT, PolicyDriftMonitor
 from nw.policy.redact import redact_fields
-from nw.policy.retrieval import PolicyIndex
+from nw.policy.retrieval import PolicyIndex, Retriever
 from nw.ratelimit import install_rate_limit
+from nw.serving.gateway import gateway_fields, resolve_gateway_key
+from nw.serving.identity import bind_identity, identity
 from nw.telemetry import configure_tracing, instrument_app
 
 log = get_logger("nw.policy.service")
@@ -90,8 +101,11 @@ class AskResponse(Answer):
 
 
 class State:
-    index: PolicyIndex | None = None
+    index: Retriever | None = None
     client: LLMClient | None = None
+    retriever_kind: str = INPROCESS
+    corpus_id: str | None = None
+    settings: Any = None  # the settings the client was built with, gateway key resolved
     min_score: float = 0.0
     ready = False
     stale: bool | None = None
@@ -112,6 +126,7 @@ state = State()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging(os.environ.get("NW_LOG_FORMAT", "json"))
+    bind_identity()
     start_metrics_export("policy")
     index_dir = Path(os.environ.get("NW_POLICY_INDEX", "artifacts/policy"))
     state.min_score = float(os.environ.get("NW_POLICY_MIN_SCORE", "0.0"))
@@ -121,16 +136,35 @@ async def lifespan(app: FastAPI):
         reranker = (
             CrossEncoderReranker() if os.environ.get("NW_POLICY_RERANK", "1") == "1" else None
         )
-        state.index = PolicyIndex.load(
-            index_dir, real_embeddings(), index_dir / "chunks.jsonl", reranker=reranker
-        )
-        s = settings()
+        state.retriever_kind = retriever_kind()
+        state.corpus_id = corpus_id(state.retriever_kind)
+        if state.retriever_kind == INPROCESS:
+            state.index = PolicyIndex.load(
+                index_dir, real_embeddings(), index_dir / "chunks.jsonl", reranker=reranker
+            )
+        else:
+            # Dense retrieval on the platform's store; the chunks and the manifest, when the
+            # image ships them, give the hits their full metadata and the drift baseline.
+            chunks_path = index_dir / "chunks.jsonl"
+            state.index = platform_retriever(
+                settings(),
+                chunks=load_chunks(chunks_path) if chunks_path.exists() else None,
+                reranker=reranker,
+                manifest=read_manifest(index_dir),
+            )
+        s = resolve_gateway_key(settings())
+        state.settings = s
         state.client = LLMClient(make_provider(s), settings=s)
         state.ready = True
         READY.set(1)
         log.info(
             "index loaded",
-            extra=log_fields(chunks=len(state.index.chunks), rerank=reranker is not None),
+            extra=log_fields(
+                chunks=len(state.index.chunks),
+                rerank=reranker is not None,
+                retriever=state.retriever_kind,
+                corpus_id=state.corpus_id,
+            ),
         )
     except Exception as exc:  # noqa: BLE001
         state.ready = False
@@ -212,7 +246,9 @@ def healthz() -> dict[str, str]:
 def readyz() -> dict[str, str | int]:
     if not state.ready or state.index is None:
         raise HTTPException(503, "index not loaded")
-    return {"status": "ready", "chunks": len(state.index.chunks)}
+    size = getattr(state.index, "size", None)
+    chunks = len(state.index.chunks) or (size() if callable(size) else 0)
+    return {"status": "ready", "chunks": chunks}
 
 
 def _model_id() -> str:
@@ -228,8 +264,16 @@ def version() -> dict[str, Any]:
     manifest = {k: v for k, v in state.index.manifest.items() if k != "baseline"}
     built = manifest.get("prompt_versions") or {}
     current = prompts.versions()
+    describe = getattr(state.index, "describe", None)
     return {
         "manifest": manifest,
+        "retriever": {
+            "kind": state.retriever_kind,
+            "corpus_id": state.corpus_id,
+            **(describe() if callable(describe) else {}),
+        },
+        **identity(),
+        **gateway_fields(state.settings or settings()),
         "index_stale": state.stale,
         "corpus": str(state.corpus),
         "prompt_versions": current,
@@ -278,6 +322,7 @@ def _observe(top_confidence: float, result: Answer) -> None:
                     threshold=ALERT,
                     index_corpus_sha=state.index.manifest_hash if state.index else None,
                     prompt_version=ANSWER_PROMPT.version,
+                    **identity(),
                 ),
             )
 

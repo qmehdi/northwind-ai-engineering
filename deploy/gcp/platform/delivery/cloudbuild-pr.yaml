@@ -1,0 +1,18 @@
+# Pull request checks on Cloud Build: the same green as GitHub Actions, run by the platform
+# so a reviewer sees it next to the release. No image is built here (ADR 0012).
+steps:
+  - id: checks
+    name: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        uv sync --locked --extra dev
+        uv run ruff format --check .
+        uv run ruff check .
+        uv run pytest -q tests/platform
+options:
+  logging: CLOUD_LOGGING_ONLY
+substitutions:
+  _ENVIRONMENT: northwind
+timeout: 1200s

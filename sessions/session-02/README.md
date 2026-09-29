@@ -3,7 +3,11 @@
 What you build: Project 1, the ticket triage scoring service in `nw/triage`, and the MLOps loop around it: a data contract, a promotion gate, run tracking, a model card, drift monitoring, shadow mode and a retraining workflow.
 
 ```bash
-make session02                                          # 29 tests
+make session02                                          # 33 tests; the skeleton passes 18
+make pipeline-run-local PIPELINE=triage                 # data check, train, gate, register on the Kubeflow local runner
+make pipeline-submit PIPELINE=triage [ARGS="--min-p0-recall 0.9"]   # the same pipeline on your track's platform
+make pipeline-definition-aws PIPELINE=triage ROLE=... IMAGE=... BUCKET=... TENANT=...   # AWS: the SageMaker definition, no call
+make package-sagemaker / baseline-sagemaker / serve-vertex   # the registry's packaging per track
 make data-check                                         # validate data/tickets.jsonl, write the data profile
 make train-triage                                       # validate, train, calibrate, record, card, gate; exit 1 on GATE FAILED
 make runs                                               # the experiment table from artifacts/triage/runs.jsonl
@@ -13,7 +17,7 @@ make serve-triage                                       # the service on :8001, 
 make backtest-triage A=artifacts/triage/latest B=<dir>  # two versions on the test split
 ```
 
-Run order in the session: `data-check`, then `train-triage` after each of the four model changes (the gate passes on the fourth), `runs` and `mlflow-ui`, the card and `promotions.jsonl`, the service with `/drift`, optionally a `--no-promote --target-recall 0.95` candidate as `NW_TRIAGE_SHADOW_MODEL` and `backtest-triage`, then `image-triage`.
+Run order in the part: the four model changes by hand, then the pipeline, the registry (`platform.registry.versions`), the approval (`set_stage(..., Stage.APPROVED, reason)`) and the endpoint (`platform.endpoints.deploy` and `status`). Before that, by hand: `data-check`, then `train-triage` after each of the four model changes (the gate passes on the fourth), `runs` and `mlflow-ui`, the card and `promotions.jsonl`, the service with `/drift`, optionally a `--no-promote --target-recall 0.95` candidate as `NW_TRIAGE_SHADOW_MODEL` and `backtest-triage`, then `image-triage`.
 
 Files you edit in this session:
 

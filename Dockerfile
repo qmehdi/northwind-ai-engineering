@@ -6,6 +6,10 @@
 #   docker build --build-arg APP=nw.policy.service:app   --build-arg ARTIFACTS="policy" --build-arg HF_MODELS=1 -t nw-policy .
 #   docker build --build-arg APP=nw.agent.service:app    --build-arg ARTIFACTS="triage semantic index policy" --build-arg HF_MODELS=1 -t nw-agent .
 #   docker build --build-arg APP=mcp --build-arg ARTIFACTS="triage semantic index policy" --build-arg HF_MODELS=1 -t nw-mcp .
+#   docker build --build-arg APP=pipelines --build-arg ARTIFACTS="" --build-arg EXTRAS="--extra dl --extra mlops --extra pipelines" -t nw-pipelines .
+#     (the pipelines image runs the steps under Kubeflow, Vertex or SageMaker; it carries kfp, the production summaries in
+#      data/golden as a fallback for the ones the deploy copies to <artifacts>/baselines/, and the Project 2 base encoder.
+#      Built by make local-up, scripts/images_gcp.sh (plus --extra platform-gcp), make images-aws and the AWS delivery pipeline)
 #
 # Weights and indexes are loaded once at startup, never per request. Nothing in
 # the image reaches the Hub at runtime: HF_MODELS=1 pre-downloads the embedder and
@@ -28,10 +32,11 @@ FROM ${PYTHON_IMAGE} AS builder
 COPY --from=uv /uv /bin/uv
 WORKDIR /app
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never
-COPY pyproject.toml uv.lock .python-version ./
-RUN uv sync --frozen --no-dev --no-install-project --extra dl --extra agents --extra agents-aws --extra agents-gcp
+COPY pyproject.toml uv.lock .python-version README.md ./
+ARG EXTRAS="--extra dl --extra agents --extra agents-aws --extra agents-gcp"
+RUN uv sync --frozen --no-dev --no-install-project $EXTRAS
 COPY nw ./nw
-RUN uv sync --frozen --no-dev --extra dl --extra agents --extra agents-aws --extra agents-gcp
+RUN uv sync --frozen --no-dev $EXTRAS
 
 # Pick the artifacts this service needs. Training checkpoints and the fp32 ONNX graph
 # never ship; the int8 graph and the indexes do.
@@ -58,6 +63,9 @@ COPY --from=builder --chown=nw:nw /app/.venv /app/.venv
 COPY --from=builder --chown=nw:nw /app/nw /app/nw
 COPY --from=artifacts --chown=nw:nw /out/ /app/artifacts/
 COPY --chown=nw:nw data/accounts.json /app/data/accounts.json
+# The committed production summaries (two small files): a pipeline step run with the repo
+# defaults finds them where `nw.pipelines.params` says. .dockerignore lets only these through.
+COPY --chown=nw:nw data/golden/triage_production.json data/golden/semantic_production.json /app/data/golden/
 ENV PATH="/app/.venv/bin:$PATH" HF_HOME=/app/hf HF_HUB_OFFLINE=0 \
     NW_TRIAGE_MODEL=/app/artifacts/triage/latest NW_SEMANTIC_ARTIFACT=/app/artifacts/semantic \
     NW_INDEX=/app/artifacts/index NW_POLICY_INDEX=/app/artifacts/policy \
@@ -67,8 +75,24 @@ RUN if [ "$HF_MODELS" = "1" ]; then python -c "\
 from sentence_transformers import SentenceTransformer, CrossEncoder; \
 SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2'); \
 CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')" ; fi
+# The pipelines image fine-tunes Project 2 offline, so its base encoder is baked in too.
+RUN if [ "$APP" = "pipelines" ]; then python -c "\
+from transformers import AutoModel, AutoTokenizer; \
+AutoTokenizer.from_pretrained('distilbert-base-uncased'); AutoModel.from_pretrained('distilbert-base-uncased')" ; fi
 ENV HF_HUB_OFFLINE=1
 EXPOSE ${PORT}
 HEALTHCHECK --interval=15s --timeout=3s --start-period=60s CMD python -c "import urllib.request,os;urllib.request.urlopen(f'http://127.0.0.1:{os.environ[\"PORT\"]}/readyz')" || exit 1
-# The MCP image runs the server directly; every other image runs uvicorn.
-CMD ["sh", "-c", "if [ \"$NW_APP\" = mcp ]; then exec python -m nw.agent.mcp_server; else exec uvicorn ${NW_APP} --host 0.0.0.0 --port ${PORT} --timeout-graceful-shutdown 20; fi"]
+# The MCP image runs the server directly; every other image runs uvicorn, on AIP_HTTP_PORT when
+# a Vertex endpoint set it (the Agent Platform's custom container contract) and on PORT otherwise.
+CMD ["sh", "-c", "if [ \"$NW_APP\" = mcp ]; then exec python -m nw.agent.mcp_server; else exec uvicorn ${NW_APP} --host 0.0.0.0 --port ${AIP_HTTP_PORT:-$PORT} --timeout-graceful-shutdown 20; fi"]
+
+# The serving target for a Vertex endpoint (ADR 0008): the same runtime, no artifact baked in,
+# listening on AIP_HTTP_PORT and answering AIP_HEALTH_ROUTE and AIP_PREDICT_ROUTE beside the
+# course routes. The platform names the artifact in AIP_STORAGE_URI (honoured like NW_MODEL_URI)
+# when the registered model carries one; the registry attaches the image through
+# NW_GCP_SERVING_IMAGE. The default build (no --target) is still the runtime stage above.
+#   docker build --target serving --build-arg APP=nw.triage.service:app --build-arg ARTIFACTS="" -t nw-triage-serving .
+#   docker build --target serving --build-arg APP=nw.semantic.service:app --build-arg ARTIFACTS="" -t nw-semantic-serving .
+FROM runtime AS serving
+ENV PORT=8080 AIP_HTTP_PORT=8080 AIP_HEALTH_ROUTE=/health AIP_PREDICT_ROUTE=/predict
+EXPOSE 8080

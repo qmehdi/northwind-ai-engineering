@@ -1,0 +1,54 @@
+{
+ "name": "policy",
+ "kind": "specialist",
+ "track": "local",
+ "agent_version": "34c68183c1e4",
+ "prompt": "system@83bd0a865e73",
+ "prompt_hash": "83bd0a865e73",
+ "tools_version": "e1b56b3f2f81",
+ "tools": [
+  {
+   "name": "search_policies",
+   "version": "e1b56b3f2f81",
+   "requires_approval": false
+  }
+ ],
+ "models": {
+  "workhorse": "gpt-oss:20b"
+ },
+ "use_case": "uc-policy",
+ "owner": "product_owner",
+ "business_outcome": "Policy questions are answered from the current corpus with citations, or refused.",
+ "risk_class": "low",
+ "oversight": {
+  "actions": "read-only tools",
+  "human": "none in the loop; sampled trace review after the fact (make review)",
+  "approvers": "one"
+ },
+ "data_classes": [
+  "ticket_text",
+  "policy_corpus"
+ ],
+ "endpoints": [
+  "POST /run",
+  "GET /version",
+  "GET /drift",
+  "GET /metrics"
+ ],
+ "evaluation": {
+  "baseline": null,
+  "agent_version": null,
+  "written_at": null,
+  "cases": null,
+  "success": null,
+  "cost_usd_per_resolution": null,
+  "tiers": {},
+  "note": "no golden set of its own; covered by the contract tests"
+ },
+ "approval": {
+  "state": "approved",
+  "approver": "support-operations"
+ },
+ "runtime_id": null,
+ "written_at": "2026-09-29T07:06:51.441779+00:00"
+}

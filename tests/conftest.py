@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import os
+
 import pytest
+
+# The suite never reaches a network: every role resolves to the fake provider and the
+# `fake-*` model ids unless a test sets `provider` itself.
+os.environ.setdefault("NW_PROVIDER", "fake")
 
 from nw.config import Settings, Track
 from nw.llm.client import LLMClient

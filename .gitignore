@@ -20,3 +20,5 @@ deploy/gcp/**/.terraform/
 deploy/gcp/**/tfplan
 deploy/gcp/**/.terraform.lock.hcl
 deploy/aws/node_modules/
+mlruns/
+mlartifacts/

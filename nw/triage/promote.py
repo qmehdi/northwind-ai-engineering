@@ -47,7 +47,7 @@ class Decision:
     decided_at: str = ""
 
 
-def _summary(metadata: dict[str, Any]) -> dict[str, Any]:
+def summary(metadata: dict[str, Any]) -> dict[str, Any]:
     t = metadata["metrics"]["test"]
     return {
         "version": metadata["version"],
@@ -60,7 +60,7 @@ def _summary(metadata: dict[str, Any]) -> dict[str, Any]:
 def gate(
     candidate: dict[str, Any], production: dict[str, Any] | None, policy: GatePolicy | None = None
 ) -> Decision:
-    """Compare two production summaries (see `_summary`); None means the first model."""
+    """Compare two production summaries (see `summary`); None means the first model."""
     policy = policy or GatePolicy()
     c = candidate["test"]
     reasons: list[str] = []
@@ -109,7 +109,7 @@ def current_production(out: Path, summary_path: Path = PRODUCTION_SUMMARY) -> di
     """The served model if the artifact tree has one, else the committed summary, else None."""
     latest = out / "latest"
     if (latest / "metadata.json").exists():
-        return _summary(read_metadata(latest))
+        return summary(read_metadata(latest))
     if summary_path.exists():
         return json.loads(summary_path.read_text(encoding="utf-8"))
     return None
@@ -125,7 +125,7 @@ def promote(
     write_summary: bool = True,
 ) -> Decision:
     cand_dir = out / candidate_version
-    cand = _summary(read_metadata(cand_dir))
+    cand = summary(read_metadata(cand_dir))
     prod = current_production(out, summary_path)
     if prod and prod["version"] == cand["version"]:
         prod = None  # promoting the served model again is a no-op comparison

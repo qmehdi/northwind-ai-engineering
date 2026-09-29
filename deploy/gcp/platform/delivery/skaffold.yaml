@@ -1,0 +1,17 @@
+# Cloud Deploy renders these manifests for the live target; the image placeholders
+# (nw-triage, ...) are replaced by the digests given to `gcloud deploy releases create`.
+# @PLACEHOLDERS@ are filled by cloudbuild-main.yaml or scripts/deploy_gcp.sh release.
+apiVersion: skaffold/v4beta7
+kind: Config
+metadata:
+  name: northwind-live
+profiles:
+  - name: live
+    manifests:
+      rawYaml:
+        - run-triage.yaml
+        - run-semantic.yaml
+        - run-policy.yaml
+        - run-agent.yaml
+deploy:
+  cloudrun: {}

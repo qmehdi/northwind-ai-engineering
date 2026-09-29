@@ -5,8 +5,9 @@ parameters that matter (subset, epochs, learning rate, LoRA rank, alpha, dropout
 length, seed), the validation metrics per epoch, the test metrics of the best epoch, the
 seconds it took and the device. That file is the experiment log the course can always
 read, with no server. When MLflow is installed (the `mlops` extra) the same run is logged
-to the experiment `semantic` and registered as a version of `northwind-semantic` with the
-alias `candidate`; the promotion gate moves the alias `production`.
+to the experiment `semantic` and registered as a version of `registered_model_name()`
+(`<environment>-<tenant>-semantic` when `NW_TENANT` is set, `northwind-semantic` when not) with
+the alias `candidate`; the promotion gate moves the alias `production`.
 
     uv run python -m nw.semantic.tracking            # the runs table
     make mlflow-ui                                   # the MLflow UI over the same store
@@ -22,9 +23,10 @@ from typing import Any
 
 from nw.logging import get_logger
 from nw.triage.tracking import mlflow_uri
+from nw.triage.tracking import registered_model_name as _registered_model_name
 
 log = get_logger("nw.semantic.tracking")
-MODEL_NAME = "northwind-semantic"
+MODEL_NAME = "northwind-semantic"  # the registered model when no tenant is set
 RUNS = Path("artifacts/semantic/runs.jsonl")
 PARAMS = ("subset", "epochs", "lr", "r", "alpha", "dropout", "max_length", "seed")
 # What goes to the registry: the small files. Checkpoints and graphs stay on disk.
@@ -35,6 +37,10 @@ LOGGED_FILES = (
     "tag_thresholds.npy",
     "MODEL_CARD.md",
 )
+
+
+def registered_model_name() -> str:
+    return _registered_model_name("semantic")
 
 
 def run_params(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -106,18 +112,21 @@ def _log_to_mlflow(artifact_dir: Path, run: dict[str, Any]) -> dict[str, Any] | 
             if (artifact_dir / name).exists():
                 mlflow.log_artifact(str(artifact_dir / name), artifact_path="model")
         client = mlflow.MlflowClient()
+        name = registered_model_name()
         try:
-            client.create_registered_model(MODEL_NAME)
+            client.create_registered_model(name)
         except Exception:  # noqa: BLE001  already exists
             pass
         version = client.create_model_version(
-            MODEL_NAME, source=f"{active.info.artifact_uri}/model", run_id=active.info.run_id
+            name, source=f"{active.info.artifact_uri}/model", run_id=active.info.run_id
         )
-        client.set_registered_model_alias(MODEL_NAME, "candidate", version.version)
-        client.set_model_version_tag(
-            MODEL_NAME, version.version, "artifact_version", run["version"]
-        )
-    return {"run_id": active.info.run_id, "registered_version": int(version.version)}
+        client.set_registered_model_alias(name, "candidate", version.version)
+        client.set_model_version_tag(name, version.version, "artifact_version", run["version"])
+    return {
+        "run_id": active.info.run_id,
+        "registered_model": name,
+        "registered_version": int(version.version),
+    }
 
 
 def set_production_alias(artifact_version: str) -> bool:
@@ -128,9 +137,10 @@ def set_production_alias(artifact_version: str) -> bool:
         return False
     mlflow.set_tracking_uri(mlflow_uri())
     client = mlflow.MlflowClient()
-    for mv in client.search_model_versions(f"name='{MODEL_NAME}'"):
+    name = registered_model_name()
+    for mv in client.search_model_versions(f"name='{name}'"):
         if mv.tags.get("artifact_version") == artifact_version:
-            client.set_registered_model_alias(MODEL_NAME, "production", mv.version)
+            client.set_registered_model_alias(name, "production", mv.version)
             return True
     return False
 

@@ -13,6 +13,14 @@ Endpoints:
 Environment, all optional: NW_TRIAGE_SHADOW_MODEL (a second artifact scored on every request,
 agreement counted, never served), NW_TRIAGE_CAPTURE (a JSONL file of requests and predictions
 for backtests), NW_TRIAGE_DRIFT_WINDOW, NW_TRIAGE_DRIFT_MIN, NW_TRIAGE_DRIFT_EVERY.
+
+On a platform (ADR 0008) the model comes from the registry: `NW_MODEL_URI` (`s3://`, `gs://`,
+`file://` or MLflow `models:/`) is fetched into a temp directory at startup and
+`NW_MODEL_VERSION` names the version served; `NW_TRIAGE_MODEL` stays the fallback. `/version`
+reports both with the tenant and the environment, which every `drift_alert` line carries too.
+The same app answers the Agent Platform's custom container contract (`AIP_HEALTH_ROUTE`,
+`AIP_PREDICT_ROUTE`, `{"instances": [...]}` in, `{"predictions": [...]}` out) for the live
+Vertex endpoint.
 """
 
 from __future__ import annotations
@@ -27,13 +35,16 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel, Field
 
-from nw.api import install_version_headers, mount_versioned, version_fields
+from nw.api import UNVERSIONED, install_version_headers, mount_versioned, version_fields
 from nw.auth import install_api_key
 from nw.config import settings
 from nw.logging import bind_correlation_id, configure_logging, get_logger, log_fields
 from nw.metrics_export import start_metrics_export
 from nw.policy.redact import redact_fields
 from nw.ratelimit import install_rate_limit
+from nw.serving.download import ModelSource, model_source
+from nw.serving.identity import bind_identity, identity
+from nw.serving.vertex import install_vertex_routes
 from nw.telemetry import configure_tracing, instrument_app
 from nw.triage.model import TriageModel, TriageResult
 from nw.triage.monitor import ALERT, DriftMonitor
@@ -69,6 +80,7 @@ class State:
     drift_every: int = 50
     seen: int = 0
     capture: Path | None = None
+    source: ModelSource | None = None  # where the served artifact came from
 
 
 state = State()
@@ -84,8 +96,13 @@ def load_model(path: Path) -> TriageModel:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging(os.environ.get("NW_LOG_FORMAT", "json"))
+    bind_identity()
     start_metrics_export("triage")
-    path = Path(os.environ.get("NW_TRIAGE_MODEL", "artifacts/triage/latest"))
+    # The registry's artifact when the platform injected NW_MODEL_URI, else the local path.
+    state.source = model_source(
+        fallback=Path(os.environ.get("NW_TRIAGE_MODEL", "artifacts/triage/latest"))
+    )
+    path = state.source.path
     state.model, state.ready = load_model(path), True  # Step 6: and if it fails?
     _configure_mlops(path)
     yield
@@ -158,8 +175,13 @@ def version() -> dict:
     if state.model is None:
         raise HTTPException(status_code=503, detail="model not loaded")
     meta = {k: v for k, v in state.model.metadata.items() if k != "metrics"}
+    source = state.source
     return {
-        "model_version": state.model.version,
+        # The registry's version when the platform pinned one, else the artifact's own.
+        "model_version": (source.version if source and source.version else state.model.version),
+        "artifact_version": state.model.version,
+        "model_uri": source.uri if source else None,
+        **identity(),
         "p0_threshold": state.model.p0_threshold,
         "metadata": meta,
         "shadow_version": state.shadow.version if state.shadow else None,
@@ -193,6 +215,7 @@ def _observe(ticket: TicketIn, result: TriageResult) -> None:
                     window=snap.window,
                     threshold=ALERT,
                     model_version=state.model.version if state.model else None,
+                    **identity(),
                 ),
             )
 
@@ -231,8 +254,9 @@ def _capture(ticket: TicketIn, result: TriageResult, shadow: str | None) -> None
         f.write(json.dumps(record) + "\n")
 
 
-@app.post("/triage", response_model=TriageResult)
-def triage(ticket: TicketIn) -> TriageResult:
+def score(ticket: TicketIn) -> TriageResult:
+    """One ticket through the model with every side effect: metrics, drift window, shadow,
+    capture and the log line. Both the course route and the platform route call it."""
     if state.model is None:
         REQUESTS.labels(outcome="not_ready").inc()
         raise HTTPException(status_code=503, detail="model not loaded")
@@ -255,9 +279,22 @@ def triage(ticket: TicketIn) -> TriageResult:
     return result
 
 
+@app.post("/triage", response_model=TriageResult)
+def triage(ticket: TicketIn) -> TriageResult:
+    return score(ticket)
+
+
+def vertex_predict(instances: list[dict], parameters: dict) -> list[dict]:
+    """The Agent Platform contract: every instance is a ticket, every prediction a result."""
+    return [score(TicketIn.model_validate(i)).model_dump() for i in instances]
+
+
 @app.get("/metrics")
 def metrics() -> Response:
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
-mount_versioned(app)  # /v1/... is the API; the bare paths are deprecated aliases for one release
+VERTEX_ROUTES = install_vertex_routes(app, vertex_predict, ready=lambda: state.ready)
+# /v1/... is the API; the bare paths are deprecated aliases for one release. The platform's
+# routes are addressed by their configured path and stay out of the mirror.
+mount_versioned(app, exclude=UNVERSIONED | VERTEX_ROUTES)

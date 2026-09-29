@@ -1,0 +1,633 @@
+{
+ "uid": "northwind-course",
+ "title": "Northwind support intelligence",
+ "tags": [
+  "northwind",
+  "course"
+ ],
+ "timezone": "browser",
+ "schemaVersion": 39,
+ "version": 1,
+ "refresh": "30s",
+ "editable": true,
+ "time": {
+  "from": "now-1h",
+  "to": "now"
+ },
+ "templating": {
+  "list": []
+ },
+ "annotations": {
+  "list": []
+ },
+ "panels": [
+  {
+   "id": 1,
+   "type": "row",
+   "title": "Traffic and latency",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 0,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 2,
+   "type": "timeseries",
+   "title": "Requests per second by service",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 1,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum by (service) (rate(nw_triage_requests_total[5m]))",
+     "legendFormat": "triage"
+    },
+    {
+     "refId": "B",
+     "expr": "sum by (service) (rate(nw_semantic_requests_total[5m]))",
+     "legendFormat": "semantic"
+    },
+    {
+     "refId": "C",
+     "expr": "sum by (service) (rate(nw_policy_requests_total[5m]))",
+     "legendFormat": "policy"
+    },
+    {
+     "refId": "D",
+     "expr": "sum by (service) (rate(nw_agent_runs_total[5m]))",
+     "legendFormat": "agent runs"
+    }
+   ]
+  },
+  {
+   "id": 3,
+   "type": "timeseries",
+   "title": "Latency p95",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 1,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "histogram_quantile(0.95, sum by (le) (rate(nw_triage_latency_seconds_bucket[5m])))",
+     "legendFormat": "triage"
+    },
+    {
+     "refId": "B",
+     "expr": "histogram_quantile(0.95, sum by (le) (rate(nw_policy_latency_seconds_bucket[5m])))",
+     "legendFormat": "policy"
+    }
+   ]
+  },
+  {
+   "id": 4,
+   "type": "timeseries",
+   "title": "Rate limited and errors",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 9,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum by (service) (rate(nw_rate_limited_total[5m]))",
+     "legendFormat": "429 {{service}}"
+    },
+    {
+     "refId": "B",
+     "expr": "sum by (outcome) (rate(nw_triage_requests_total{outcome!=\"ok\"}[5m]))",
+     "legendFormat": "triage {{outcome}}"
+    },
+    {
+     "refId": "C",
+     "expr": "sum by (outcome) (rate(nw_policy_requests_total{outcome!=\"ok\"}[5m]))",
+     "legendFormat": "policy {{outcome}}"
+    }
+   ]
+  },
+  {
+   "id": 5,
+   "type": "stat",
+   "title": "Ready and loaded",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 9,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "bool_on_off"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "nw_triage_model_loaded",
+     "legendFormat": "triage model loaded"
+    },
+    {
+     "refId": "B",
+     "expr": "nw_semantic_model_loaded",
+     "legendFormat": "semantic model loaded"
+    },
+    {
+     "refId": "C",
+     "expr": "nw_policy_ready",
+     "legendFormat": "policy ready"
+    },
+    {
+     "refId": "D",
+     "expr": "nw_agent_ready",
+     "legendFormat": "agent ready {{service}}"
+    },
+    {
+     "refId": "E",
+     "expr": "nw_agent_disabled",
+     "legendFormat": "agent kill switch {{service}}"
+    }
+   ]
+  },
+  {
+   "id": 6,
+   "type": "row",
+   "title": "Drift, one PSI per service (the /drift endpoints)",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 17,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 7,
+   "type": "timeseries",
+   "title": "Drift PSI",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 18,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {},
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "orange",
+        "value": 0.1
+       },
+       {
+        "color": "red",
+        "value": 0.25
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "max by (feature) (nw_triage_drift_psi)",
+     "legendFormat": "triage {{feature}}"
+    },
+    {
+     "refId": "B",
+     "expr": "max by (feature) (nw_semantic_drift_psi)",
+     "legendFormat": "semantic {{feature}}"
+    },
+    {
+     "refId": "C",
+     "expr": "max by (feature) (nw_policy_drift_psi)",
+     "legendFormat": "policy {{feature}}"
+    },
+    {
+     "refId": "D",
+     "expr": "max by (service) (nw_agent_drift_psi)",
+     "legendFormat": "agent {{service}}"
+    }
+   ]
+  },
+  {
+   "id": 8,
+   "type": "stat",
+   "title": "Drift level (0 ok, 1 watch, 2 alert, -1 warming up)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 18,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "nw_triage_drift_level",
+     "legendFormat": "triage"
+    },
+    {
+     "refId": "B",
+     "expr": "nw_semantic_drift_level",
+     "legendFormat": "semantic"
+    },
+    {
+     "refId": "C",
+     "expr": "nw_policy_drift_level",
+     "legendFormat": "policy"
+    },
+    {
+     "refId": "D",
+     "expr": "max by (service) (nw_agent_drift_level)",
+     "legendFormat": "agent {{service}}"
+    }
+   ]
+  },
+  {
+   "id": 9,
+   "type": "row",
+   "title": "Policy service (Project 3)",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 26,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 10,
+   "type": "timeseries",
+   "title": "Refusal rate in the window and cache hits",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 27,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "nw_policy_refusal_rate_window",
+     "legendFormat": "refusal rate"
+    },
+    {
+     "refId": "B",
+     "expr": "sum by (result) (rate(nw_policy_cache_total[5m]))",
+     "legendFormat": "cache {{result}}"
+    },
+    {
+     "refId": "C",
+     "expr": "nw_policy_index_stale",
+     "legendFormat": "index stale"
+    }
+   ]
+  },
+  {
+   "id": 11,
+   "type": "timeseries",
+   "title": "Tokens and spend",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 27,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum by (kind) (rate(nw_policy_tokens_total[5m]))",
+     "legendFormat": "tokens/s {{kind}}"
+    },
+    {
+     "refId": "B",
+     "expr": "nw_policy_spend_usd_total",
+     "legendFormat": "spend USD"
+    }
+   ]
+  },
+  {
+   "id": 12,
+   "type": "row",
+   "title": "Agents (Project 4)",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 35,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 13,
+   "type": "timeseries",
+   "title": "Tool calls per second",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 36,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum by (tool, outcome) (rate(nw_agent_tool_calls_total[5m]))",
+     "legendFormat": "{{tool}} {{outcome}}"
+    }
+   ]
+  },
+  {
+   "id": 14,
+   "type": "timeseries",
+   "title": "Terminations, runs in flight, cost",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 36,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum by (reason) (rate(nw_agent_terminations_total[5m]))",
+     "legendFormat": "stop {{reason}}"
+    },
+    {
+     "refId": "B",
+     "expr": "sum by (service) (nw_agent_runs_in_flight)",
+     "legendFormat": "in flight {{service}}"
+    },
+    {
+     "refId": "C",
+     "expr": "sum(nw_agent_cost_usd_total)",
+     "legendFormat": "cost USD"
+    }
+   ]
+  },
+  {
+   "id": 15,
+   "type": "row",
+   "title": "Versions",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 44,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 16,
+   "type": "table",
+   "title": "Model and agent versions",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 45,
+    "w": 24,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "showHeader": true
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "nw_triage_model_info",
+     "format": "table",
+     "instant": true
+    },
+    {
+     "refId": "B",
+     "expr": "nw_semantic_model_info",
+     "format": "table",
+     "instant": true
+    },
+    {
+     "refId": "C",
+     "expr": "nw_policy_index_info",
+     "format": "table",
+     "instant": true
+    },
+    {
+     "refId": "D",
+     "expr": "nw_agent_version_info",
+     "format": "table",
+     "instant": true
+    }
+   ]
+  }
+ ]
+}

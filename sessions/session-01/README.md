@@ -5,7 +5,10 @@ What you build: `nw/llm`, the client every later project calls a model through.
 Follow the guide for the steps. Run the acceptance tests with:
 
 ```bash
-make session01
+make session01                      # 126 tests; the skeleton passes 92
+NW_PROVIDER=fake make preflight     # every role on the fake provider, the mode the exercises run in
+make preflight                      # one route line and one round trip per role, through the gateway when NW_GATEWAY_URL is set
+uv run python scripts/live_check.py # the first live call, on the Workhorse (gpt-oss-120b; gpt-oss:20b on Local)
 ```
 
 Files you edit in this session:
@@ -16,9 +19,9 @@ Files you edit in this session:
 Files you read but do not edit:
 
 - `nw/llm/types.py`, `nw/llm/errors.py`, `nw/llm/provider.py`: the contract
-- `nw/llm/providers/`: Bedrock, Vertex, and the fake used by the tests
+- `nw/llm/providers/`: Bedrock Converse (gpt-oss, Nova), the OpenAI-compatible client (Ollama, the model gateway, Google's managed API), Claude on Bedrock, the Agent Platform or the Anthropic API, the `RoleRouter`, and the fake used by the tests
 - `nw/llm/cost.py`, `nw/llm/prices.py`: metering and the price table
 - `nw/logging.py`: structured logs and the correlation ID
 - `nw/llm/breaker.py`: the circuit breaker per model
 
-Environment, all optional: `NW_MODEL_FALLBACK_WORKHORSE`, `NW_MODEL_FALLBACK_JUDGE`, `NW_MODEL_FALLBACK_ECONOMY` (a second model per role, tried once when the primary fails), `NW_BREAKER_FAILURES` (default 3) and `NW_BREAKER_OPEN_S` (default 30), `NW_REQUEST_TIMEOUT_S` (default 60, applied in the vendor client and around every call). `uv run python -m nw.config` prints every setting with its source and the `config_hash`.
+Environment: `NW_TRACK`, `NW_TENANT`, `NW_ENVIRONMENT`, `NW_GATEWAY_URL`, `NW_GATEWAY_KEY` name you on the platform; `NW_PROVIDER=fake` answers every role in memory. All optional: `NW_MODEL_FALLBACK_WORKHORSE`, `NW_MODEL_FALLBACK_JUDGE`, `NW_MODEL_FALLBACK_ECONOMY` (a second model per role, tried once when the primary fails), `NW_BREAKER_FAILURES` (default 3) and `NW_BREAKER_OPEN_S` (default 30), `NW_REQUEST_TIMEOUT_S` (default 60, applied in the vendor client and around every call). `uv run python -m nw.config` prints every setting with its source and the `config_hash`.

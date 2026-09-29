@@ -70,6 +70,25 @@
     "title": "HTTPValidationError",
     "type": "object"
    },
+   "PredictRequest": {
+    "properties": {
+     "instances": {
+      "items": {
+       "additionalProperties": true,
+       "type": "object"
+      },
+      "title": "Instances",
+      "type": "array"
+     },
+     "parameters": {
+      "additionalProperties": true,
+      "title": "Parameters",
+      "type": "object"
+     }
+    },
+    "title": "PredictRequest",
+    "type": "object"
+   },
    "TicketIn": {
     "properties": {
      "body": {
@@ -214,6 +233,25 @@
     ]
    }
   },
+  "/health": {
+   "get": {
+    "operationId": "vertex_health_health_get",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "Vertex Health",
+    "tags": [
+     "vertex"
+    ]
+   }
+  },
   "/healthz": {
    "get": {
     "operationId": "healthz_healthz_get",
@@ -250,6 +288,49 @@
      }
     },
     "summary": "Metrics"
+   }
+  },
+  "/predict": {
+   "post": {
+    "operationId": "vertex_predict_predict_post",
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/PredictRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "additionalProperties": true,
+         "title": "Response Vertex Predict Predict Post",
+         "type": "object"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Vertex Predict",
+    "tags": [
+     "vertex"
+    ]
    }
   },
   "/readyz": {

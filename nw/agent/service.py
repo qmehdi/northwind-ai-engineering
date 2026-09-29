@@ -19,6 +19,11 @@ NW_AGENT_CAPTURE appends one JSON line per run; NW_AGENT_BASELINE points the dri
 at a baseline other than data/golden/agent_baseline.json; NW_AGENT_DRIFT_WINDOW and
 NW_AGENT_DRIFT_MIN size the window; NW_AGENT_MAX_TOTAL_TOKENS caps the tokens one resolver
 run may spend (input plus output), stopping it with BUDGET.
+
+On a platform (ADR 0008) the runtime injects NW_TENANT and NW_ENVIRONMENT (on every log line,
+every run line and every drift_alert), NW_AGENT_REGISTRY (the registry entry this agent runs
+under) and NW_MEMORY_ID (its memory store); `/version` reports them. The gateway key comes
+from NW_GATEWAY_KEY_SECRET_ARN or NW_GATEWAY_KEY_SECRET_NAME when NW_GATEWAY_KEY is unset.
 """
 
 from __future__ import annotations
@@ -58,6 +63,8 @@ from nw.logging import bind_correlation_id, configure_logging, get_logger, log_f
 from nw.metrics_export import start_metrics_export
 from nw.policy.redact import redact
 from nw.ratelimit import install_rate_limit
+from nw.serving.gateway import gateway_fields, resolve_gateway_key
+from nw.serving.identity import bind_identity, identity
 from nw.telemetry import configure_tracing, instrument_app
 
 log = get_logger("nw.agent.service")
@@ -105,6 +112,7 @@ class State:
     capture: Path | None = None
     max_runs: int = 4
     max_total_tokens: int | None = None
+    settings: Any = None  # the settings the client was built with, gateway key resolved
 
     def __init__(self) -> None:
         # Mutable per instance: tests build a fresh State and must not share a window.
@@ -156,13 +164,15 @@ def configure_agentops() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging(os.environ.get("NW_LOG_FORMAT", "json"))
+    bind_identity()
     start_metrics_export("agent")
     state.role = os.environ.get("NW_AGENT_ROLE", "triage")
     state.trace_dir = Path(os.environ.get("NW_TRACE_DIR", "artifacts/traces"))
     try:
         if state.role not in {*SPECIALISTS, "orchestrator", "resolver"}:
             raise ValueError(f"unknown NW_AGENT_ROLE {state.role!r}")
-        s = settings()
+        s = resolve_gateway_key(settings())
+        state.settings = s
         state.client = LLMClient(make_provider(s), settings=s)
         from nw.agent.screen import from_env
 
@@ -262,6 +272,12 @@ def version() -> dict[str, Any]:
     info["config_hash"] = s.config_hash()
     info["fallbacks"] = {r.value: m for r, m in s.fallback.items()}
     info["resilience"] = state.client.meter.resilience() if state.client else None
+    # The platform's view of this agent (ADR 0008): whose it is, the registry entry it runs
+    # under, its memory store and the gateway its model calls go through.
+    info.update(identity())
+    info["registry"] = os.environ.get("NW_AGENT_REGISTRY", "").strip() or None
+    info["memory_id"] = os.environ.get("NW_MEMORY_ID", "").strip() or None
+    info.update(gateway_fields(state.settings or s))
     info.update(version_fields())
     return info
 
@@ -410,6 +426,21 @@ def finish_run(t: Trajectory, role: str, t0: float) -> None:
     summary = state.monitor.observe(t)
     _observe_drift()
     _capture(summary)
+    # One line per run on every path (the loop logs its own only when a model ran), with the
+    # tenant and the environment so a platform can attribute runs and cost.
+    log.info(
+        "run_finished",
+        extra=log_fields(
+            run_id=t.run_id,
+            role=role,
+            agent=t.agent,
+            agent_version=t.agent_version,
+            terminated=t.terminated.value,
+            steps=t.n_steps,
+            cost_usd=round(t.cost_usd, 5),
+            **identity(),
+        ),
+    )
 
 
 def _observe_drift() -> None:
@@ -433,6 +464,7 @@ def _observe_drift() -> None:
                 window=snap.window,
                 threshold=ALERT,
                 reasons=snap.reasons,
+                **identity(),
             ),
         )
 

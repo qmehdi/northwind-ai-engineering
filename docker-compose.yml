@@ -1,43 +1,90 @@
-# Local stack: the four project services, the agent in every role, and the MCP server,
-# plus an OpenTelemetry collector and Jaeger under the `observability` profile.
-#   docker compose up --build
-#   docker compose --profile observability up --build
-# Every agent container shares the `nw-agent` image: compose builds it once and reuses it.
+# The Local track (ADR 0011): the course services plus one open-source service per managed
+# box, on one laptop, no cloud. Profiles:
+#   (none)         the course services: triage, semantic, policy, the agents, the MCP server
+#   platform       registry, Postgres, RustFS (S3), MLflow, Qdrant, Ollama, LiteLLM, Evidently,
+#                  the serving tier (two replicas behind a weighted proxy)
+#   observability  OpenTelemetry collector, Jaeger, Prometheus, Grafana
+#   higher         a second serving tier named for a higher environment (the promotion target)
+#   gpu            pulls gpt-oss:120b; pair with docker-compose.gpu.yml for the device
+#
+#   make local-up                      # build, push to the local registry, platform profile up
+#   docker compose --profile platform --profile observability up -d
+#   deploy/local/README.md             # ports, measured RAM, the mapping to AWS and Google Cloud
+#
+# Every image is pinned by tag and, where the registry publishes one, by digest (fetched
+# 2026-09-29 with `docker buildx imagetools inspect`). The course images come from the local
+# registry on :5050 (`make local-up` builds and pushes them); NW_IMAGE_TAG defaults to `dev`.
+name: northwind
+
 x-env: &env
   NW_TRACK: ${NW_TRACK:-local}
+  NW_TENANT: ${NW_TENANT:-solo}
+  NW_ENVIRONMENT: ${NW_ENVIRONMENT:-northwind}
   NW_AWS_REGION: ${NW_AWS_REGION:-us-east-1}
   NW_GCP_PROJECT: ${NW_GCP_PROJECT:-}
   NW_GCP_REGION: ${NW_GCP_REGION:-global}
   NW_LOG_FORMAT: json
+  # The model gateway: every model call from a container goes through LiteLLM with the
+  # tenant's key. Set NW_COMPOSE_GATEWAY_URL to empty to call Ollama directly.
+  NW_GATEWAY_URL: ${NW_COMPOSE_GATEWAY_URL:-http://litellm:4000}
+  NW_GATEWAY_KEY: ${NW_GATEWAY_KEY:-sk-nw-solo-change-me}
+  NW_OLLAMA_URL: ${NW_COMPOSE_OLLAMA_URL:-http://ollama:11434/v1}
+  NW_MLFLOW_URI: http://mlflow:5000
+  NW_QDRANT_URL: http://qdrant:6333
+  NW_API_KEY: ${NW_API_KEY:-}
   OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
 
+x-cloud-creds: &cloud-creds
+  volumes: ["~/.aws:/home/nw/.aws:ro", "~/.config/gcloud:/home/nw/.config/gcloud:ro"]
+
+x-ready: &ready
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/readyz')"]
+    interval: 15s
+    timeout: 3s
+    start_period: 90s
+    retries: 5
+
+x-agent-image: &agent-image ${NW_AGENT_IMAGE:-${NW_REGISTRY:-localhost:5050}/nw-agent:${NW_IMAGE_TAG:-dev}}
+x-agent-build: &agent-build
+  context: .
+  args: { APP: nw.agent.service:app, ARTIFACTS: "triage semantic index policy", HF_MODELS: "1" }
+
 services:
+  # ----- the course services -----------------------------------------------------------
   triage:
-    image: nw-triage
+    image: ${NW_REGISTRY:-localhost:5050}/nw-triage:${NW_IMAGE_TAG:-dev}
     build: { context: ., args: { APP: nw.triage.service:app, ARTIFACTS: "triage" } }
     environment: *env
     ports: ["8001:8000"]
+    <<: *ready
   semantic:
-    image: nw-semantic
+    image: ${NW_REGISTRY:-localhost:5050}/nw-semantic:${NW_IMAGE_TAG:-dev}
     build: { context: ., args: { APP: nw.semantic.service:app, ARTIFACTS: "semantic index", HF_MODELS: "1" } }
     environment: *env
     ports: ["8002:8000"]
+    <<: *ready
   policy:
-    image: nw-policy
+    image: ${NW_REGISTRY:-localhost:5050}/nw-policy:${NW_IMAGE_TAG:-dev}
     build: { context: ., args: { APP: nw.policy.service:app, ARTIFACTS: "policy", HF_MODELS: "1" } }
     environment: *env
     ports: ["8003:8000"]
-    volumes: ["~/.aws:/home/nw/.aws:ro", "~/.config/gcloud:/home/nw/.config/gcloud:ro"]
+    <<: [*cloud-creds, *ready]
   resolver:
-    # The Session path's deployment: the whole registry behind /run and /route on :8014
-    image: nw-agent
-    build: { context: ., args: { APP: nw.agent.service:app, ARTIFACTS: "triage semantic index policy", HF_MODELS: "1" } }
-    environment: { <<: *env, NW_AGENT_ROLE: resolver }
+    # The agent runtime: the whole registry behind /invocations (AgentCore shape),
+    # /api/reasoning_engine (Agent Engine shape) and the course's /route and /run, on :8014.
+    # `nw.platform.local` recreates it on a new image tag with the tenant's env file.
+    image: *agent-image
+    build: *agent-build
+    environment: { <<: *env, NW_AGENT_ROLE: resolver, NW_APP: nw.agent.agentcore:app }
+    env_file:
+      - path: ${NW_AGENT_ENV_FILE:-deploy/local/registry/agent.env}
+        required: false
     ports: ["8014:8000"]
-    volumes: ["~/.aws:/home/nw/.aws:ro", "~/.config/gcloud:/home/nw/.config/gcloud:ro"]
+    <<: [*cloud-creds, *ready]
   agent:
-    image: nw-agent
-    build: { context: ., args: { APP: nw.agent.service:app, ARTIFACTS: "triage semantic index policy", HF_MODELS: "1" } }
+    image: *agent-image
+    build: *agent-build
     environment:
       <<: *env
       NW_AGENT_ROLE: orchestrator
@@ -46,36 +93,419 @@ services:
       NW_RESOLUTION_AGENT_URL: http://agent-resolution:8000
     ports: ["8010:8000"]
     depends_on: [agent-triage, agent-policy, agent-resolution]
-    volumes: ["~/.aws:/home/nw/.aws:ro", "~/.config/gcloud:/home/nw/.config/gcloud:ro"]
+    <<: [*cloud-creds, *ready]
   agent-triage:
-    image: nw-agent
-    build: { context: ., args: { APP: nw.agent.service:app, ARTIFACTS: "triage semantic index policy", HF_MODELS: "1" } }
+    image: *agent-image
+    build: *agent-build
     environment: { <<: *env, NW_AGENT_ROLE: triage }
-    volumes: ["~/.aws:/home/nw/.aws:ro", "~/.config/gcloud:/home/nw/.config/gcloud:ro"]
+    <<: [*cloud-creds, *ready]
   agent-policy:
-    image: nw-agent
-    build: { context: ., args: { APP: nw.agent.service:app, ARTIFACTS: "triage semantic index policy", HF_MODELS: "1" } }
+    image: *agent-image
+    build: *agent-build
     environment: { <<: *env, NW_AGENT_ROLE: policy }
-    volumes: ["~/.aws:/home/nw/.aws:ro", "~/.config/gcloud:/home/nw/.config/gcloud:ro"]
+    <<: [*cloud-creds, *ready]
   agent-resolution:
-    image: nw-agent
-    build: { context: ., args: { APP: nw.agent.service:app, ARTIFACTS: "triage semantic index policy", HF_MODELS: "1" } }
+    image: *agent-image
+    build: *agent-build
     environment: { <<: *env, NW_AGENT_ROLE: resolution }
-    volumes: ["~/.aws:/home/nw/.aws:ro", "~/.config/gcloud:/home/nw/.config/gcloud:ro"]
+    <<: [*cloud-creds, *ready]
   mcp:
-    image: nw-mcp
+    image: ${NW_REGISTRY:-localhost:5050}/nw-mcp:${NW_IMAGE_TAG:-dev}
     build: { context: ., args: { APP: mcp, ARTIFACTS: "triage semantic index policy", HF_MODELS: "1" } }
     environment: { <<: *env, NW_MCP_HOST: 0.0.0.0, NW_MCP_PORT: "8000" }
     ports: ["8020:8000"]
+    healthcheck:
+      # the MCP server speaks streamable HTTP, no /readyz: a TCP connect is the probe
+      test: ["CMD", "python", "-c", "import socket;socket.create_connection(('127.0.0.1',8000),timeout=2).close()"]
+      interval: 15s
+      timeout: 3s
+      start_period: 90s
+      retries: 5
+
+  # ----- platform: delivery ------------------------------------------------------------
+  registry:
+    # The image registry the course services are pulled from: ECR and Artifact Registry here.
+    image: registry:3.1.2@sha256:ddf754342cfc8acc51a56d5d0ab6af06826461864460636d8bd5c546dab2a7b8
+    profiles: [platform]
+    ports: ["5050:5000"]
+    volumes: ["registry-data:/var/lib/registry"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5000/v2/"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+  # ----- platform: state ---------------------------------------------------------------
+  postgres:
+    # One Postgres, two databases: MLflow's backend store and LiteLLM's keys and spend.
+    image: postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+    profiles: [platform]
+    environment:
+      POSTGRES_USER: nw
+      POSTGRES_PASSWORD: ${NW_DB_PASSWORD:-northwind}
+      POSTGRES_DB: mlflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./deploy/local/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nw -d mlflow"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+  rustfs:
+    # S3-compatible object storage for MLflow artifacts: S3 and Cloud Storage here. ADR 0011
+    # names MinIO; MinIO stopped publishing public images in 2025, so RustFS (Apache-2.0,
+    # S3 API) takes the box. Console on :9001, API on :9000.
+    image: rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
+    profiles: [platform]
+    environment:
+      RUSTFS_ACCESS_KEY: ${NW_S3_ACCESS_KEY:-nw}
+      RUSTFS_SECRET_KEY: ${NW_S3_SECRET_KEY:-northwind-secret}
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+    ports: ["9000:9000", "9001:9001"]
+    volumes: ["rustfs-data:/data"]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+  rustfs-init:
+    # Creates the `mlflow` bucket once the store answers; exits.
+    image: ${NW_REGISTRY:-localhost:5050}/nw-mlflow:${NW_IMAGE_TAG:-dev}
+    build: { context: deploy/local/mlflow }
+    profiles: [platform]
+    entrypoint: ["python", "/usr/local/bin/init_bucket.py"]
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://rustfs:9000
+      AWS_ACCESS_KEY_ID: ${NW_S3_ACCESS_KEY:-nw}
+      AWS_SECRET_ACCESS_KEY: ${NW_S3_SECRET_KEY:-northwind-secret}
+      NW_ARTIFACT_BUCKET: mlflow
+    depends_on:
+      rustfs: { condition: service_healthy }
+    restart: "no"
+  mlflow:
+    # Tracking, model registry with aliases, prompt registry, artifact proxy: SageMaker Model
+    # Registry, Vertex Model Registry, Bedrock Prompt Management and the Gen AI SDK prompts.
+    # Clients never see object-store credentials; artifacts go through this server.
+    image: ${NW_REGISTRY:-localhost:5050}/nw-mlflow:${NW_IMAGE_TAG:-dev}
+    build: { context: deploy/local/mlflow }
+    profiles: [platform]
+    command:
+      - mlflow
+      - server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "5000"
+      - --workers
+      - "2"
+      - --backend-store-uri
+      - postgresql+psycopg2://nw:${NW_DB_PASSWORD:-northwind}@postgres:5432/mlflow
+      - --artifacts-destination
+      - s3://mlflow
+      - --serve-artifacts
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://rustfs:9000
+      AWS_ACCESS_KEY_ID: ${NW_S3_ACCESS_KEY:-nw}
+      AWS_SECRET_ACCESS_KEY: ${NW_S3_SECRET_KEY:-northwind-secret}
+      MLFLOW_DISABLE_AGENT_HINT: "1"
+    ports: ["5001:5000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      rustfs-init: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:5000/health')"]
+      interval: 15s
+      timeout: 5s
+      start_period: 60s
+      retries: 10
+  qdrant:
+    # The vector store behind the policy service: Bedrock Knowledge Bases on S3 Vectors and
+    # RAG Engine on Vector Search here. REST on :6333, gRPC on :6334, /metrics for Prometheus.
+    image: qdrant/qdrant:v1.19.1@sha256:12364fe851b9f17356fc88189fc06d1b521262e04659ec7345975b00c9246a10
+    profiles: [platform]
+    ports: ["6333:6333", "6334:6334"]
+    volumes: ["qdrant-data:/qdrant/storage"]
+    healthcheck:
+      # the image ships bash and nothing else: a raw HTTP probe over /dev/tcp
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/6333 && printf 'GET /healthz HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q 200"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+  # ----- platform: models --------------------------------------------------------------
+  ollama:
+    # The open-weight Workhorse and Economy (gpt-oss:20b) and the guardrail (llama-guard3:1b):
+    # Bedrock's and the Agent Platform's managed open models here. Host port 11435 so a native
+    # Ollama on 11434 keeps working; NW_OLLAMA_MODELS_DIR=~/.ollama shares its model store, and
+    # on a Mac, where containers have no GPU, NW_COMPOSE_OLLAMA_INTERNAL_URL=
+    # http://host.docker.internal:11434 points the gateway at the native one (Metal).
+    image: ollama/ollama:0.34.4@sha256:8262851b2846b87c649eddf3e76beb270c52f4d1bc94559f47efde16b0841551
+    profiles: [platform]
+    environment:
+      OLLAMA_KEEP_ALIVE: ${NW_OLLAMA_KEEP_ALIVE:-5m}
+      OLLAMA_MAX_LOADED_MODELS: "2"
+      OLLAMA_NUM_PARALLEL: "1"
+    ports: ["${NW_OLLAMA_PORT:-11435}:11434"]
+    volumes: ["${NW_OLLAMA_MODELS_DIR:-ollama-models}:/root/.ollama"]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+  ollama-pull:
+    # Pulls the platform models on first start (the guardrail first, then the Workhorse);
+    # a pull of a model already in the store returns at once. `make local-pull` reruns it.
+    image: ollama/ollama:0.34.4@sha256:8262851b2846b87c649eddf3e76beb270c52f4d1bc94559f47efde16b0841551
+    profiles: [platform]
+    entrypoint: ["/bin/sh", "/pull.sh"]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      NW_OLLAMA_PULL: ${NW_OLLAMA_PULL:-llama-guard3:1b gpt-oss:20b}
+    volumes: ["./deploy/local/ollama/pull.sh:/pull.sh:ro"]
+    depends_on:
+      ollama: { condition: service_healthy }
+    restart: "no"
+  ollama-pull-120b:
+    # gpu profile: the 65 GB Workhorse of the cloud tracks. Needs the device reservation in
+    # docker-compose.gpu.yml and NW_GATEWAY_WORKHORSE=ollama_chat/gpt-oss:120b on the gateway.
+    image: ollama/ollama:0.34.4@sha256:8262851b2846b87c649eddf3e76beb270c52f4d1bc94559f47efde16b0841551
+    profiles: [gpu]
+    entrypoint: ["/bin/sh", "/pull.sh"]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      NW_OLLAMA_PULL: gpt-oss:120b
+    volumes: ["./deploy/local/ollama/pull.sh:/pull.sh:ro"]
+    depends_on:
+      ollama: { condition: service_healthy }
+    restart: "no"
+  litellm:
+    # The model gateway (ADR 0008): role names in, Ollama or the cloud Judge out, one virtual
+    # key and budget per tenant (deploy/local/litellm/tenants.tsv), Llama Guard on every
+    # request. The AWS multi-provider gateway guidance and the same LiteLLM on Cloud Run here.
+    image: ghcr.io/berriai/litellm:v1.103.0@sha256:bd089afdcd35b894b14a93f9743cdc8b591f82da1a38dd43a010a7b0c9de5fd7
+    profiles: [platform]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        cfg=/config/config.yaml;
+        if [ -n "$$ANTHROPIC_API_KEY" ]; then cfg=/config/config-cloud-judge.yaml; fi;
+        echo "gateway config $$cfg";
+        exec /app/docker/prod_entrypoint.sh --config $$cfg --port 4000
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-nw-master-change-me}
+      DATABASE_URL: postgresql://nw:${NW_DB_PASSWORD:-northwind}@postgres:5432/litellm
+      STORE_MODEL_IN_DB: "false"
+      NW_OLLAMA_INTERNAL_URL: ${NW_COMPOSE_OLLAMA_INTERNAL_URL:-http://ollama:11434}
+      NW_GATEWAY_WORKHORSE: ${NW_GATEWAY_WORKHORSE:-ollama_chat/gpt-oss:20b}
+      NW_GUARD_FAIL_OPEN: ${NW_GUARD_FAIL_OPEN:-0}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      LITELLM_LOG: ${LITELLM_LOG:-INFO}
+    ports: ["4000:4000"]
+    volumes: ["./deploy/local/litellm:/config:ro"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      ollama: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness')"]
+      interval: 15s
+      timeout: 5s
+      start_period: 120s
+      retries: 10
+  litellm-keys:
+    # Applies tenants.tsv: one key with a budget per tenant. Exits.
+    image: curlimages/curl:8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da16bbe3f92dec39ec7785166777
+    profiles: [platform]
+    entrypoint: ["/bin/sh", "/config/keys.sh"]
+    environment:
+      LITELLM_URL: http://litellm:4000
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-nw-master-change-me}
+      TENANTS_FILE: /config/tenants.tsv
+    volumes: ["./deploy/local/litellm:/config:ro"]
+    depends_on:
+      litellm: { condition: service_healthy }
+    restart: "no"
+
+  # ----- platform: monitoring ----------------------------------------------------------
+  evidently:
+    # Drift reports and their UI on :8030: SageMaker Model Monitor and Vertex Model Monitoring.
+    image: ${NW_REGISTRY:-localhost:5050}/nw-evidently:${NW_IMAGE_TAG:-dev}
+    build: { context: deploy/local/evidently }
+    profiles: [platform]
+    command: ["evidently", "ui", "--host", "0.0.0.0", "--port", "8000", "--workspace", "/workspace"]
+    ports: ["8030:8000"]
+    volumes: ["evidently-workspace:/workspace"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/')"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+  drift-reports:
+    # The scheduled job: a report per capture file every NW_DRIFT_EVERY_S seconds into the
+    # workspace the UI reads and as HTML under artifacts/drift/.
+    image: ${NW_REGISTRY:-localhost:5050}/nw-evidently:${NW_IMAGE_TAG:-dev}
+    build: { context: deploy/local/evidently }
+    profiles: [platform]
+    command: ["/app/run.sh"]
+    environment:
+      NW_DRIFT_EVERY_S: ${NW_DRIFT_EVERY_S:-900}
+      NW_DRIFT_MIN: ${NW_DRIFT_MIN:-50}
+    volumes:
+      - evidently-workspace:/workspace
+      - ./data:/data:ro
+      - ./artifacts:/artifacts:ro
+      - ./artifacts/drift:/reports
+    depends_on:
+      evidently: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "test -n \"$(find /workspace/.heartbeat -mmin -35 2>/dev/null)\""]
+      interval: 60s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+
+  # ----- platform: the serving tier ----------------------------------------------------
+  serving-stable:
+    # MLflow model serving of models:/<environment>-<tenant>-triage@live. The stable replica
+    # of the endpoint: a SageMaker real-time endpoint and a Vertex endpoint here.
+    image: ${NW_REGISTRY:-localhost:5050}/nw-serving:${NW_IMAGE_TAG:-dev}
+    build:
+      context: deploy/local/serving
+      args: { BASE: "${NW_REGISTRY:-localhost:5050}/nw-triage:${NW_IMAGE_TAG:-dev}" }
+    profiles: [platform]
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      NW_SERVING_MODEL: ${NW_ENVIRONMENT:-northwind}-${NW_TENANT:-solo}-triage
+      NW_SERVING_ALIAS: live
+    depends_on:
+      mlflow: { condition: service_healthy }
+  serving-canary:
+    # The canary replica: models:/...@canary, the share of traffic set by `make local-canary`.
+    image: ${NW_REGISTRY:-localhost:5050}/nw-serving:${NW_IMAGE_TAG:-dev}
+    build:
+      context: deploy/local/serving
+      args: { BASE: "${NW_REGISTRY:-localhost:5050}/nw-triage:${NW_IMAGE_TAG:-dev}" }
+    profiles: [platform]
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      NW_SERVING_MODEL: ${NW_ENVIRONMENT:-northwind}-${NW_TENANT:-solo}-triage
+      NW_SERVING_ALIAS: canary
+    depends_on:
+      mlflow: { condition: service_healthy }
+  proxy:
+    # The endpoint's one address on :8005; the canary by replica weight lives in
+    # deploy/local/proxy/upstream.conf (CodeDeploy's traffic shift and the Vertex split here).
+    image: nginx:1.30.5-alpine@sha256:0985e772fb9f729e6fa0980da05fca5d9c468e870eed43071545afa9d2e27d94
+    profiles: [platform]
+    ports: ["8005:8000"]
+    volumes:
+      - ./deploy/local/proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deploy/local/proxy:/etc/nginx/nw:ro
+    depends_on: [serving-stable, serving-canary]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8000/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+  # ----- higher: the promotion target --------------------------------------------------
+  serving-stable-higher:
+    image: ${NW_REGISTRY:-localhost:5050}/nw-serving:${NW_IMAGE_TAG:-dev}
+    profiles: [higher]
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      NW_SERVING_MODEL: higher-${NW_TENANT:-solo}-triage
+      NW_SERVING_ALIAS: live
+    depends_on:
+      mlflow: { condition: service_healthy }
+  serving-canary-higher:
+    image: ${NW_REGISTRY:-localhost:5050}/nw-serving:${NW_IMAGE_TAG:-dev}
+    profiles: [higher]
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      NW_SERVING_MODEL: higher-${NW_TENANT:-solo}-triage
+      NW_SERVING_ALIAS: canary
+    depends_on:
+      mlflow: { condition: service_healthy }
+  proxy-higher:
+    image: nginx:1.30.5-alpine@sha256:0985e772fb9f729e6fa0980da05fca5d9c468e870eed43071545afa9d2e27d94
+    profiles: [higher]
+    ports: ["8105:8000"]
+    volumes:
+      - ./deploy/local/proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deploy/local/proxy/higher:/etc/nginx/nw:ro
+    depends_on: [serving-stable-higher, serving-canary-higher]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8000/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+  # ----- observability -----------------------------------------------------------------
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.161.0
+    # Distroless: no shell for a Docker probe. Prometheus scrapes its own metrics on :8888,
+    # which is where its health shows.
+    image: otel/opentelemetry-collector-contrib:0.161.0@sha256:fd328de2552466ad78385e1b1289c3f2402b1c45f265b252aab1955b42845ac1
     profiles: [observability]
     command: ["--config=/etc/otel/config.yaml"]
     volumes: ["./deploy/local/otel-collector.yaml:/etc/otel/config.yaml:ro"]
     ports: ["4318:4318"]
     depends_on: [jaeger]
   jaeger:
-    # Jaeger v2 (the all-in-one image is v1 and frozen); UI on 16686, OTLP gRPC on 4317
-    image: jaegertracing/jaeger:2.21.0
+    # Jaeger v2 (the all-in-one image is v1 and frozen); UI on 16686, OTLP gRPC on 4317.
+    image: jaegertracing/jaeger:2.21.0@sha256:3d0ac795ff98aa04d1be04311d2dac6c25b4bfc8322dc02e53bc5b170c5018c3
     profiles: [observability]
     ports: ["16686:16686", "4317:4317"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:16686/"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+  prometheus:
+    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+    profiles: [observability]
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=7d"]
+    ports: ["9090:9090"]
+    volumes:
+      - ./deploy/local/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9090/-/ready"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+  grafana:
+    # One dashboard, provisioned: deploy/local/grafana/dashboards/northwind.json. Login
+    # admin / NW_GRAFANA_PASSWORD (northwind); anonymous viewers allowed.
+    image: grafana/grafana:13.2.2@sha256:ac461fb352abc50da10a51c7d02462e9c05488f11f53f14b3ad79a8145f638a0
+    profiles: [observability]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${NW_GRAFANA_PASSWORD:-northwind}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    ports: ["3000:3000"]
+    volumes:
+      - ./deploy/local/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/local/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on: [prometheus]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
+      interval: 15s
+      timeout: 3s
+      start_period: 30s
+      retries: 5
+
+volumes:
+  registry-data:
+  postgres-data:
+  rustfs-data:
+  qdrant-data:
+  ollama-models:
+  evidently-workspace:
+  prometheus-data:
+  grafana-data:

@@ -30,7 +30,7 @@ HASH_CHARS = 12
 # Modules that register prompts at import. The CLI imports them so the table is complete;
 # nothing else needs the list. `nw.agent.loop` is included best effort: its rules are
 # registered from here by text, so the agent package does not depend on this module.
-KNOWN_MODULES: tuple[str, ...] = ("nw.policy.answer", "nw.policy.evaluate")
+KNOWN_MODULES: tuple[str, ...] = ("nw.policy.answer", "nw.policy.evaluate", "nw.agent.evaluate")
 
 
 def prompt_hash(text: str) -> str:

@@ -1,0 +1,119 @@
+{
+ "name": "resolver",
+ "kind": "resolver",
+ "track": "local",
+ "agent_version": "e15e6982168c",
+ "prompt": "system@e645e8a6b564",
+ "prompt_hash": "e645e8a6b564",
+ "tools_version": "e0d56e06da2b",
+ "tools": [
+  {
+   "name": "check_entitlement",
+   "version": "7e89ec15b10c",
+   "requires_approval": false
+  },
+  {
+   "name": "classify_semantic",
+   "version": "22bfdabed8be",
+   "requires_approval": false
+  },
+  {
+   "name": "classify_urgency",
+   "version": "9f77abb96bc9",
+   "requires_approval": false
+  },
+  {
+   "name": "escalate",
+   "version": "ce361cdb6a6f",
+   "requires_approval": true
+  },
+  {
+   "name": "find_similar_tickets",
+   "version": "5cfd03b7c38d",
+   "requires_approval": false
+  },
+  {
+   "name": "lookup_customer",
+   "version": "53aae0c9171c",
+   "requires_approval": false
+  },
+  {
+   "name": "search_policies",
+   "version": "e1b56b3f2f81",
+   "requires_approval": false
+  }
+ ],
+ "models": {
+  "workhorse": "gpt-oss:20b"
+ },
+ "use_case": "uc-resolver",
+ "owner": "product_owner",
+ "business_outcome": "One agent resolves a ticket end to end with the Project 1 to 3 services as tools; escalation is proposed, never executed.",
+ "risk_class": "medium",
+ "oversight": {
+  "actions": "may propose an irreversible action",
+  "human": "one reviewer approves each proposal before it executes (make approve)",
+  "approvers": "one"
+ },
+ "data_classes": [
+  "ticket_text",
+  "customer_account",
+  "entitlements",
+  "policy_corpus",
+  "past_tickets",
+  "escalation_queue"
+ ],
+ "endpoints": [
+  "POST /run",
+  "GET /version",
+  "GET /drift",
+  "GET /metrics"
+ ],
+ "evaluation": {
+  "baseline": "data/golden/agent_baseline.json",
+  "agent_version": null,
+  "written_at": "2026-09-28T00:00:00+00:00",
+  "cases": 15,
+  "success": 15,
+  "cost_usd_per_resolution": 0.10826333333333334,
+  "tiers": {
+   "tool": {
+    "bar": {
+     "max_invalid_argument_rate": 0.1,
+     "max_error_rate_per_tool": 0.2,
+     "min_calls": 3
+    },
+    "measured": null
+   },
+   "turn": {
+    "bar": {
+     "min_pass_rate": 0.8,
+     "min_judge_mean": 3.5
+    },
+    "measured": null
+   },
+   "session": {
+    "bar": {
+     "max_pass_drop": 1,
+     "max_extra_steps": 2.0,
+     "max_cap_rate": 0.2
+    },
+    "measured": null
+   },
+   "system": {
+    "bar": {
+     "min_escalation_correct_rate": 1.0,
+     "max_cost_ratio": 1.5
+    },
+    "measured": null
+   }
+  },
+  "note": "the baseline predates the tiers; measured values arrive with the next --write-baseline"
+ },
+ "approval": {
+  "state": "approved",
+  "approver": "support-operations"
+ },
+ "runtime_id": null,
+ "written_at": "2026-09-29T07:06:51.442389+00:00"
+}

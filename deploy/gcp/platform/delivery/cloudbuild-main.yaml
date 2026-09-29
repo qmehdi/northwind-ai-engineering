@@ -1,0 +1,48 @@
+# Push to main: build every course image once, push by digest, create the Cloud Deploy
+# release. The rollout stops at the canary and waits for approval (`make approve-gcp`).
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        build() { docker build --build-arg "APP=$2" --build-arg "ARTIFACTS=$3" --build-arg "HF_MODELS=$4" -t "${_REGISTRY}/nw-$1:${SHORT_SHA}" . ; }
+        build triage   nw.triage.service:app   "triage" 0
+        build semantic nw.semantic.service:app "semantic index" 1
+        build policy   nw.policy.service:app   "policy" 1
+        build agent    nw.agent.service:app    "triage semantic index policy" 1
+        for s in triage semantic policy agent; do docker push "${_REGISTRY}/nw-$s:${SHORT_SHA}"; done
+        for s in triage semantic policy agent; do
+          docker inspect --format='{{index .RepoDigests 0}}' "${_REGISTRY}/nw-$s:${SHORT_SHA}" | sed "s/^/nw-$s=/" >> /workspace/images.txt
+        done
+        cat /workspace/images.txt
+  - id: release
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        cd deploy/gcp/platform/delivery
+        mkdir -p rendered
+        for f in skaffold.yaml run-*.yaml; do
+          sed -e "s/@ENVIRONMENT@/${_ENVIRONMENT}/g" -e "s/@PROJECT@/${PROJECT_ID}/g" -e "s/@REGION@/${_REGION}/g" -e "s/@LIVE_SA@/${_LIVE_SA}/g" "$f" > "rendered/$f"
+        done
+        IMAGES=$(paste -sd, /workspace/images.txt)
+        gcloud deploy releases create "rel-${SHORT_SHA}" \
+          --project="${PROJECT_ID}" --region="${_REGION}" \
+          --delivery-pipeline="${_PIPELINE}" --source=rendered \
+          --images="${IMAGES}" --deploy-parameters="environment=${_ENVIRONMENT}"
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
+substitutions:
+  _ENVIRONMENT: northwind
+  _REGION: us-central1
+  _REGISTRY: us-central1-docker.pkg.dev/PROJECT/northwind
+  _PIPELINE: northwind-live
+  _LIVE_SA: northwind-live@PROJECT.iam.gserviceaccount.com
+  _DEPLOYER_SA: northwind-deployer@PROJECT.iam.gserviceaccount.com
+timeout: 3600s

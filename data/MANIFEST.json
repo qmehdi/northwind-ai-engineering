@@ -1,6 +1,6 @@
 {
- "dataset_version": "2026.09.0",
- "written_at": "2026-09-28T09:30:21+00:00",
+ "dataset_version": "2026.09.1",
+ "written_at": "2026-09-29T07:06:51+00:00",
  "licence": "Synthetic, generated for the course and for the cohort's use. No row of the reference dataset Tobi-Bueck/customer-support-tickets (CC BY-NC 4.0) is included.",
  "provenance": "The schema and the label distributions are modelled on the public dataset Tobi-Bueck/customer-support-tickets on Hugging Face (English subset), which has three priority levels: high 39 percent, medium 41 percent, low 20 percent.",
  "files": {
@@ -15,9 +15,9 @@
    "rows": 15
   },
   "golden/agent_baseline.json": {
-   "sha256": "d9a6629d7efe13ad9362615ffd5433acf7b219d68998745864dc94e032ba221a",
-   "bytes": 2425,
-   "rows": 7
+   "sha256": "eea85ef0e2157933d753b28c0eabac49353165d7d5f7a5437d35ecc16bccfdaf",
+   "bytes": 2790,
+   "rows": 8
   },
   "golden/baseline.json": {
    "sha256": "9424eabe7a96c978a4daa6071d9fceac8ef97e74107c7e3603f93746ba09b818",

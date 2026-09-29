@@ -1,6 +1,6 @@
 # 0001. Lambda container images for the Session path on AWS
 
-Date: 2026-09-08. Status: accepted.
+Date: 2026-09-08. Status: superseded on 2026-09-29 by the workspace ADR 0008 (the managed platform replaces the Session path; the policy service still runs as a Lambda container image behind an HTTP API, the rest moved to SageMaker endpoints and AgentCore).
 
 ## Context
 
