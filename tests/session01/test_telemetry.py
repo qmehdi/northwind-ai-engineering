@@ -36,3 +36,51 @@ def test_no_exporter_means_no_crash(monkeypatch):
     telemetry.configure_tracing("test", env={})
     with telemetry.span("anything", k="v"):
         pass
+
+
+def test_azure_track_picks_the_azure_monitor_exporter_without_sending(monkeypatch):
+    from opentelemetry.sdk.trace.export import SpanExporter
+
+    made: list[str] = []
+
+    class Sentinel(SpanExporter):
+        def export(self, spans):  # pragma: no cover - never called
+            raise AssertionError("nothing is sent")
+
+    def fake(connection_string):
+        made.append(connection_string)
+        return Sentinel()
+
+    monkeypatch.setattr(telemetry, "azure_monitor_exporter", fake)
+    conn = "InstrumentationKey=00000000-0000-0000-0000-000000000000"
+    exporter, kind = telemetry._exporter(
+        {"NW_TRACK": "azure", "APPLICATIONINSIGHTS_CONNECTION_STRING": conn}
+    )
+    assert kind == "azuremonitor" and isinstance(exporter, Sentinel) and made == [conn]
+    _, kind = telemetry._exporter(
+        {"NW_TRACK": "azure", "NW_AZURE_APPINSIGHTS_CONNECTION_STRING": conn}
+    )
+    assert kind == "azuremonitor"
+    # other tracks, no connection string, or an explicit OTLP collector: not Azure Monitor
+    assert (
+        telemetry._exporter({"NW_TRACK": "aws", "APPLICATIONINSIGHTS_CONNECTION_STRING": conn})[1]
+        == "none"
+    )
+    assert telemetry._exporter({"NW_TRACK": "azure"})[1] == "none"
+    assert (
+        telemetry._exporter(
+            {"NW_TRACE_EXPORT": "azuremonitor", "NW_AZURE_APPINSIGHTS_CONNECTION_STRING": conn}
+        )[1]
+        == "azuremonitor"
+    )
+
+
+def test_azure_monitor_import_failure_degrades_to_no_exporter(monkeypatch):
+    def broken(connection_string):
+        raise ImportError("cannot import name 'LogData'")
+
+    monkeypatch.setattr(telemetry, "azure_monitor_exporter", broken)
+    exporter, kind = telemetry._exporter(
+        {"NW_TRACK": "azure", "APPLICATIONINSIGHTS_CONNECTION_STRING": "InstrumentationKey=x"}
+    )
+    assert (exporter, kind) == (None, "none")

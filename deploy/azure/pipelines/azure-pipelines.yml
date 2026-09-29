@@ -1,0 +1,106 @@
+# Delivery for the Azure track (ADR 0012, 0013): Azure Pipelines builds the live images once,
+# releases them by digest as a canary revision of the live Container Apps, and waits for a
+# person before the canary takes all the traffic. Pull-request checks stay in GitHub Actions.
+#
+# Setup, once, in the Azure DevOps project (deploy/azure/README.md, "Delivery"):
+#   1. A service connection named `northwind-deployer`: Azure Resource Manager, workload identity
+#      federation (manual), bound to the managed identity `northwind-deployer` (the deployment
+#      output NW_AZURE_DEPLOYER_CLIENT_ID). Deploy the platform with NW_ADO_ISSUER and
+#      NW_ADO_SUBJECT set to the issuer and subject the connection shows, so the identity trusts it.
+#   2. Two environments: `northwind-canary` (no checks) and `northwind-live` with an Approvals
+#      check (Environments, northwind-live, Approvals and checks). Approvals are not YAML: the
+#      resource owner sets them, which is the point.
+#   3. A pipeline from this file on the GitHub repository (Azure Pipelines GitHub app).
+#
+# The deployer's rights (deploy/azure/modules/delivery.bicep): AcrPush on the registry and a
+# custom role on the resource group to update the live apps and move their traffic. Nothing else.
+
+trigger:
+  branches:
+    include: [main]
+pr: none
+
+variables:
+  environment: northwind
+  resourceGroup: rg-northwind
+  serviceConnection: northwind-deployer
+  canaryPercent: 10
+
+stages:
+  - stage: Build
+    displayName: Build the live images once
+    jobs:
+      - job: images
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+            fetchDepth: 1
+          - task: AzureCLI@2
+            displayName: outputs.json from the platform deployment
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                NW_ENVIRONMENT=$(environment) NW_AZURE_RESOURCE_GROUP=$(resourceGroup) scripts/deploy_azure.sh outputs
+          - task: AzureCLI@2
+            displayName: Build and push policy, agent and mcp (tag = commit)
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                docker buildx create --use >/dev/null
+                NW_IMAGE_TAG=$(git rev-parse --short HEAD) IMAGES="policy agent mcp" scripts/images_azure.sh
+
+  - stage: Canary
+    displayName: Canary revision at $(canaryPercent) percent
+    dependsOn: Build
+    jobs:
+      - deployment: canary
+        environment: $(environment)-canary
+        pool:
+          vmImage: ubuntu-latest
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  fetchDepth: 1
+                - task: AzureCLI@2
+                  displayName: Release by digest
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      export NW_ENVIRONMENT=$(environment) NW_AZURE_RESOURCE_GROUP=$(resourceGroup)
+                      scripts/deploy_azure.sh outputs
+                      NW_IMAGE_TAG=$(git rev-parse --short HEAD) NW_CANARY_PERCENT=$(canaryPercent) scripts/deploy_azure.sh release
+
+  - stage: Promote
+    displayName: Promote after approval
+    dependsOn: Canary
+    jobs:
+      # The environment's Approvals check holds this job until a person approves in the portal.
+      - deployment: promote
+        environment: $(environment)-live
+        pool:
+          vmImage: ubuntu-latest
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  fetchDepth: 1
+                - task: AzureCLI@2
+                  displayName: Canary to 100 percent unless a live alert fires
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      export NW_ENVIRONMENT=$(environment) NW_AZURE_RESOURCE_GROUP=$(resourceGroup)
+                      scripts/deploy_azure.sh outputs
+                      REASON="Azure Pipelines run $(Build.BuildNumber) approved" scripts/deploy_azure.sh approve

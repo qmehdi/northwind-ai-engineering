@@ -34,13 +34,19 @@ log = get_logger("nw.platform.retrievers")
 
 RETRIEVER_VAR = "NW_RETRIEVER"
 INPROCESS = "inprocess"
-KINDS = (INPROCESS, "knowledge-base", "rag-engine", "qdrant")
+KINDS = (INPROCESS, "knowledge-base", "rag-engine", "ai-search", "qdrant")
 CORPUS_VARS = {
     "knowledge-base": "NW_KNOWLEDGE_BASE_ID",
     "rag-engine": "NW_RAG_CORPUS",
+    "ai-search": "NW_AZURE_SEARCH_INDEX",
     "qdrant": "NW_QDRANT_COLLECTION",
 }
-TRACK_KIND = {Track.AWS: "knowledge-base", Track.GCP: "rag-engine", Track.LOCAL: "qdrant"}
+TRACK_KIND = {
+    Track.AWS: "knowledge-base",
+    Track.GCP: "rag-engine",
+    Track.AZURE: "ai-search",
+    Track.LOCAL: "qdrant",
+}
 COLLECTION = "policies"
 
 

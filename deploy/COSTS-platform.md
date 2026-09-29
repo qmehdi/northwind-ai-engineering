@@ -122,6 +122,81 @@ As above in one project; the learner deploys before a session and destroys after
 | **Daily idle cost of a deployed platform**: gateway 1.73, Vector Search node 2.25, endpoint 1.85, storage 0.06 | **5.89 USD per day**; 1.79 per day with the endpoint and the index undeployed |
 | **Residual after destroy**: retained bucket (50 GB, 1.00 per month) and registry (10 GB, 0.95 per month); logs inside the free allotment | **about 2 USD per month** |
 
+## Azure track
+
+Region eastus2 (the default of `deploy/azure`), prices fetched 2026-09-29. Sources: the Azure Retail Prices API (`https://prices.azure.com/api/retail/prices?api-version=2023-01-01-preview&currencyCode=USD`, filtered on `armRegionName eq 'eastus2'` and the service name, pay-as-you-go consumption rows; no key needed) and, for what the API does not carry, the pricing pages `azure.microsoft.com/en-us/pricing/details/<service>/` (container-apps, monitor, cost-management, cognitive-services/content-safety, foundry-agent-service, ai-foundry-models/aoai) and Microsoft Learn's Claude billing page (`learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/claude-models-billing`, updated 2026-09-11). The Foundry models pricing page renders "$-" for every price; the API rows are the ones used. Same assumptions as the other tracks: 25 learners plus one instructor tenant, 45 days (1,080 hours), seven 8-hour session days.
+
+### Model spend
+
+| Role | Deployment (`deploy/azure/main.bicep`, `models`) | Price per million tokens in and out, Global Standard |
+| --- | --- | --- |
+| Workhorse | `gpt-oss-120b` (format OpenAI-OSS, version 1) | 0.15 and 0.60 (Foundry Models, API) |
+| Economy | `mistral-small-2503` (format Mistral AI, version 1) | 0.10 and 0.30: sold through Azure Marketplace, so the Retail Prices API has no inference row; the rate is the Foundry catalogue price as third-party trackers record it (futureagi.com, getmaxim.ai, verified 2026-08-06), confirm in the portal's Pricing tab in the delivery week. Rejected, all in eastus2 Global Standard: gpt-5.4-nano 0.20 and 1.25 (API), dearer than the Workhorse; gpt-5-nano 0.05 and 0.40 (API) retires 2027-02-09; gpt-4.1-nano retires 2026-10-14; Phi-4-mini-instruct 0.075 and 0.30 (API) has no tool calling; Ministral-3B 0.04 and 0.04 (trackers) calls tools but is a 3B model for a multi-step agent loop |
+| Judge | `claude-opus-5` (format Anthropic, version 2) | 5.00 and 25.00, cache reads 0.50 and 5-minute cache writes 6.25: Claude has no Azure price meter; it is billed through Azure Marketplace in Claude Consumption Units of 0.01 USD at Anthropic's list rates (Learn billing page); US Data Zone deployments cost 1.1 times |
+| Embeddings | `text-embedding-3-small` | 0.02 per million (API, `text-embedding-3-small-glbl`) |
+
+Per participant, the units of the model spend table above: preflight 0.01; judged harness, 60 judgements on Opus 5, 1.50; unjudged experiments 0.15; adversarial set 0.10; framework port 0.10; capstone 0.27 (a third of the steps routed to Economy, about two thirds of the Workhorse's cost per step); embeddings for the policy corpus and queries 0.02; headroom 1.00. **Model spend per participant: about 3.15 USD.** The Economy role is cheaper than the Workhorse on both input and output, which is the point of the cheap-first router; `models` in `main.bicep` and `NW_MODEL_ECONOMY` swap it in one line each.
+
+Content filters with Prompt Shields on the deployments carry no separate meter in the price list; the standalone Content Safety API would be 0.375 USD per 1,000 text records after 5,000 free a month, Prompt Shields included (Content Safety page). The Foundry Agent Service states "no additional charge for creating or running Foundry-native agents using prompts and workflows" (Agent Service page); hosted agents, file search and code interpreter show "$-" (not published). Foundry evaluations have no price of their own; the Azure ML evaluation token meters are 0.02 USD per 1,000 input and 0.06 per 1,000 output tokens (API), and the course's judged evaluations run on the Judge deployment, counted above.
+
+### Cohort mode: shared platform (deployed once per cohort by the instructor)
+
+| Component | Part of the environment | Unit price (eastus2, fetched 2026-09-29) | Cohort estimate |
+| --- | --- | --- | --- |
+| API Management Basic v2, the AI gateway | platform | 0.20548 USD per hour, 10 million calls included, then 0.03 per 10,000; the "AI Gateway Requests" meter is 0; Developer 0.0658 per hour, Standard v2 0.9589; Consumption (0.035 per 10,000 after 1 million free) has no llm-token-limit | 221.92 USD: 1,080 hours; the tier cannot be paused |
+| Azure AI Search | platform | Basic 0.101 USD per search unit hour (15 indexes), Standard S1 0.336 (50 indexes); semantic ranker free plan | 362.88 USD: S1, because 27 owners need 27 indexes; 109.08 on Basic for 14 tenants or fewer |
+| Container Registry | platform | Basic 0.1666 USD per day, Standard 0.6666; storage 0.10 USD per GB-month | 10.50 USD: 45 days plus 20 GB of images for 1.5 months, before any storage the tier includes |
+| Storage: the lake (hierarchical namespace, Hot LRS) and the workspace account (flat, Hot LRS) | platform | lake 0.018 USD per GB-month, writes 0.065 and reads 0.005 per 10,000; flat 0.0184 per GB-month, writes 0.05 and reads 0.004 per 10,000 | 7.30 USD: 50 GB in the lake and 30 GB in the workspace account for 1.5 months, 700,000 writes, 3 million reads |
+| Key Vault Standard | platform | 0.03 USD per 10,000 operations | 0.60 USD: 200,000 secret reads (every app start reads two) |
+| Log Analytics and Application Insights (workspace based) | platform | 2.76 USD per GB ingested after 5 GB free per billing account per month; 31 days retention included | 20.70 USD: 15 GB over the cohort (the workspace caps at 1 GB a day), 7.5 GB inside the free allowance |
+| Alerts, action group, workbook, budget | platform | metric alerts: first 10 time series free, then 0.10 USD each per month; log search alert at 15 minutes 0.50 per month; email notifications first 1,000 free; workbooks: no meter and no price on the Monitor page (not published); budgets free (Cost Management page) | 0.75 USD: four metric alerts inside the free series, one drift log alert |
+| Container Apps (consumption) for every owner's policy, agent and MCP apps | platform and tenant | 0.000024 USD per active vCPU-second, 0.000003 per GiB-second, 0.40 per million requests; 180,000 vCPU-seconds, 360,000 GiB-seconds and 2 million requests free per subscription per month (Container Apps page); scale to zero, no environment fee on the consumption plan | 5.83 USD: 2 active hours per tenant (2.5 vCPU, 5 GiB across the three apps) and 2 hours per session day for the live apps, less two months of free grant |
+| Live online endpoint `nw-live-triage-<scope>`, blue and green | live target | Standard_DS3_v2 0.229 USD per hour; Azure ML adds no CPU surcharge (the surcharge meters are 0) | 16.03 USD: one instance 8 hours on 7 session days plus the second colour 2 hours per session; 247.32 if left running 45 days |
+| Foundry resource, project, content filters, Agent Service basic setup | platform | no charge found in the price list for the resource or the project; tokens as above | 0 |
+| Microsoft Purview (off), Defender for Containers (off) | optional | Purview: no Data Map capacity unit meter in eastus2 (not published); Defender for Containers 0.00941 USD per vCore-hour, 0.29 per image in the "Standard Images" meter | 0 |
+| Delivery: Azure Pipelines or GitHub Actions | delivery | Azure Pipelines: one free Microsoft-hosted parallel job (not fetched today, see note); GitHub Actions free for public repositories | 0 |
+
+Per tenant (26 including the instructor):
+
+| Item | Unit price | Estimate |
+| --- | --- | --- |
+| Pipeline steps: 6 runs of 20 minutes on Standard_DS3_v2 (cluster or serverless) | 0.229 USD per hour | 0.46 USD |
+| Tenant endpoints: triage and semantic on Standard_F2s_v2, 2 hours in each of two sessions | 0.0846 USD per hour | 0.68 USD |
+| Search index and embeddings | inside the search unit; 0.02 per million embedding tokens | 0.02 USD |
+| **Tenant rows** | | **1.16 USD** |
+
+- Platform, delivery and live target add to **about 650 USD per cohort**, 26.00 per learner. Search S1 and API Management are 90 percent of it and bill every hour whether anyone works or not.
+- With model spend the **per-tenant cost is about 4.30 USD** (1.16 plus 3.15).
+- Cohort total: **about 760 USD** (650 plus 25 times 4.31).
+- Cheaper variants: 14 tenants or fewer keep Search on Basic (saves 253.80); LiteLLM instead of API Management (`NW_GATEWAY_KIND=litellm`: PostgreSQL Burstable B1ms 0.017 USD per hour and 0.115 per GB-month of storage, about 6.50 for the cohort with the database stopped between sessions) saves about 215; API Management Developer saves 150.86 but is a classic tier with no SLA, where the Anthropic API gets a request rate limit instead of the token limit.
+
+Credit to request per participant (cohort): platform share 26.00 plus per-tenant 4.31, 30.31 USD, **request 35 USD per learner**, on a pay-as-you-go subscription: Claude on Foundry cannot be deployed on free trial, student, sponsored credit-only or CSP subscriptions (Foundry Claude pages, 2026-09-22), so credits must land on a subscription with a payment method.
+
+### Solo mode
+
+As above in one resource group with one tenant; the learner deploys before a session and destroys after it (the deploy re-uploads the data and indexes; images are pushed again).
+
+| Item | Cost |
+| --- | --- |
+| Platform per session day (8 hours): API Management 1.64, Search Basic 0.81, registry 0.17, the drill on the live endpoint 0.46, the tenant endpoints 0.34 | about 3.40 USD |
+| Seven session days | 23.94 USD |
+| Kept between sessions | nothing: destroy removes the group |
+| Tenant rows | 1.16 USD |
+| Model spend | 3.15 USD |
+| **Solo cost for one learner** | **about 28 USD** |
+| If the platform is left running for 45 days instead | about 350 USD (API Management 221.92, Search Basic 109.08, the rest as above) |
+| **Daily idle cost of a deployed platform** (after `make stop-azure`: API Management, Search and the registry keep billing) | **solo 7.57 USD per day** (4.93 plus 2.42 plus 0.17 plus storage and the alert); **cohort 13.28 USD per day** with Search S1; about 2.80 per day solo with LiteLLM instead of API Management |
+| **Residual after destroy** | **0 USD**: the resource group goes, the script purges the soft-deleted Key Vault, Foundry resource and API Management names, deletes the custom role definitions and sets Defender back to Free if it was turned on |
+
+### Validation run budget, Azure
+
+| Run | Cloud side | Model spend | Budget |
+| --- | --- | --- | --- |
+| Azure cohort mode: platform plus two tenants (Search Basic) | 4.91 platform day (API Management 1.64, Search 0.81, registry 0.17, live endpoint with the split 2.29) plus 2 times 1.16 | 2 times 3.15 | 20 USD |
+| Azure solo mode | 4.91 plus 1.16 | 3.15 | 15 USD |
+
+Prices not found on a vendor page (2026-09-29): Claude has no Azure price meter (Marketplace billing at Anthropic's rates, per the Learn billing page); mistral-small-2503 is Marketplace billed and has no inference meter either (trackers' figure used); gpt-oss-20b has no pay-per-token Foundry price (fine-tuning meters only, and no serverless deployment); Foundry hosted agents, file search and code interpreter show "$-"; workbooks and dashboards have no meter; Purview has no Data Map capacity unit meter in eastus2; Azure Pipelines' free parallel job was not fetched today (the price list carries no Azure DevOps meter in the query used).
+
 ## Local track
 
 No cloud cost. Requirements to state: 16 GB RAM, about 40 GB of disk for images and models, gpt-oss-20b runs on CPU, gpt-oss-120b needs a GPU or is swapped for gpt-oss-20b in the Workhorse role by a compose profile.

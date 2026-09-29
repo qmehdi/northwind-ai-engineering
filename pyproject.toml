@@ -95,6 +95,23 @@ dev = [
     "nbclient>=0.10",
     "ipykernel>=6.29",
 ]
+# nw/platform/azure.py and nw/pipelines/azureml (ADR 0013): the Azure ML registry, pipelines and
+# online endpoints, Foundry hosted agents (azure-ai-projects: HostedAgentDefinition, RaiConfig),
+# AI Search, Blob Storage, Entra ID. Claude on Foundry needs nothing new: `anthropic` ships
+# AsyncAnthropicFoundry. The Azure Monitor trace exporter (nw/telemetry.py) resolves to 1.0.0b45,
+# which fails to import against opentelemetry-sdk 1.42.1 (it imports `LogData`, no longer there):
+# b46 and later pin the SDK to one minor (1.39, 1.40, 1.43, 1.44), never the 1.42.1 that
+# aws-opentelemetry-distro 0.18 and google-adk 2.10 both need. Until ADK lifts its cap,
+# telemetry logs a warning and traces without an exporter on Azure. ADOT 0.17 (SDK 1.40.0) with
+# exporter b53 resolves, checked 2026-09-29, and is the way out if Azure traces must ship first.
+platform-azure = [
+    "azure-ai-ml>=1.35",
+    "azure-ai-projects>=2.7",
+    "azure-identity>=1.25",
+    "azure-monitor-opentelemetry-exporter>=1.0.0b45",
+    "azure-search-documents>=12.0",
+    "azure-storage-blob>=12.26",
+]
 
 [build-system]
 requires = ["hatchling"]

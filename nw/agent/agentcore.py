@@ -86,6 +86,7 @@ async def _route(body: dict[str, Any]) -> SpecialistResponse:
 
 
 @app.get("/ping")
+@app.get("/readiness")  # Microsoft Foundry hosted agents probe /readiness on port 8088
 def ping() -> JSONResponse:
     if not service.state.ready:
         return JSONResponse({"status": "Unhealthy", "role": service.state.role}, status_code=503)

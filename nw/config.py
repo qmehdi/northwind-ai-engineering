@@ -21,7 +21,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, PrivateAttr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -29,6 +29,7 @@ class Track(StrEnum):
     AWS = "aws"
     GCP = "gcp"
     LOCAL = "local"
+    AZURE = "azure"
 
 
 class ProviderMode(StrEnum):
@@ -62,6 +63,27 @@ class ModelRole(StrEnum):
 #   (`us-central1` only; deprecated 2026-07-21, retirement announced for 2026-10-21). Requests
 #   name the model `openai/<id>` on the OpenAI-compatible chat completions endpoint
 #   `https://<region>-aiplatform.googleapis.com/v1/projects/<project>/locations/<region>/endpoints/openapi/chat/completions`.
+# - Microsoft Foundry (learn.microsoft.com/azure/foundry/foundry-models/concepts/
+#   models-sold-directly-by-azure, models-from-partners and openai/concepts/
+#   model-retirement-schedule, all fetched 2026-09-29, pages dated 2026-09-21): a role's id is
+#   the Foundry deployment name, which `deploy/azure` sets equal to the model id.
+#   `gpt-oss-120b` (format OpenAI-OSS, version 1, GlobalStandard, needs a Foundry project; the
+#   capability table marks it Preview, the retirement schedule GA with no retirement date) on
+#   the v1 chat completions endpoint `https://<resource>.services.ai.azure.com/openai/v1`.
+#   `gpt-oss-20b` is served only on managed compute and Foundry Local, not as a serverless
+#   deployment. Economy is `mistral-small-2503` (Mistral Small 3.1, format Mistral AI,
+#   version 1, GA with no retirement date, Global Standard in eastus2, tool calling and JSON
+#   output, sold through Azure Marketplace): 0.10 and 0.30 USD per million tokens against the
+#   Workhorse's 0.15 and 0.60, so the cheap-first router saves on both sides. Rejected:
+#   gpt-5.4-nano (0.20 and 1.25, dearer than the Workhorse), gpt-5-nano (0.05 and 0.40, retires
+#   2027-02-09), gpt-4.1-nano (retires 2026-10-14), Phi-4-mini-instruct (no tool calling),
+#   Ministral-3B (cheapest, but 3B parameters for a multi-step tool loop). The model is not a
+#   reasoning model, so it takes a temperature. Claude is on the Messages API at
+#   `https://<resource>.services.ai.azure.com/anthropic`: Foundry offers claude-opus-5-5,
+#   claude-opus-5, claude-opus-4-8, 4-7, 4-6, 4-5, claude-sonnet-5-5, claude-sonnet-5,
+#   4-6, 4-5, claude-haiku-4-5, claude-fable-5 and 5-1 (preview) and the gated Mythos models.
+#   The Judge is `claude-opus-5` (GA, retires 2027-07-08), the model the judge was calibrated
+#   against on the other clouds. All three deploy GlobalStandard in eastus2.
 # - Ollama (ollama.com/library/gpt-oss): tags `gpt-oss:20b` (14 GB) and `gpt-oss:120b`
 #   (65 GB), both with the `tools` and `thinking` capabilities.
 DEFAULT_MODELS: dict[Track, dict[ModelRole, str]] = {
@@ -77,6 +99,11 @@ DEFAULT_MODELS: dict[Track, dict[ModelRole, str]] = {
         # so Economy maps to gpt-oss-120b with the Economy token caps until a cheaper open
         # model is generally available.
         ModelRole.ECONOMY: "openai/gpt-oss-120b-maas",
+    },
+    Track.AZURE: {
+        ModelRole.WORKHORSE: "gpt-oss-120b",
+        ModelRole.JUDGE: "claude-opus-5",
+        ModelRole.ECONOMY: "mistral-small-2503",
     },
     Track.LOCAL: {
         # gpt-oss:120b is 65 GB and needs the compose gpu profile; a 16 GB laptop runs
@@ -111,7 +138,45 @@ def is_claude(model: str) -> bool:
 SECRET_MARKERS = ("key", "secret", "token", "password")
 
 
+# Names that match a marker but hold no credential: a vault's name is not a secret.
+NOT_SECRET = frozenset({"azure_key_vault"})
+
+
+# `make deploy-azure` writes the deployment outputs here (`scripts/deploy_azure.sh`), keyed by
+# the same `NW_AZURE_*` names as the settings. `NW_AZURE_OUTPUTS` points elsewhere; empty
+# turns the file off (the test suite does, so a deployed checkout cannot change a test).
+AZURE_OUTPUTS = Path(__file__).resolve().parents[1] / "deploy" / "azure" / "outputs.json"
+# Settings filled from the outputs file when the environment and `.env` leave them unset.
+AZURE_FROM_OUTPUTS = ("azure_apim_gateway_url",)
+
+
+def azure_outputs_path(env: Mapping[str, str] | None = None) -> Path | None:
+    e = os.environ if env is None else env
+    if "NW_AZURE_OUTPUTS" in e:
+        return Path(e["NW_AZURE_OUTPUTS"]) if e["NW_AZURE_OUTPUTS"] else None
+    return AZURE_OUTPUTS
+
+
+def read_azure_outputs(path: Path | None) -> dict[str, str]:
+    """`deploy/azure/outputs.json`: `{"NW_AZURE_ACR": "..."}`, or the ARM deployment outputs
+    `{"NW_AZURE_ACR": {"type": "String", "value": "..."}}`. Missing file, empty dict."""
+    if path is None or not path.exists():
+        return {}
+    data = json.loads(path.read_text())
+    if isinstance(data, dict) and "properties" in data:  # `az deployment ... show` whole
+        data = data["properties"].get("outputs", {})
+    out: dict[str, str] = {}
+    for key, value in (data or {}).items():
+        if isinstance(value, dict) and "value" in value:
+            value = value["value"]
+        if isinstance(value, str | int | float):
+            out[key.upper() if key.upper().startswith("NW_") else key] = str(value)
+    return out
+
+
 def is_secret(name: str) -> bool:
+    if name.lower() in NOT_SECRET:
+        return False
     return any(m in name.lower() for m in SECRET_MARKERS)
 
 
@@ -148,6 +213,29 @@ class Settings(BaseSettings):
     # keeps `gcp_region`; gpt-oss-20b is served only from us-central1.
     gcp_maas_region: str = "us-central1"
 
+    # Azure track (ADR 0013). Each has an env override and `deploy/azure/outputs.json` fills
+    # the rest (`nw.platform.azure.AzureConfig`). The Foundry endpoint is the resource's
+    # `https://<resource>.services.ai.azure.com`; the APIM gateway, when set, is the model
+    # gateway and `gateway_key` is the tenant's APIM subscription key.
+    azure_subscription_id: str | None = None
+    azure_resource_group: str | None = None
+    azure_location: str = "eastus2"
+    azure_ml_workspace: str | None = None
+    azure_foundry_endpoint: str | None = None
+    azure_foundry_project: str | None = None
+    # An API key for the Foundry resource (from Key Vault, injected by reference). Unset means
+    # Microsoft Entra ID through DefaultAzureCredential, which is the default.
+    azure_foundry_key: str | None = None
+    azure_search_endpoint: str | None = None
+    azure_key_vault: str | None = None
+    azure_acr: str | None = None
+    azure_storage_account: str | None = None
+    azure_appinsights_connection_string: str | None = None
+    # Unset here and in `.env`, it is read from `deploy/azure/outputs.json` on the azure track,
+    # so a learner never copies it. Empty (`NW_AZURE_APIM_GATEWAY_URL=`) means no APIM.
+    azure_apim_gateway_url: str | None = None
+    azure_containerapps_env: str | None = None
+
     # Local track: Ollama's OpenAI-compatible base URL, and the key that turns the Judge
     # role into a real Claude call through the Anthropic API.
     ollama_url: str = "http://localhost:11434/v1"
@@ -174,6 +262,24 @@ class Settings(BaseSettings):
     # Read here only so `describe()` can say whether it is set. `nw.auth` reads the key.
     api_key: str | None = None
 
+    _from_outputs: set[str] = PrivateAttr(default_factory=set)
+
+    @model_validator(mode="after")
+    def _azure_outputs(self) -> Settings:
+        """On the azure track, fill what the deployment knows and nobody set."""
+        if self.track is not Track.AZURE:
+            return self
+        missing = [n for n in AZURE_FROM_OUTPUTS if getattr(self, n) is None]
+        if not missing:
+            return self
+        out = read_azure_outputs(azure_outputs_path())
+        for name in missing:
+            value = out.get(f"NW_{name.upper()}")
+            if value:
+                object.__setattr__(self, name, value)
+                self._from_outputs.add(name)
+        return self
+
     def model_for(self, role: ModelRole) -> str:
         override = {
             ModelRole.WORKHORSE: self.model_workhorse,
@@ -195,8 +301,22 @@ class Settings(BaseSettings):
         return bool(self.gateway_url or self.anthropic_api_key)
 
     @property
+    def uses_apim(self) -> bool:
+        """API Management's AI gateway in front of Foundry: the azure track with its URL set and
+        no LiteLLM gateway, which wins when both are set (`make_provider`)."""
+        return (
+            self.track is Track.AZURE
+            and bool(self.azure_apim_gateway_url)
+            and not self.gateway_url
+            and self.provider is not ProviderMode.FAKE
+        )
+
+    @property
     def uses_gateway(self) -> bool:
-        return bool(self.gateway_url) and self.provider is not ProviderMode.FAKE
+        """A model gateway is in the path: LiteLLM on any track, or API Management on Azure."""
+        if self.provider is ProviderMode.FAKE:
+            return False
+        return bool(self.gateway_url) or self.uses_apim
 
     def fallback_for(self, role: ModelRole) -> str | None:
         """The fallback model for a role, or None. A fallback equal to the primary is no
@@ -227,7 +347,8 @@ class Settings(BaseSettings):
         env_file: str | Path | None = ".env",
     ) -> list[dict[str, Any]]:
         """Every setting with its effective value and where it came from: `env`, `.env`,
-        `init` (a value passed to the constructor) or `default`. Secret values are redacted
+        `outputs` (`deploy/azure/outputs.json`), `init` (a value passed to the constructor) or
+        `default`. Secret values are redacted
         to `set` or `unset` and never returned."""
         environ = dict(os.environ) if env is None else dict(env)
         dotenv = _read_dotenv(env_file)
@@ -241,6 +362,8 @@ class Settings(BaseSettings):
                 source = "env"
             elif var in dotenv:
                 source = ".env"
+            elif name in self._from_outputs:
+                source = "outputs"
             elif value != default:
                 source = "init"
             else:

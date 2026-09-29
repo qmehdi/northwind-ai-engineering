@@ -254,6 +254,10 @@ def platform_for(settings: Settings) -> Platform:
         from nw.platform.gcp import build
 
         return build(settings)
+    if settings.track == Track.AZURE:
+        from nw.platform.azure import build
+
+        return build(settings)
     from nw.platform.local import build
 
     return build(settings)

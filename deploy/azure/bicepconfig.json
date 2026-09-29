@@ -1,0 +1,21 @@
+{
+  "analyzers": {
+    "core": {
+      "enabled": true,
+      "rules": {
+        "use-recent-api-versions": { "level": "warning" },
+        "use-recent-module-versions": { "level": "off" },
+        "use-resource-symbol-reference": { "level": "warning" },
+        "use-safe-access": { "level": "warning" },
+        "use-secure-value-for-secure-inputs": { "level": "error" },
+        "secure-secrets-in-params": { "level": "error" },
+        "outputs-should-not-contain-secrets": { "level": "error" },
+        "no-hardcoded-env-urls": { "level": "warning" },
+        "no-unused-params": { "level": "warning" },
+        "no-unused-vars": { "level": "warning" },
+        "prefer-unquoted-property-names": { "level": "warning" },
+        "explicit-values-for-loc-params": { "level": "warning" }
+      }
+    }
+  }
+}

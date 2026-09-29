@@ -252,3 +252,87 @@ def test_preflight_route_lines_say_when_the_gateway_is_in_the_path():
 
     provider, failure = pf.make_provider_check(_settings(track=Track.GCP))
     assert provider is None and not failure.ok and "NW_GCP_PROJECT" in failure.detail
+
+
+# ----- preflight on azure ----------------------------------------------------------------------
+
+AZ_ENDPOINT = "https://northwind-foundry.services.ai.azure.com"
+AZ_APIM = "https://northwind-apim.azure-api.net"
+
+
+class FakeCredential:
+    def __init__(self, fail: Exception | None = None):
+        self.fail = fail
+        self.scopes: list[str] = []
+
+    def get_token(self, scope):
+        import time
+        from types import SimpleNamespace
+
+        self.scopes.append(scope)
+        if self.fail:
+            raise self.fail
+        return SimpleNamespace(token="t", expires_on=time.time() + 3600)
+
+
+def _azure(**kw) -> Settings:
+    kw.setdefault("track", Track.AZURE)
+    kw.setdefault("azure_foundry_endpoint", AZ_ENDPOINT)
+    kw.setdefault("azure_foundry_project", "northwind")
+    return _settings(**kw)
+
+
+def test_preflight_azure_track_line_and_entra_identity():
+    pf = _preflight()
+    cred = FakeCredential()
+    s = _azure(azure_apim_gateway_url=AZ_APIM, gateway_key="sub")
+    checks = {c.name: c for c in pf.check_track_auth("azure", s, azure_credential=cred)}
+    assert checks["azure track"].ok
+    assert checks["azure track"].detail == (
+        f"foundry {AZ_ENDPOINT}, project northwind, region eastus2, apim yes, {AZ_APIM}"
+    )
+    assert checks["azure identity"].ok and checks["azure identity"].required
+    assert "https://ai.azure.com/.default" in checks["azure identity"].detail
+    assert cred.scopes == ["https://ai.azure.com/.default"]
+
+
+def test_preflight_azure_identity_fails_without_a_login_and_passes_with_a_key():
+    pf = _preflight()
+    s = _azure()
+    bad = {
+        c.name: c
+        for c in pf.check_azure(s, FakeCredential(RuntimeError("DefaultAzureCredential failed")))
+    }
+    assert not bad["azure identity"].ok and bad["azure identity"].required
+    assert "az login" in bad["azure identity"].detail
+    assert "apim no" in bad["azure track"].detail
+    cred = FakeCredential()
+    keyed = {c.name: c for c in pf.check_azure(_azure(azure_foundry_key="k"), cred)}
+    assert keyed["azure identity"].ok and cred.scopes == [], "a key needs no token"
+
+
+def test_preflight_azure_without_endpoint_or_gateway_fails_the_track_line():
+    pf = _preflight()
+    checks = {
+        c.name: c for c in pf.check_azure(_azure(azure_foundry_endpoint=None), FakeCredential())
+    }
+    assert not checks["azure track"].ok and "unset" in checks["azure track"].detail
+
+
+def test_preflight_azure_routes_say_gateway_yes_behind_apim():
+    pf = _preflight()
+    s = _azure(azure_apim_gateway_url=AZ_APIM, gateway_key="sub")
+    routes = {c.name: c.detail for c in pf.check_routes(s, make_provider(s))}
+    assert routes["route workhorse"].startswith(f"gpt-oss-120b via apim-openai at {AZ_APIM}")
+    assert routes["route judge"].startswith(f"claude-opus-5 via apim-claude at {AZ_APIM}")
+    assert all(d.endswith("gateway=yes") for d in routes.values())
+    direct = _azure()
+    routes = {c.name: c.detail for c in pf.check_routes(direct, make_provider(direct))}
+    assert all(d.endswith("gateway=no") for d in routes.values())
+
+
+def test_preflight_azure_tools_check_az(monkeypatch):
+    pf = _preflight()
+    monkeypatch.setattr(pf, "_run", lambda cmd, timeout=30: (0, "2.79.0"))
+    (az,) = pf.check_track_tools("azure")
+    assert az.name == "az" and az.ok and not az.required and az.detail == "2.79.0"

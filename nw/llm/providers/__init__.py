@@ -8,6 +8,10 @@
 - AWS: Claude ids on the Anthropic SDK's Bedrock client, everything else on Converse.
 - GCP: Claude ids on the Anthropic SDK's Vertex client, everything else on the
   OpenAI-compatible managed API for open models.
+- Azure: Claude ids on the Anthropic SDK's Foundry client, everything else on the Foundry
+  resource's v1 OpenAI-compatible endpoint, both with Entra ID (or `NW_AZURE_FOUNDRY_KEY`).
+  `NW_AZURE_APIM_GATEWAY_URL` puts API Management's AI gateway in front of both, with
+  `NW_GATEWAY_KEY` as the tenant's subscription key; `NW_GATEWAY_URL` (LiteLLM) still wins.
 - Local: Ollama, with `fake-*` ids on the fake provider (the Judge without a cloud key)
   and Claude ids on the Anthropic API when `NW_ANTHROPIC_API_KEY` is set.
 
@@ -61,6 +65,26 @@ def make_provider(settings: Settings) -> LLMProvider:
             project_id=settings.gcp_project, region=settings.gcp_region, timeout_s=timeout
         )
         maas = for_google_maas(settings.gcp_project, settings.gcp_maas_region, timeout_s=timeout)
+        return RoleRouter([(is_claude, claude)], default=maas)
+
+    if settings.track == Track.AZURE:
+        from nw.llm.providers.azure_foundry import for_apim, for_foundry
+
+        if settings.azure_apim_gateway_url:
+            maas, claude = for_apim(
+                settings.azure_apim_gateway_url, settings.gateway_key, timeout_s=timeout
+            )
+        else:
+            if not settings.azure_foundry_endpoint:
+                raise ValueError(
+                    "NW_AZURE_FOUNDRY_ENDPOINT (or NW_AZURE_APIM_GATEWAY_URL) is required on the "
+                    "azure track"
+                )
+            maas, claude = for_foundry(
+                settings.azure_foundry_endpoint,
+                api_key=settings.azure_foundry_key,
+                timeout_s=timeout,
+            )
         return RoleRouter([(is_claude, claude)], default=maas)
 
     from nw.llm.providers.openai_compat import for_ollama

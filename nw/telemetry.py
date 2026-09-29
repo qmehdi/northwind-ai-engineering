@@ -8,6 +8,14 @@ One call at startup, `configure_tracing(service_name)`, picks the exporter:
   `https://xray.<region>.amazonaws.com/v1/traces`. Needs Transaction Search enabled in the
   account and `AWSXrayWriteOnlyPolicy` on the role.
 - `NW_TRACE_EXPORT=cloudtrace`: the Cloud Trace exporter. Needs `roles/cloudtrace.agent`.
+- `NW_TRACK=azure` with `APPLICATIONINSIGHTS_CONNECTION_STRING` (or
+  `NW_AZURE_APPINSIGHTS_CONNECTION_STRING`), or `NW_TRACE_EXPORT=azuremonitor`: the Azure Monitor
+  trace exporter (`azure-monitor-opentelemetry-exporter`, `AzureMonitorTraceExporter`) to
+  Application Insights, the resource Foundry's tracing and evaluations already write to. The
+  connection string carries the ingestion endpoint; Entra ID ingestion needs a credential and
+  local auth off on the resource, which the platform leaves on. If the exporter cannot be
+  imported (see the note on `platform-azure` in pyproject.toml) the service logs a warning and
+  runs without one rather than failing to start.
 - none of the above: no exporter. Spans are still created, so the code path is always
   exercised and the tests can assert on them with an in-memory exporter.
 
@@ -59,7 +67,33 @@ def _exporter(env: dict[str, str]) -> tuple[SpanExporter | None, str]:
         from opentelemetry.exporter.cloud_trace import CloudTraceSpanExporter
 
         return CloudTraceSpanExporter(project_id=env.get("NW_GCP_PROJECT") or None), "cloudtrace"
+    connection = azure_connection_string(env)
+    if connection and (mode == "azuremonitor" or (not mode and env.get("NW_TRACK") == "azure")):
+        try:
+            return azure_monitor_exporter(connection), "azuremonitor"
+        except ImportError as exc:
+            log.warning(
+                "azure monitor exporter unavailable, tracing without an exporter",
+                extra=log_fields(error=f"{type(exc).__name__}: {exc}"),
+            )
     return None, "none"
+
+
+def azure_connection_string(env: dict[str, str]) -> str:
+    """The Application Insights connection string: the variable the Azure Monitor libraries
+    read, or the course's own name for it."""
+    return env.get("APPLICATIONINSIGHTS_CONNECTION_STRING") or env.get(
+        "NW_AZURE_APPINSIGHTS_CONNECTION_STRING", ""
+    )
+
+
+def azure_monitor_exporter(connection_string: str) -> SpanExporter:
+    """`AzureMonitorTraceExporter(connection_string=...)`, imported here so every other track
+    runs without the package. Tests replace this function; constructing the exporter sends
+    nothing."""
+    from azure.monitor.opentelemetry.exporter import AzureMonitorTraceExporter
+
+    return AzureMonitorTraceExporter(connection_string=connection_string)
 
 
 def configure_tracing(

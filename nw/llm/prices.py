@@ -5,7 +5,13 @@ endpoint prices for the `anthropic.` IDs (verified 2026-09-08); open-weight and 
 prices per ADR 0010 (Bedrock and Google pricing pages, fetched 2026-09-29; Nova Micro
 and gpt-oss-20b on Google from third-party trackers of the same pages, the vendor
 tables being too long for the fetch, so confirm them in the delivery week). Ollama
-is priced at zero: the laptop is already paid for. Replace this table from the
+is priced at zero: the laptop is already paid for. Azure (ADR 0013), eastus2 Global Standard,
+fetched 2026-09-29: gpt-oss-120b from the Azure Retail Prices API (meters `gpt-oss-120B Inp
+glbl` and `Outp glbl`); mistral-small-2503 is sold through Azure Marketplace and has no
+Retail Prices row, so its rate is the Foundry catalogue price recorded by third-party
+trackers (confirm in the portal's Pricing tab); Claude on Foundry bills Anthropic's own
+per-model rates in Claude Consumption Units (Learn, claude-models-billing, updated
+2026-09-11), so claude-opus-5 already carries the right price. Replace this table from the
 provider's pricing page before each delivery, and treat every number as an estimate
 until the cloud bill confirms it. Unknown models fall back to the workhorse rate so a
 cost is always recorded, and the meter logs the fallback.
@@ -37,6 +43,10 @@ _NOVA_MICRO = Price(0.035, 0.14, 0.00875, 0.035)
 # Google's managed API for open models, standard requests.
 _GPT_OSS_120B_GOOGLE = Price(0.09, 0.36, 0.09, 0.09)
 _GPT_OSS_20B_GOOGLE = Price(0.07, 0.25, 0.007, 0.07)
+# Microsoft Foundry, Global Standard in eastus2. gpt-oss-120b has no cached-input meter;
+# Mistral Small 3.1 has no prompt caching on Foundry.
+_GPT_OSS_120B_AZURE = Price(0.15, 0.60, 0.15, 0.15)
+_MISTRAL_SMALL_AZURE = Price(0.10, 0.30, 0.10, 0.10)
 _FREE = Price(0.0, 0.0, 0.0, 0.0)
 
 PRICES: dict[str, Price] = {
@@ -60,6 +70,10 @@ PRICES: dict[str, Price] = {
     # Google managed API ids
     "openai/gpt-oss-120b-maas": _GPT_OSS_120B_GOOGLE,
     "openai/gpt-oss-20b-maas": _GPT_OSS_20B_GOOGLE,
+    # Microsoft Foundry deployment names (the Azure track sends the deployment name as the
+    # model id); claude-opus-5 above is Anthropic's rate, which is what Foundry bills.
+    "gpt-oss-120b": _GPT_OSS_120B_AZURE,
+    "mistral-small-2503": _MISTRAL_SMALL_AZURE,
     # Ollama tags on the Local track
     "gpt-oss:120b": _FREE,
     "gpt-oss:20b": _FREE,

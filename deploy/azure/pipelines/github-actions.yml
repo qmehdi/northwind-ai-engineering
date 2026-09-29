@@ -1,0 +1,65 @@
+# The documented alternative to deploy/azure/pipelines/azure-pipelines.yml: the same three stages
+# in GitHub Actions, signing in to Azure with OpenID Connect (no secret; the `northwind-deployer`
+# identity trusts this repository through the federated credentials that `NW_GITHUB_REPOSITORY`
+# adds). Not active here: copy it to .github/workflows/azure-delivery.yml to use it, and create
+# the GitHub environment `northwind-live` with required reviewers (the manual approval).
+#
+# Repository secrets: AZURE_CLIENT_ID (the output NW_AZURE_DEPLOYER_CLIENT_ID), AZURE_TENANT_ID,
+# AZURE_SUBSCRIPTION_ID.
+name: azure-delivery
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  NW_ENVIRONMENT: northwind
+  NW_AZURE_RESOURCE_GROUP: rg-northwind
+  NW_CANARY_PERCENT: "10"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - uses: docker/setup-buildx-action@v3
+      - run: scripts/deploy_azure.sh outputs
+      - run: NW_IMAGE_TAG=$(git rev-parse --short HEAD) IMAGES="policy agent mcp" scripts/images_azure.sh
+
+  canary:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - run: scripts/deploy_azure.sh outputs
+      - run: NW_IMAGE_TAG=$(git rev-parse --short HEAD) scripts/deploy_azure.sh release
+
+  promote:
+    needs: canary
+    runs-on: ubuntu-latest
+    # Required reviewers on this environment are the manual approval.
+    environment: northwind-live
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - run: scripts/deploy_azure.sh outputs
+      - run: REASON="GitHub run ${{ github.run_id }} approved by the northwind-live reviewers" scripts/deploy_azure.sh approve

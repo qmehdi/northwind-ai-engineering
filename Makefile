@@ -1,7 +1,7 @@
 .PHONY: package-sagemaker baseline-sagemaker serve-vertex setup setup-local local-up local-down local-pull local-status local-canary local-promote local-higher-up local-bootstrap local-test setup-aws platform-aws-test tenants-aws status-aws gateway-key-aws prompts-catalog rotate-key release openapi check-openapi data-manifest check-data audit check test lint fmt preflight session01 session02 data-check train-triage runs promote-triage backtest-triage mlflow-ui serve-triage image-triage images up up-observability down session03 train-semantic export-semantic benchmark runs-semantic promote-semantic backtest-semantic index serve-semantic session04 index-policy eval-policy check-index prompts eval-policy-free feedback-policy calibrate-judge serve-policy session05 agent-eval agent-gate agent-gate-offline catalog catalog-check roles agent-cards registry registry-check agentops-check approve review replay specialists agent-eval-strands agent-eval-adk mcp pipeline-compile pipeline-run-local pipeline-submit pipeline-definition-aws pipeline-upsert-aws pipeline-upload-gcp images-aws
 
 setup:            ## Create the virtualenv and install everything, deep learning and agents included
-	uv sync --extra dev --extra dl --extra agents --extra agents-aws --extra agents-gcp --extra mlops --extra pipelines --extra local --extra platform-aws --extra platform-gcp
+	uv sync --extra dev --extra dl --extra agents --extra agents-aws --extra agents-gcp --extra mlops --extra pipelines --extra local --extra platform-aws --extra platform-gcp --extra platform-azure
 	uv run pre-commit install
 
 check: lint test  ## What CI runs
@@ -372,3 +372,60 @@ destroy-gcp:      ## GCP: terraform destroy the platform, then the live services
 
 platform-gcp-test: ## GCP: the platform client tests and the Terraform validate and plan tests
 	uv run pytest -q tests/platform/test_gcp_platform.py tests/platform/test_gcp_terraform.py
+
+.PHONY: setup-azure platform-azure-test describe-azure pipeline-definition-azure
+setup-azure:      ## Azure track: the platform clients (Azure ML, Foundry projects, AI Search, Blob, identity) into the virtualenv, and the Bicep CLI
+	uv sync --extra dev --extra platform-azure
+	scripts/deploy_azure.sh setup
+
+platform-azure-test: ## Azure: the platform client, naming, provider and Azure ML pipeline tests, no subscription needed
+	uv run pytest -q tests/platform/test_azure_platform.py tests/platform/test_azure_naming.py tests/session01/test_providers_azure.py tests/pipelines/test_azureml.py
+
+describe-azure:   ## Azure: what the platform client resolved (NW_AZURE_* and deploy/azure/outputs.json) and the tenant's resource names
+	uv run python -m nw.platform.azure describe
+
+pipeline-definition-azure: ## Azure: the tenant's Azure ML pipeline job as YAML, without calling Azure (PIPELINE=triage|semantic)
+	uv run python -m nw.platform.azure pipeline-definition $(or $(PIPELINE),triage)
+
+.PHONY: build-azure what-if-azure deploy-azure tenants-azure status-azure stop-azure start-azure destroy-azure images-azure release-azure approve-azure keys-azure indexes-azure bicep-azure-test
+build-azure:      ## Azure: bicep build and lint deploy/azure/main.bicep, no Azure call
+	scripts/deploy_azure.sh build
+
+what-if-azure:    ## Azure: what the deployment would change (reads the subscription). NW_TENANTS=alice,bob or NW_MODE=solo
+	scripts/deploy_azure.sh what-if
+
+deploy-azure:     ## Azure: deploy the platform, upload data and baselines, create the search indexes. Read deploy/COSTS-platform.md first
+	scripts/deploy_azure.sh deploy
+
+tenants-azure:    ## Azure: what each tenant got; ACTION=add|remove TENANT=carol changes the cohort
+	scripts/deploy_azure.sh tenants $(ACTION) $(TENANT)
+
+status-azure:     ## Azure: endpoints, apps and traffic, model deployments, pipeline jobs, schedules, fired alerts
+	scripts/deploy_azure.sh status
+
+stop-azure:       ## Azure: delete the online deployments, idle the apps, stop the LiteLLM database
+	scripts/deploy_azure.sh stop
+
+start-azure:      ## Azure: start the LiteLLM database; endpoints refill on the next approval
+	scripts/deploy_azure.sh start
+
+destroy-azure:    ## Azure: delete the resource group, purge soft-deleted names, remove the custom roles
+	scripts/deploy_azure.sh destroy
+
+images-azure:     ## Azure: build and push every image, the pipelines image included, to the platform registry (IMAGES="policy agent")
+	scripts/images_azure.sh
+
+release-azure:    ## Azure: a new revision of the live policy and agent apps by digest at the canary weight
+	scripts/deploy_azure.sh release
+
+approve-azure:    ## Azure: give the canary revisions all the traffic unless a live alert fires (REASON="...")
+	REASON="$(REASON)" scripts/deploy_azure.sh approve
+
+keys-azure:       ## Azure: register the owners' keys with LiteLLM (gateway kind litellm); APIM keys need nothing
+	scripts/deploy_azure.sh keys
+
+indexes-azure:    ## Azure: create the per-owner search indexes and their index-scoped roles again
+	scripts/deploy_azure.sh indexes
+
+bicep-azure-test: ## Azure: the Bicep build, lint and naming tests, no subscription needed
+	uv run pytest -q tests/platform/test_azure_bicep.py

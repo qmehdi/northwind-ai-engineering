@@ -7,7 +7,9 @@ before the first session.
 Checks:
 - Python version and virtualenv
 - uv, Docker, git
-- the track's CLI is authenticated (aws sts get-caller-identity / gcloud auth list)
+- the track's CLI is authenticated (aws sts get-caller-identity / gcloud auth list); on azure,
+  the Foundry endpoint, project, region and whether API Management is in the path, then an Entra
+  ID token for https://ai.azure.com/.default from DefaultAzureCredential (or the key is set)
 - per model role: the model id, the provider and endpoint it resolves to, and whether the
   model gateway is in the path (no network; `nw.llm.providers.make_provider` decides)
 - one real round trip per model role on the aws and gcp tracks (spends a fraction of a
@@ -15,7 +17,7 @@ Checks:
 - the accelerator PyTorch would see (reported, not required; the deep learning part has a fallback)
 - free disk for model weights
 - warned, not required: docker compose, huggingface.co reachable, application default
-  credentials and terraform on gcp, node and cdk on aws
+  credentials and terraform on gcp, node and cdk on aws, the az CLI on azure
 """
 
 from __future__ import annotations
@@ -25,7 +27,9 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
+from typing import Any
 
 REQUIRED_PY = (3, 12)
 FREE_DISK_GB = 6
@@ -94,7 +98,57 @@ def check_accelerator() -> Check:
         )
 
 
-def check_track_auth(track: str, settings) -> list[Check]:
+AZURE_SCOPE = "https://ai.azure.com/.default"
+
+
+def check_azure(settings, credential: Any = None) -> list[Check]:
+    """The Azure track line and the identity check. `credential` is any azure-identity
+    credential; the default is DefaultAzureCredential (the `az login` session on a laptop).
+    Tests pass a fake, so nothing here reaches the network in the suite."""
+    endpoint = settings.azure_foundry_endpoint or ""
+    apim = settings.azure_apim_gateway_url or ""
+    fake = settings.provider.value == "fake"
+    line = (
+        f"foundry {endpoint or '(NW_AZURE_FOUNDRY_ENDPOINT unset)'}, "
+        f"project {settings.azure_foundry_project or '(unset)'}, "
+        f"region {settings.azure_location}, "
+        f"apim {'yes, ' + apim if settings.uses_apim else 'no'}"
+    )
+    checks = [Check("azure track", fake or bool(endpoint or apim), line)]
+    if settings.azure_foundry_key:
+        checks.append(Check("azure identity", True, "NW_AZURE_FOUNDRY_KEY set: key auth"))
+        return checks
+    try:
+        if credential is None:
+            from azure.identity import DefaultAzureCredential
+
+            credential = DefaultAzureCredential()
+        token = credential.get_token(AZURE_SCOPE)
+        minutes = max(0, int((token.expires_on - time.time()) // 60))
+        checks.append(
+            Check(
+                "azure identity",
+                True,
+                f"Entra ID token for {AZURE_SCOPE}, expires in {minutes} min",
+                required=not fake,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        detail = f"{type(exc).__name__}: {str(exc).splitlines()[0] if str(exc) else ''}"
+        checks.append(
+            Check(
+                "azure identity",
+                False,
+                f"no Entra ID token ({detail[:120]}); run az login or set NW_AZURE_FOUNDRY_KEY",
+                required=not fake,
+            )
+        )
+    return checks
+
+
+def check_track_auth(track: str, settings, azure_credential: Any = None) -> list[Check]:
+    if track == "azure":
+        return check_azure(settings, azure_credential)
     if track == "aws":
         code, out = _run(["aws", "sts", "get-caller-identity", "--output", "text"])
         return [Check("aws identity", code == 0, out.replace("\t", " ")[:100])]
@@ -204,6 +258,8 @@ def check_track_tools(track: str) -> list[Check]:
             check_tool("node", ["--version"], required=False),
             check_tool("npx cdk", ["--version"], required=False, timeout=120),
         ]
+    if track == "azure":
+        return [check_tool("az", ["version", "--query", '"azure-cli"', "-o", "tsv"], False, 60)]
     if track == "gcp":
         code, out = _run(["gcloud", "auth", "application-default", "print-access-token"])
         return [

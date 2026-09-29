@@ -1,0 +1,25 @@
+{
+  "name": "__NAME__",
+  "fields": [
+    { "name": "key", "type": "Edm.String", "key": true, "searchable": false, "filterable": false, "sortable": false, "facetable": false, "retrievable": true },
+    { "name": "id", "type": "Edm.String", "searchable": false, "filterable": true, "sortable": false, "facetable": false, "retrievable": true },
+    { "name": "text", "type": "Edm.String", "searchable": true, "filterable": false, "sortable": false, "facetable": false, "retrievable": true },
+    { "name": "metadata", "type": "Edm.String", "searchable": false, "filterable": false, "sortable": false, "facetable": false, "retrievable": true },
+    { "name": "vector", "type": "Collection(Edm.Single)", "searchable": true, "retrievable": true, "dimensions": __DIMENSIONS__, "vectorSearchProfile": "nw-hnsw-profile" }
+  ],
+  "vectorSearch": {
+    "algorithms": [ { "name": "nw-hnsw", "kind": "hnsw" } ],
+    "profiles": [ { "name": "nw-hnsw-profile", "algorithm": "nw-hnsw", "vectorizer": "nw-foundry" } ],
+    "vectorizers": [
+      {
+        "name": "nw-foundry",
+        "kind": "azureOpenAI",
+        "azureOpenAIParameters": {
+          "resourceUri": "__FOUNDRY__",
+          "deploymentId": "__EMBEDDING__",
+          "modelName": "__EMBEDDING__"
+        }
+      }
+    ]
+  }
+}

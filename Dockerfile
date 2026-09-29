@@ -6,7 +6,7 @@
 #   docker build --build-arg APP=nw.policy.service:app   --build-arg ARTIFACTS="policy" --build-arg HF_MODELS=1 -t nw-policy .
 #   docker build --build-arg APP=nw.agent.service:app    --build-arg ARTIFACTS="triage semantic index policy" --build-arg HF_MODELS=1 -t nw-agent .
 #   docker build --build-arg APP=mcp --build-arg ARTIFACTS="triage semantic index policy" --build-arg HF_MODELS=1 -t nw-mcp .
-#   docker build --build-arg APP=pipelines --build-arg ARTIFACTS="" --build-arg EXTRAS="--extra dl --extra mlops --extra pipelines" -t nw-pipelines .
+#   docker build --build-arg APP=pipelines --build-arg ARTIFACTS="" --build-arg EXTRAS="--extra dl --extra mlops --extra pipelines --extra platform-aws --extra platform-gcp --extra platform-azure" -t nw-pipelines .
 #     (the pipelines image runs the steps under Kubeflow, Vertex or SageMaker; it carries kfp, the production summaries in
 #      data/golden as a fallback for the ones the deploy copies to <artifacts>/baselines/, and the Project 2 base encoder.
 #      Built by make local-up, scripts/images_gcp.sh (plus --extra platform-gcp), make images-aws and the AWS delivery pipeline)
@@ -33,7 +33,7 @@ COPY --from=uv /uv /bin/uv
 WORKDIR /app
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never
 COPY pyproject.toml uv.lock .python-version README.md ./
-ARG EXTRAS="--extra dl --extra agents --extra agents-aws --extra agents-gcp"
+ARG EXTRAS="--extra dl --extra agents --extra agents-aws --extra agents-gcp --extra platform-azure"
 RUN uv sync --frozen --no-dev --no-install-project $EXTRAS
 COPY nw ./nw
 RUN uv sync --frozen --no-dev $EXTRAS

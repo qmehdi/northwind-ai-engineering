@@ -8,6 +8,10 @@ Notable changes to this repository. The format follows [Keep a Changelog](https:
 
 ### Added
 
+- Azure: `NW_AZURE_APIM_GATEWAY_URL` is read from `deploy/azure/outputs.json` when unset; `NW_GATEWAY_URL` means LiteLLM only (the Bicep no longer sets it to the API Management URL); `platform.agents.deploy` gives hosted agents the APIM route and the Foundry endpoint.
+- Azure: preflight prints `azure track`, `azure identity` (an Entra ID token for `https://ai.azure.com/.default`, or the key) and `az`; `route` lines say `gateway=yes` behind API Management.
+- Azure: `AzurePromptShields` screener (Content Safety `text:shieldPrompt`, api-version 2024-09-01) when `NW_AZURE_CONTENT_SAFETY_ENDPOINT` is set; the endpoint is a Bicep output.
+- Azure: the Azure Monitor trace exporter in `nw/telemetry.py` on the azure track with an Application Insights connection string; it degrades to no exporter while the OpenTelemetry pin keeps it from importing.
 - API versioning: every route under `/v1`, the bare paths kept as deprecated aliases for one release, `x-api-version` and `x-nw-version` on every response, `api_version` and `nw_version` in `/version` (`nw/api.py`).
 - OpenAPI snapshots in `docs/openapi/`; `scripts/openapi_snapshot.py --check` fails on a removed path, a removed or retyped field, or a new required field, and passes additive change.
 - API key ids: `NW_API_KEY` accepts one secret or a JSON map of key id to secret, from the environment or the cloud secret; every request line carries `api_key_id`, never the secret; `nw_requests_by_key_total{key_id}`; unknown keys are rejected.

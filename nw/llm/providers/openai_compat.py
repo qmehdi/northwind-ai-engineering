@@ -274,7 +274,7 @@ class OpenAICompatProvider:
         max_tokens: int = 1024,
         temperature: float | None = None,
     ) -> Completion:
-        body = build_request(
+        body = self._build(
             messages,
             model=model,
             system=system,
@@ -299,8 +299,31 @@ class OpenAICompatProvider:
             payload,
             model=model,
             latency_ms=latency_ms,
-            request_id=response.headers.get("x-request-id"),
+            request_id=self._request_id(response),
         )
+
+    def _build(
+        self,
+        messages: list[Message],
+        *,
+        model: str,
+        system: str | None,
+        tools: list[ToolSpec] | None,
+        max_tokens: int,
+        temperature: float | None,
+    ) -> dict[str, Any]:
+        """The request body; a subclass for an endpoint with its own dialect overrides it."""
+        return build_request(
+            messages,
+            model=model,
+            system=system,
+            tools=tools,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+
+    def _request_id(self, response: httpx.Response) -> str | None:
+        return response.headers.get("x-request-id")
 
     async def aclose(self) -> None:
         await self._client.aclose()
