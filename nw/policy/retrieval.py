@@ -131,7 +131,14 @@ class OverlapReranker:
 
 def rrf(rankings: list[list[str]], k: int = 60) -> dict[str, float]:
     """Reciprocal rank fusion: each list contributes 1 / (k + rank)."""
-    return {cid: 1.0 for cid in rankings[0]}  # the hybrid retrieval step: fuse both lists
+    # SOLUTION BEGIN
+    fused: dict[str, float] = {}
+    for ranking in rankings:
+        for rank, cid in enumerate(ranking, 1):
+            fused[cid] = fused.get(cid, 0.0) + 1.0 / (k + rank)
+    return fused
+    # STUB: return {cid: 1.0 for cid in rankings[0]}  # the hybrid retrieval step: fuse both lists
+    # SOLUTION END
 
 
 class PolicyIndex:
@@ -196,7 +203,27 @@ class PolicyIndex:
         line for any retriever that cannot filter in the store.
         """
         mask = self.visible(audience, current_only)
-        return self.dense(query, k, mask)  # hybrid: BM25, fusion, reranker
+        # SOLUTION BEGIN
+        dense = self.dense(query, candidates, mask)
+        if hybrid:
+            lexical = self.lexical(query, candidates, mask)
+            fused = rrf([[r.chunk.id for r in dense], [r.chunk.id for r in lexical]])
+            pool = [
+                Retrieved(self.by_id[cid], s, "hybrid")
+                for cid, s in sorted(fused.items(), key=lambda kv: -kv[1])
+            ]
+        else:
+            pool = dense
+        pool = [r for r in pool if self._allowed(r.chunk, current_only, audience)]
+        if rerank and self.reranker is not None and pool:
+            scores = self.reranker.score(query, [r.chunk.text for r in pool[: max(k * 3, 10)]])
+            pool = sorted(
+                (Retrieved(r.chunk, s, "reranked") for r, s in zip(pool, scores, strict=False)),
+                key=lambda r: -r.score,
+            )
+        return pool[:k]
+        # STUB: return self.dense(query, k, mask)  # hybrid: BM25, fusion, reranker
+        # SOLUTION END
 
     @staticmethod
     def _allowed(chunk: Chunk, current_only: bool, audience: str) -> bool:

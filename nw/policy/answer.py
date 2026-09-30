@@ -104,7 +104,58 @@ async def answer(
     min_score: float = 0.0,
     role: ModelRole = ModelRole.WORKHORSE,
 ) -> Answer:
-    raise NotImplementedError("Answer: refuse when weak, answer, validate citations")
+    # SOLUTION BEGIN
+    if weak_retrieval(retrieved, min_score):
+        return Answer(
+            text=REFUSAL,
+            citations=[],
+            confidence=0.0,
+            refused=True,
+            reason="weak_retrieval",
+            context_ids=[r.chunk.id for r in retrieved],
+            prompt_version=ANSWER_PROMPT.version,
+        )
+    context, ids = build_context(retrieved)
+    prompt = f"Context passages:\n\n{context}\n\nQuestion: {safe_question(question)}"
+    draft = await client.structured(
+        prompt, Draft, role=role, system=ANSWER_PROMPT.text, max_tokens=800
+    )
+    if not draft.answerable:
+        return Answer(
+            text=REFUSAL,
+            citations=[],
+            confidence=draft.confidence,
+            refused=True,
+            reason="model_unanswerable",
+            context_ids=ids,
+            prompt_version=ANSWER_PROMPT.version,
+        )
+    allowed = set(ids)
+    kept = [c for c in draft.citations if c in allowed]
+    dropped = [c for c in draft.citations if c not in allowed]
+    if not kept:
+        # An answer with no valid citation is an answer from memory. Refuse it.
+        return Answer(
+            text=REFUSAL,
+            citations=[],
+            confidence=draft.confidence,
+            refused=True,
+            reason="no_valid_citation",
+            context_ids=ids,
+            dropped_citations=dropped,
+            prompt_version=ANSWER_PROMPT.version,
+        )
+    return Answer(
+        text=draft.answer.strip(),
+        citations=kept,
+        confidence=draft.confidence,
+        refused=False,
+        context_ids=ids,
+        dropped_citations=dropped,
+        prompt_version=ANSWER_PROMPT.version,
+    )
+    # STUB: raise NotImplementedError("Answer: refuse when weak, answer, validate citations")
+    # SOLUTION END
 
 
 def as_dict(a: Answer) -> dict[str, Any]:

@@ -229,7 +229,26 @@ def redact(
     text: str, *, keep: Collection[str] = (), detector: Detector | None | bool = True
 ) -> Redaction:
     """Replace every sensitive match with a stable token like `[EMAIL_1]`."""
-    return Redaction(text=text)  # the redaction step: nothing is redacted yet
+    # SOLUTION BEGIN
+    mapping: dict[str, str] = {}
+    counters: dict[str, int] = {}
+
+    def token_for(kind: str, value: str) -> str:
+        if value not in mapping:
+            counters[kind] = counters.get(kind, 0) + 1
+            mapping[value] = f"[{kind}_{counters[kind]}]"
+        return mapping[value]
+
+    parts: list[str] = []
+    cursor = 0
+    for span in detect(text, keep=keep, detector=detector):
+        parts.append(text[cursor : span.start])
+        parts.append(token_for(span.kind, text[span.start : span.end]))
+        cursor = span.end
+    parts.append(text[cursor:])
+    return Redaction(text="".join(parts), mapping=mapping)
+    # STUB: return Redaction(text=text)  # the redaction step: nothing is redacted yet
+    # SOLUTION END
 
 
 AGENT_KEEP = ("ACCOUNT", "INVOICE")

@@ -161,7 +161,19 @@ JUDGE_PROMPT = register("policy.judge", JUDGE_SYSTEM)
 
 def retrieval_metrics(retrieved: list[Retrieved], gold: list[str]) -> tuple[float, float]:
     """recall@k: share of gold chunks in the retrieved list. MRR: 1 / rank of the first gold hit."""
-    return 0.0, 0.0  # the harness step: recall@k and MRR against the gold ids
+    # SOLUTION BEGIN
+    if not gold:
+        return 1.0, 1.0
+    ids = [r.chunk.id for r in retrieved]
+    hits = sum(1 for g in gold if g in ids)
+    rr = 0.0
+    for rank, cid in enumerate(ids, 1):
+        if cid in gold:
+            rr = 1.0 / rank
+            break
+    return hits / len(gold), rr
+    # STUB: return 0.0, 0.0  # the harness step: recall@k and MRR against the gold ids
+    # SOLUTION END
 
 
 def recall_at(retrieved: list[Retrieved], gold: list[str], n: int) -> float:
@@ -451,7 +463,19 @@ def gate(
     """Names of metrics that regressed beyond the tolerance. Empty means pass. `keys` narrows
     the comparison: the retrieval-only run in CI gates on recall and MRR alone, because its
     refusals and citations never met a model."""
-    return []  # the regression gate step: fail on a drop past max_drop
+    # SOLUTION BEGIN
+    failures = []
+    for key in keys:
+        cur, base = current.get(key), baseline.get(key)
+        if cur is None or base is None:
+            continue
+        if cur < base - max_drop:
+            failures.append(f"{key}: {cur:.3f} < baseline {base:.3f} - {max_drop}")
+    if "citation_validity" in keys and current["citation_validity"] < 1.0:
+        failures.append(f"citation_validity must be 1.0, got {current['citation_validity']:.3f}")
+    return failures
+    # STUB: return []  # the regression gate step: fail on a drop past max_drop
+    # SOLUTION END
 
 
 def comparability(current: dict[str, Any], baseline: dict[str, Any]) -> list[str]:

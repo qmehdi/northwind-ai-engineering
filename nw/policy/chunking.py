@@ -81,7 +81,26 @@ def parse_document(text: str) -> Document:
 
 def split_sections(body: str) -> list[tuple[str, str]]:
     """(heading, text) pairs. Text before the first heading is the preamble."""
-    return [("Whole document", body.strip())]  # the chunking step: split on headings
+    # SOLUTION BEGIN
+    sections: list[tuple[str, str]] = []
+    positions = [
+        (m.start(), m.end(), m.group(2).strip(), len(m.group(1))) for m in _HEADING.finditer(body)
+    ]
+    if not positions:
+        return [("Preamble", body.strip())] if body.strip() else []
+    first = positions[0][0]
+    if body[:first].strip():
+        sections.append(("Preamble", body[:first].strip()))
+    for i, (_start, end, heading, level) in enumerate(positions):
+        stop = positions[i + 1][0] if i + 1 < len(positions) else len(body)
+        text = body[end:stop].strip()
+        if level == 1 and not text:
+            continue  # the title line
+        if text:
+            sections.append((heading, text))
+    return sections
+    # STUB: return [("Whole document", body.strip())]  # the chunking step: split on headings
+    # SOLUTION END
 
 
 def approx_tokens(text: str) -> int:
