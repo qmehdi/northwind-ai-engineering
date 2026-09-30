@@ -64,6 +64,10 @@ FROM ${PYTHON_IMAGE} AS runtime
 # Everything every service image shares comes first, before any per-image ARG: an ARG in scope
 # is part of each later RUN's cache key, so declaring APP or LAMBDA above these lines gave every
 # service its own copy of the 2 GB virtualenv layer (and filled a 70 GB Docker disk on Local).
+# Debian security updates on top of the pinned base: the digest pins the image, but fixed OS
+# packages (openssl, say) often land in Debian before the upstream image is rebuilt, and the
+# image workflow's Trivy scan fails on a CRITICAL or HIGH with a fix available.
+RUN apt-get update && apt-get upgrade -y --no-install-recommends && rm -rf /var/lib/apt/lists/*
 RUN useradd --create-home --uid 10001 nw && mkdir -p /app/hf /tmp/traces && chown -R nw:nw /app /tmp/traces
 WORKDIR /app
 COPY --from=builder --chown=nw:nw /app/.venv /app/.venv
