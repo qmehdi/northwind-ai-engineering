@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import random
+
 from pydantic import BaseModel, Field
 
 
@@ -23,4 +25,10 @@ class RetryPolicy(BaseModel):
           better than equal jitter; see the AWS Architecture Blog post
           "Exponential Backoff And Jitter".
         """
-        raise NotImplementedError("Service layer, backoff: Retry-After, then full jitter")
+        # SOLUTION BEGIN
+        if retry_after_s is not None:
+            return min(max(retry_after_s, 0.0), self.retry_after_cap_s)
+        ceiling = min(self.max_delay_s, self.base_delay_s * (2 ** (attempt - 1)))
+        return random.uniform(0.0, ceiling)
+        # STUB: raise NotImplementedError("Service layer, backoff: Retry-After, then full jitter")
+        # SOLUTION END

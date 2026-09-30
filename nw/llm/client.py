@@ -40,16 +40,17 @@ import hashlib
 import json
 import re
 import time
+import uuid
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from nw.config import ModelRole, Residency, Settings
 from nw.config import settings as default_settings
 from nw.llm.breaker import CircuitBreaker
-from nw.llm.cost import CostMeter, CostScope, cost_scope
+from nw.llm.cost import CostMeter, CostScope, cost_scope, cost_usd
 from nw.llm.errors import (
     CircuitOpenError,
     ContentFilteredError,
@@ -61,11 +62,13 @@ from nw.llm.errors import (
     TerminalError,
     TokenBudgetExceeded,
 )
+from nw.llm.prompts import STRUCTURED_INSTRUCTIONS, version_for
 from nw.llm.provider import LLMProvider
 from nw.llm.residency import current_residency
 from nw.llm.retry import RetryPolicy
 from nw.llm.types import Completion, Message, ToolSpec, Usage
-from nw.logging import get_logger, log_fields
+from nw.logging import correlation_id, get_logger, log_fields
+from nw.telemetry import span
 
 Sleep = Callable[[float], Awaitable[None]]
 
@@ -180,7 +183,116 @@ class LLMClient:
         caller does not pass one it is looked up from the registry by the text of `system`.
         `timeout_s` overrides `Settings.request_timeout_s` for this call.
         """
-        raise NotImplementedError("Service layer, complete: semaphore, retries, metering")
+        # SOLUTION BEGIN
+        messages = [Message.user(prompt)] if isinstance(prompt, str) else prompt
+        residency = current_residency()
+        try:
+            model = self.model_for(role)
+        except ResidencyError as exc:
+            # Refused before any network, and said so: never silently sent out of the zone.
+            log.warning(
+                "residency refused",
+                extra=log_fields(role=role.value, residency=residency.value, reason=str(exc)),
+            )
+            raise
+        request_id = uuid.uuid4().hex[:12]
+        # A rough reservation: assume the call costs as much as the largest output we
+        # allowed plus a modest prompt. It is released and replaced by the real cost.
+        estimate = cost_usd(model, Usage(input_tokens=2 * max_tokens, output_tokens=max_tokens))
+        prompt_version = prompt_version or version_for(system)
+        timeout = timeout_s or self._timeout_s
+        deadline = _Deadline(self._deadline_s)
+
+        async def attempt(m: str) -> Completion:
+            async with self._sem:
+                self.meter.reserve(estimate)
+                try:
+                    return await self._timed(
+                        self._provider.complete(
+                            messages,
+                            model=m,
+                            system=system,
+                            tools=tools,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                        ),
+                        deadline.cap(timeout, m),
+                        m,
+                    )
+                finally:
+                    self.meter.release(estimate)
+
+        with span(
+            "llm.complete",
+            **{
+                "gen_ai.request.model": model,
+                "nw.role": role.value,
+                "nw.prompt_version": prompt_version,
+                "nw.residency": residency.value,
+            },
+        ) as sp:
+            try:
+                completion, outcome = await self._with_fallback(
+                    request_id, role, attempt, deadline=deadline
+                )
+            except ContentFilteredError as exc:
+                # The refusal still consumed tokens: meter it, and hand the record to the caller.
+                refused = exc.completion
+                if refused is not None:
+                    exc.cost = self.meter.record(
+                        request_id,
+                        refused.model or model,
+                        refused.usage,
+                        correlation_id(),
+                        role=role.value,
+                        refused=True,
+                        residency=residency.value,
+                    )
+                    sp.set_attribute("nw.cost_usd", exc.cost.cost_usd)
+                raise
+            model = outcome.model
+            sp.set_attribute("gen_ai.request.model", model)
+            sp.set_attribute("gen_ai.usage.input_tokens", completion.usage.input_tokens)
+            sp.set_attribute("gen_ai.usage.output_tokens", completion.usage.output_tokens)
+            sp.set_attribute("nw.stop_reason", completion.stop_reason.value)
+            sp.set_attribute("nw.fallback", outcome.fallback)
+            sp.set_attribute("nw.attempts", outcome.attempts)
+            if outcome.skipped:
+                sp.set_attribute("nw.breaker_skipped", ",".join(outcome.skipped))
+            record = self.meter.record(
+                request_id,
+                model,
+                completion.usage,
+                correlation_id(),
+                role=role.value,
+                fallback=outcome.fallback,
+                attempts=outcome.attempts,
+                skipped=outcome.skipped,
+                residency=residency.value,
+            )
+            sp.set_attribute("nw.cost_usd", record.cost_usd)
+        log.info(
+            "completion",
+            extra=log_fields(
+                request_id=request_id,
+                provider_request_id=completion.request_id,
+                model=model,
+                role=role.value,
+                residency=residency.value,
+                input_tokens=completion.usage.input_tokens,
+                output_tokens=completion.usage.output_tokens,
+                latency_ms=round(completion.usage.latency_ms, 1),
+                cost_usd=round(record.cost_usd, 6),
+                spend_usd=round(self.meter.total_usd, 6),
+                stop_reason=completion.stop_reason.value,
+                prompt_version=prompt_version,
+                fallback=outcome.fallback,
+                attempts=outcome.attempts,
+            ),
+        )
+        return completion.model_copy(update={"cost": record})
+        # STUB: raise NotImplementedError("Service layer, complete: semaphore, retries, metering")
+        # SOLUTION END
 
     async def structured[T: BaseModel](
         self,
@@ -203,7 +315,41 @@ class LLMClient:
         The schema is part of the version (`<prompt>+schema.<Name>@<hash>`): a field added to
         the schema changes what the model is asked for as surely as a prompt edit does.
         """
-        raise NotImplementedError("Structured output: schema prompt, parse, repair")
+        # SOLUTION BEGIN
+        schema_json = json.dumps(schema.model_json_schema(), indent=None)
+        instructions = (
+            f"{system.rstrip() if system else ''}\n\n{STRUCTURED_INSTRUCTIONS.text}\n{schema_json}"
+        ).strip()
+        prompt_version = schema_version(version_for(system), schema.__name__, schema_json)
+        messages = [Message.user(prompt)]
+        last_error: str | None = None
+        for attempt in range(2):
+            completion = await self.complete(
+                messages,
+                role=role,
+                system=instructions,
+                max_tokens=max_tokens,
+                prompt_version=prompt_version,
+            )
+            try:
+                return _parse_as(completion.text, schema)
+            except (ValueError, ValidationError) as exc:
+                last_error = _short(str(exc))
+                log.warning(
+                    "structured output invalid",
+                    extra=log_fields(attempt=attempt + 1, error=last_error),
+                )
+                messages = messages + [
+                    Message.assistant(completion.text),
+                    Message.user(
+                        "That was not valid. Error:\n"
+                        f"{last_error}\n"
+                        "Reply again with only the corrected JSON object."
+                    ),
+                ]
+        raise StructuredOutputError(f"output did not match {schema.__name__}: {last_error}")
+        # STUB: raise NotImplementedError("Structured output: schema prompt, parse, repair")
+        # SOLUTION END
 
     async def map(
         self,
@@ -224,7 +370,27 @@ class LLMClient:
         overshoot is at most one call per concurrency slot. The budget is checked after a
         prompt has its turn (a slot of the fan-out), not when the task is created: checked
         at creation, every prompt would pass at t=0 against a provider that really waits."""
-        raise NotImplementedError("Service layer, fan out: gather, keep input order")
+        # SOLUTION BEGIN
+        budget = _TokenBudget(max_total_tokens)
+        turns = asyncio.Semaphore(self._max_concurrency)
+
+        async def one(p: str) -> Completion:
+            async with turns:
+                budget.check()
+                c = await self.complete(p, role=role, system=system, max_tokens=max_tokens)
+                budget.add(c.usage)
+                return c
+
+        tasks = [one(p) for p in prompts]
+        # gather preserves order; as_completed would not.
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        if not return_exceptions:
+            for r in results:
+                if isinstance(r, BaseException):
+                    raise r
+        return list(results)
+        # STUB: raise NotImplementedError("Service layer, fan out: gather, keep input order")
+        # SOLUTION END
 
     # ----- internals --------------------------------------------------------
 
@@ -313,7 +479,43 @@ class LLMClient:
     ) -> Completion:
         """Run `call` under the retry policy. Terminal errors are raised at once. With a
         `deadline`, a back-off that would end past it is not taken: the last error is raised."""
-        raise NotImplementedError("Service layer, complete: classify, back off, give up")
+        # SOLUTION BEGIN
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return await call()
+            except TerminalError:
+                raise
+            except RetryableError as exc:
+                delay = self._retry.delay_for(attempt, exc.retry_after_s)
+                out_of_time = deadline is not None and deadline.remaining() <= delay
+                if attempt >= self._retry.max_attempts or out_of_time:
+                    log.error(
+                        "giving up",
+                        extra=log_fields(
+                            request_id=request_id,
+                            attempts=attempt,
+                            error=str(exc),
+                            deadline=out_of_time,
+                        ),
+                    )
+                    raise
+                log.warning(
+                    "retrying",
+                    extra=log_fields(
+                        request_id=request_id,
+                        attempt=attempt,
+                        delay_s=round(delay, 3),
+                        status=exc.status,
+                        retry_after_s=exc.retry_after_s,
+                    ),
+                )
+                await self._sleep(delay)
+                if deadline is not None:
+                    deadline.slept(delay)
+        # STUB: raise NotImplementedError("Service layer, complete: classify, back off, give up")
+        # SOLUTION END
 
 
 class _Deadline:
