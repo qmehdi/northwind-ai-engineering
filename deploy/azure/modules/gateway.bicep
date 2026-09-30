@@ -4,15 +4,18 @@
 //   apim     API Management's AI gateway in front of Foundry (the default). Two APIs publish
 //            the Foundry shapes the course client speaks: `<gateway>/openai/v1` (gpt-oss-120b,
 //            mistral-small-2503) and `<gateway>/anthropic` (Claude). A subscription per tenant is the
-//            tenant's key (header `api-key`); llm-token-limit caps tokens per minute per
-//            subscription, llm-emit-token-metric sends tokens per tenant to Application
+//            tenant's key (header `api-key`); llm-token-limit caps tokens per minute and
+//            tokens per calendar month per subscription (a 429 past the rate, a 403 past the
+//            monthly quota), llm-emit-token-metric sends tokens per tenant to Application
 //            Insights, a backend pool load balances across Foundry deployments (a second
 //            Foundry resource joins with `secondaryFoundryEndpoint`) with a circuit breaker,
 //            and APIM calls Foundry with its own managed identity. Semantic caching is off: it
 //            needs an Azure Managed Redis cache and an embeddings deployment, and the course's
 //            prompts rarely repeat.
 //   litellm  LiteLLM on Container Apps with PostgreSQL for virtual keys, the same proxy as the
-//            AWS and Google Cloud tracks, for an organisation that does not want APIM.
+//            AWS and Google Cloud tracks, for an organisation that does not want APIM. The
+//            image is pinned by digest (the tag Local pins); PostgreSQL has no public endpoint,
+//            it sits in a delegated subnet of the platform's network (network.bicep).
 //
 // Either way every owner's key lands in Key Vault as `<environment>-<owner>-gateway-key`.
 metadata owner = 'northwind'
@@ -26,6 +29,7 @@ param owners array
 param apimSku string
 param publisherEmail string
 param tenantTokensPerMinute int
+param tenantTokensPerMonth int
 param foundryAccountName string
 param foundryEndpoint string
 param secondaryFoundryEndpoint string
@@ -34,11 +38,19 @@ param appInsightsId string
 @secure()
 param appInsightsConnectionString string
 param containerAppsEnvironmentId string
+param dbSubnetId string
+param dbZoneId string
 param models array
+@description('The EU Foundry resource and its models (empty when off): LiteLLM serves them as eu/<name>.')
+param euFoundryEndpoint string
+param euModels array
 @secure()
 param litellmMasterKey string
 @secure()
 param postgresPassword string
+@description('LiteLLM encrypts the credentials it stores with this key; it must never change once keys exist (kept in Key Vault by the deploy script).')
+@secure()
+param litellmSaltKey string
 @secure()
 param gatewayKeys object
 param enableTelemetry bool
@@ -123,19 +135,21 @@ resource diagnostics 'Microsoft.ApiManagement/service/diagnostics@2024-05-01' = 
 
 // One backend per Foundry resource and API shape. The circuit breaker trips on 429 and 5xx and
 // honours Retry-After, so the pool sends traffic to the next member meanwhile.
-var foundryRoots = empty(secondaryFoundryEndpoint)
-  ? [foundryEndpoint]
-  : [foundryEndpoint, secondaryFoundryEndpoint]
+var foundryRoots = empty(secondaryFoundryEndpoint) ? [foundryEndpoint] : [foundryEndpoint, secondaryFoundryEndpoint]
 var shapes = [
   { api: 'openai', path: 'openai', resource: 'https://cognitiveservices.azure.com' }
   { api: 'anthropic', path: 'anthropic', resource: 'https://ai.azure.com' }
 ]
-var backendMembers = flatten(map(shapes, s => map(range(0, length(foundryRoots)), i => {
-  name: '${s.api}-${i}'
-  api: s.api
-  url: '${foundryRoots[i]}/${s.path}'
-  priority: i + 1
-})))
+var backendMembers = flatten(map(
+  shapes,
+  s =>
+    map(range(0, length(foundryRoots)), i => {
+      name: '${s.api}-${i}'
+      api: s.api
+      url: '${foundryRoots[i]}/${s.path}'
+      priority: i + 1
+    })
+))
 
 resource backends 'Microsoft.ApiManagement/service/backends@2024-05-01' = [
   for b in backendMembers: if (apim) {
@@ -211,11 +225,15 @@ var operations = [
   { name: 'post', method: 'POST' }
   { name: 'get', method: 'GET' }
 ]
-var apiOperations = flatten(map(range(0, length(shapes)), i => map(operations, o => {
-  api: i
-  name: o.name
-  method: o.method
-})))
+var apiOperations = flatten(map(
+  range(0, length(shapes)),
+  i =>
+    map(operations, o => {
+      api: i
+      name: o.name
+      method: o.method
+    })
+))
 
 resource apiOperationsResources 'Microsoft.ApiManagement/service/apis/operations@2024-05-01' = [
   for op in apiOperations: if (apim) {
@@ -229,18 +247,21 @@ resource apiOperationsResources 'Microsoft.ApiManagement/service/apis/operations
   }
 ]
 
-// The AI gateway policy: the token limit is per subscription (the counter is shared by both
-// APIs because the key is the same), the token metric carries the tenant, the request goes to
+// The AI gateway policy: the token limit and the monthly quota are per subscription (the
+// counter is shared by both APIs because the key is the same), the token metric carries the tenant, the request goes to
 // the pool with APIM's identity and is retried once on the next member on 429.
 var tokenPolicies = '''
-    <llm-token-limit counter-key="@(context.Subscription.Id)" tokens-per-minute="__TPM__" estimate-prompt-tokens="false" remaining-tokens-variable-name="remainingTokens" />
+    <llm-token-limit counter-key="@(context.Subscription.Id)" tokens-per-minute="__TPM__" token-quota="__TPMONTH__" token-quota-period="Monthly" estimate-prompt-tokens="false" remaining-tokens-variable-name="remainingTokens" remaining-quota-tokens-variable-name="remainingQuotaTokens" />
     <llm-emit-token-metric namespace="__NAMESPACE__">
       <dimension name="Subscription ID" />
       <dimension name="API ID" />
       <dimension name="tenant" value="@(context.Subscription?.Name ?? &quot;none&quot;)" />
     </llm-emit-token-metric>'''
+// A classic tier has no LLM policy for the Anthropic shape: a request rate and a monthly call
+// quota per subscription stand in (calls, not tokens).
 var rateLimitPolicy = '''
-    <rate-limit-by-key calls="60" renewal-period="60" counter-key="@(context.Subscription.Id)" />'''
+    <rate-limit-by-key calls="60" renewal-period="60" counter-key="@(context.Subscription.Id)" />
+    <quota-by-key calls="20000" renewal-period="2592000" counter-key="@(context.Subscription.Id)" />'''
 var policyTemplate = '''<policies>
   <inbound>
     <base />
@@ -275,12 +296,12 @@ resource apiPolicies 'Microsoft.ApiManagement/service/apis/policies@2024-05-01' 
           replace(
             replace(
               replace(
-                policyTemplate,
-                '__LIMITS__',
-                s.api == 'openai' || v2 ? tokenPolicies : rateLimitPolicy
+                replace(policyTemplate, '__LIMITS__', s.api == 'openai' || v2 ? tokenPolicies : rateLimitPolicy),
+                '__TPM__',
+                string(tenantTokensPerMinute)
               ),
-              '__TPM__',
-              string(tenantTokensPerMinute)
+              '__TPMONTH__',
+              string(tenantTokensPerMonth)
             ),
             '__NAMESPACE__',
             environment
@@ -361,8 +382,24 @@ var litellmModels = [
     }
   }
 ]
+// The EU deployments as separate gateway models named eu/<name> (nw/config.py GATEWAY_EU_PREFIX).
+var litellmEuModels = [
+  for m in (empty(euFoundryEndpoint) ? [] : euModels): {
+    model_name: 'eu/${m.name}'
+    litellm_params: {
+      model: 'azure/${m.name}'
+      api_base: '${euFoundryEndpoint}/openai/v1'
+      api_version: 'preview'
+    }
+    model_info: {
+      role: m.role
+      environment: environment
+      zone: 'eu'
+    }
+  }
+]
 var litellmConfig = {
-  model_list: litellmModels
+  model_list: concat(litellmModels, litellmEuModels)
   litellm_settings: {
     drop_params: true
     request_timeout: 120
@@ -409,6 +446,8 @@ module database 'br/public:avm/res/db-for-postgre-sql/flexible-server:0.16.1' = 
     availabilityZone: -1
     highAvailability: 'Disabled'
     storageSizeGB: 32
+    // Retention table (docs/governance): database backups 7 days.
+    backupRetentionDays: 7
     version: '16'
     administratorLogin: 'litellm'
     administratorLoginPassword: postgresPassword
@@ -416,14 +455,11 @@ module database 'br/public:avm/res/db-for-postgre-sql/flexible-server:0.16.1' = 
       activeDirectoryAuth: 'Disabled'
       passwordAuth: 'Enabled'
     }
-    publicNetworkAccess: 'Enabled'
-    firewallRules: [
-      {
-        name: 'azure-services'
-        startIpAddress: '0.0.0.0'
-        endIpAddress: '0.0.0.0'
-      }
-    ]
+    // Private access: a delegated subnet and a private DNS zone, no public endpoint and no
+    // firewall rule; only the apps of the environment (same network) reach it.
+    publicNetworkAccess: 'Disabled'
+    delegatedSubnetResourceId: dbSubnetId
+    privateDnsZoneArmResourceId: dbZoneId
     databases: [
       {
         name: 'litellm'
@@ -452,6 +488,7 @@ module litellm 'br/public:avm/res/app/container-app:0.23.0' = if (!apim) {
     }
     secrets: [
       { name: 'master-key', value: litellmMasterKey }
+      { name: 'salt-key', value: litellmSaltKey }
       {
         name: 'database-url'
         value: 'postgresql://litellm:${postgresPassword}@${environment}-gateway-db-${suffix}.postgres.database.azure.com:5432/litellm?sslmode=require'
@@ -470,7 +507,10 @@ module litellm 'br/public:avm/res/app/container-app:0.23.0' = if (!apim) {
     containers: [
       {
         name: 'litellm'
-        image: 'ghcr.io/berriai/litellm:main-stable'
+        // The release the Local track runs, pinned by digest (docker-compose.yml, fetched
+        // 2026-09-29): the container holds the master key and the database password, so a
+        // moved tag must never change what runs.
+        image: 'ghcr.io/berriai/litellm:v1.103.0@sha256:bd089afdcd35b894b14a93f9743cdc8b591f82da1a38dd43a010a7b0c9de5fd7'
         args: ['--config', '/config/config.yaml', '--port', '4000']
         resources: {
           cpu: json('1.0')
@@ -478,6 +518,7 @@ module litellm 'br/public:avm/res/app/container-app:0.23.0' = if (!apim) {
         }
         env: [
           { name: 'LITELLM_MASTER_KEY', secretRef: 'master-key' }
+          { name: 'LITELLM_SALT_KEY', secretRef: 'salt-key' }
           { name: 'DATABASE_URL', secretRef: 'database-url' }
           { name: 'AZURE_CLIENT_ID', value: gatewayIdentity!.outputs.clientId }
           { name: 'STORE_MODEL_IN_DB', value: 'False' }
@@ -502,6 +543,15 @@ resource litellmMaster 'Microsoft.KeyVault/vaults/secrets@2026-02-01' = if (!api
   }
 }
 
+resource litellmSalt 'Microsoft.KeyVault/vaults/secrets@2026-02-01' = if (!apim) {
+  parent: vault
+  name: '${environment}-gateway-salt-key'
+  properties: {
+    value: litellmSaltKey
+    contentType: 'LiteLLM salt key; never rotate it while keys exist'
+  }
+}
+
 // LiteLLM virtual keys are chosen by the deploy script (kept in Key Vault across deploys) and
 // registered with the proxy by `scripts/deploy_azure.sh keys`, with the owner's budget.
 resource litellmKeys 'Microsoft.KeyVault/vaults/secrets@2026-02-01' = [
@@ -522,4 +572,5 @@ output url string = apim ? 'https://${apimName}.azure-api.net' : 'https://${lite
 output apimGatewayUrl string = apim ? 'https://${apimName}.azure-api.net' : ''
 output litellmUrl string = apim ? '' : 'https://${litellm!.outputs.fqdn}'
 output apimName string = apim ? apimName : ''
+output litellmPrincipalId string = apim ? '' : gatewayIdentity!.outputs.principalId
 output keySecretNames array = [for o in owners: '${environment}-${o}-gateway-key']

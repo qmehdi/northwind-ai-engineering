@@ -1,0 +1,4 @@
+# Local backend overrides: scripts/deploy_gcp.sh writes backend_override.tf for NW_TF_STATE=local,
+# tests/platform/test_gcp_terraform.py writes test_<pid>_backend_override.tf while it plans.
+platform/*_override.tf
+platform/terraform.tfstate*

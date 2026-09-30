@@ -2,14 +2,14 @@
  "name": "triage",
  "kind": "specialist",
  "track": "local",
- "agent_version": "a957ca5edcc4",
+ "agent_version": "e1d09ea60b84",
  "prompt": "system@d9e9c7cda49c",
  "prompt_hash": "d9e9c7cda49c",
- "tools_version": "0cbcd148b7ff",
+ "tools_version": "835a46969eb5",
  "tools": [
   {
    "name": "check_entitlement",
-   "version": "7e89ec15b10c",
+   "version": "4efbf5863254",
    "requires_approval": false
   },
   {
@@ -24,7 +24,7 @@
   },
   {
    "name": "lookup_customer",
-   "version": "53aae0c9171c",
+   "version": "4235bba67e0e",
    "requires_approval": false
   }
  ],
@@ -43,8 +43,22 @@
  "data_classes": [
   "ticket_text",
   "customer_account",
-  "entitlements"
+  "entitlements",
+  "past_tickets"
  ],
+ "reachable_data_classes": [
+  "customer_account",
+  "entitlements",
+  "past_tickets",
+  "ticket_text"
+ ],
+ "governance": {
+  "eu_ai_act_class": "minimal",
+  "annex_iii_item": null,
+  "article_50_disclosure": null,
+  "dpia_ref": "docs/governance/dpia.md#uc-triage",
+  "privacy_approver": "privacy-office"
+ },
  "endpoints": [
   "POST /run",
   "GET /version",
@@ -66,5 +80,5 @@
   "approver": "support-operations"
  },
  "runtime_id": null,
- "written_at": "2026-09-29T07:06:51.442916+00:00"
+ "written_at": "2026-09-30T10:03:30.572325+00:00"
 }

@@ -35,6 +35,18 @@
   "past_tickets",
   "escalation_queue"
  ],
+ "reachable_data_classes": [
+  "escalation_queue",
+  "past_tickets",
+  "ticket_text"
+ ],
+ "governance": {
+  "eu_ai_act_class": "transparency",
+  "annex_iii_item": null,
+  "article_50_disclosure": "This reply was drafted with an AI system and checked by a Northwind support agent.",
+  "dpia_ref": "docs/governance/dpia.md#uc-resolution",
+  "privacy_approver": "privacy-office"
+ },
  "endpoints": [
   "POST /run",
   "GET /version",
@@ -56,5 +68,5 @@
   "approver": "support-operations"
  },
  "runtime_id": null,
- "written_at": "2026-09-29T07:06:51.441960+00:00"
+ "written_at": "2026-09-30T10:03:30.571441+00:00"
 }

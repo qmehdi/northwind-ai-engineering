@@ -6,6 +6,14 @@
 #   observability  OpenTelemetry collector, Jaeger, Prometheus, Grafana
 #   higher         a second serving tier named for a higher environment (the promotion target)
 #   gpu            pulls gpt-oss:120b; pair with docker-compose.gpu.yml for the device
+#   docker-compose.small.yml   the smaller-model fallback for a 16 GB Mac (qwen3:4b)
+#
+# Security, by design (deploy/local/README.md): the stack has no authentication of its own.
+# Every published port is bound to 127.0.0.1, so only this machine reaches it, and no secret
+# has a default here: `make local-up` runs deploy/local/secrets.sh, which generates the gateway
+# master key, the database and object store credentials, the Grafana password and the tenant
+# gateway keys into .env (untracked). A container that holds a secret refuses to start without
+# it. `make up` (the course services alone) needs none of them.
 #
 #   make local-up                      # build, push to the local registry, platform profile up
 #   docker compose --profile platform --profile observability up -d
@@ -27,7 +35,7 @@ x-env: &env
   # The model gateway: every model call from a container goes through LiteLLM with the
   # tenant's key. Set NW_COMPOSE_GATEWAY_URL to empty to call Ollama directly.
   NW_GATEWAY_URL: ${NW_COMPOSE_GATEWAY_URL:-http://litellm:4000}
-  NW_GATEWAY_KEY: ${NW_GATEWAY_KEY:-sk-nw-solo-change-me}
+  NW_GATEWAY_KEY: ${NW_GATEWAY_KEY:-}
   NW_OLLAMA_URL: ${NW_COMPOSE_OLLAMA_URL:-http://ollama:11434/v1}
   NW_MLFLOW_URI: http://mlflow:5000
   NW_QDRANT_URL: http://qdrant:6333
@@ -56,19 +64,19 @@ services:
     image: ${NW_REGISTRY:-localhost:5050}/nw-triage:${NW_IMAGE_TAG:-dev}
     build: { context: ., args: { APP: nw.triage.service:app, ARTIFACTS: "triage" } }
     environment: *env
-    ports: ["8001:8000"]
+    ports: ["127.0.0.1:8001:8000"]
     <<: *ready
   semantic:
     image: ${NW_REGISTRY:-localhost:5050}/nw-semantic:${NW_IMAGE_TAG:-dev}
     build: { context: ., args: { APP: nw.semantic.service:app, ARTIFACTS: "semantic index", HF_MODELS: "1" } }
     environment: *env
-    ports: ["8002:8000"]
+    ports: ["127.0.0.1:8002:8000"]
     <<: *ready
   policy:
     image: ${NW_REGISTRY:-localhost:5050}/nw-policy:${NW_IMAGE_TAG:-dev}
     build: { context: ., args: { APP: nw.policy.service:app, ARTIFACTS: "policy", HF_MODELS: "1" } }
     environment: *env
-    ports: ["8003:8000"]
+    ports: ["127.0.0.1:8003:8000"]
     <<: [*cloud-creds, *ready]
   resolver:
     # The agent runtime: the whole registry behind /invocations (AgentCore shape),
@@ -80,7 +88,7 @@ services:
     env_file:
       - path: ${NW_AGENT_ENV_FILE:-deploy/local/registry/agent.env}
         required: false
-    ports: ["8014:8000"]
+    ports: ["127.0.0.1:8014:8000"]
     <<: [*cloud-creds, *ready]
   agent:
     image: *agent-image
@@ -91,7 +99,7 @@ services:
       NW_TRIAGE_AGENT_URL: http://agent-triage:8000
       NW_POLICY_AGENT_URL: http://agent-policy:8000
       NW_RESOLUTION_AGENT_URL: http://agent-resolution:8000
-    ports: ["8010:8000"]
+    ports: ["127.0.0.1:8010:8000"]
     depends_on: [agent-triage, agent-policy, agent-resolution]
     <<: [*cloud-creds, *ready]
   agent-triage:
@@ -113,7 +121,7 @@ services:
     image: ${NW_REGISTRY:-localhost:5050}/nw-mcp:${NW_IMAGE_TAG:-dev}
     build: { context: ., args: { APP: mcp, ARTIFACTS: "triage semantic index policy", HF_MODELS: "1" } }
     environment: { <<: *env, NW_MCP_HOST: 0.0.0.0, NW_MCP_PORT: "8000" }
-    ports: ["8020:8000"]
+    ports: ["127.0.0.1:8020:8000"]
     healthcheck:
       # the MCP server speaks streamable HTTP, no /readyz: a TCP connect is the probe
       test: ["CMD", "python", "-c", "import socket;socket.create_connection(('127.0.0.1',8000),timeout=2).close()"]
@@ -127,7 +135,7 @@ services:
     # The image registry the course services are pulled from: ECR and Artifact Registry here.
     image: registry:3.1.2@sha256:ddf754342cfc8acc51a56d5d0ab6af06826461864460636d8bd5c546dab2a7b8
     profiles: [platform]
-    ports: ["5050:5000"]
+    ports: ["127.0.0.1:5050:5000"]
     volumes: ["registry-data:/var/lib/registry"]
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5000/v2/"]
@@ -142,7 +150,7 @@ services:
     profiles: [platform]
     environment:
       POSTGRES_USER: nw
-      POSTGRES_PASSWORD: ${NW_DB_PASSWORD:-northwind}
+      POSTGRES_PASSWORD: ${NW_DB_PASSWORD:-}
       POSTGRES_DB: mlflow
     volumes:
       - postgres-data:/var/lib/postgresql/data
@@ -159,11 +167,11 @@ services:
     image: rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
     profiles: [platform]
     environment:
-      RUSTFS_ACCESS_KEY: ${NW_S3_ACCESS_KEY:-nw}
-      RUSTFS_SECRET_KEY: ${NW_S3_SECRET_KEY:-northwind-secret}
+      RUSTFS_ACCESS_KEY: ${NW_S3_ACCESS_KEY:-}
+      RUSTFS_SECRET_KEY: ${NW_S3_SECRET_KEY:-}
       RUSTFS_CONSOLE_ENABLE: "true"
       RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
-    ports: ["9000:9000", "9001:9001"]
+    ports: ["127.0.0.1:9000:9000", "127.0.0.1:9001:9001"]
     volumes: ["rustfs-data:/data"]
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1:9000/health"]
@@ -178,8 +186,8 @@ services:
     entrypoint: ["python", "/usr/local/bin/init_bucket.py"]
     environment:
       MLFLOW_S3_ENDPOINT_URL: http://rustfs:9000
-      AWS_ACCESS_KEY_ID: ${NW_S3_ACCESS_KEY:-nw}
-      AWS_SECRET_ACCESS_KEY: ${NW_S3_SECRET_KEY:-northwind-secret}
+      AWS_ACCESS_KEY_ID: ${NW_S3_ACCESS_KEY:-}
+      AWS_SECRET_ACCESS_KEY: ${NW_S3_SECRET_KEY:-}
       NW_ARTIFACT_BUCKET: mlflow
     depends_on:
       rustfs: { condition: service_healthy }
@@ -201,16 +209,20 @@ services:
       - --workers
       - "2"
       - --backend-store-uri
-      - postgresql+psycopg2://nw:${NW_DB_PASSWORD:-northwind}@postgres:5432/mlflow
+      - postgresql+psycopg2://nw:${NW_DB_PASSWORD:-}@postgres:5432/mlflow
       - --artifacts-destination
       - s3://mlflow
       - --serve-artifacts
+      # MLflow 3 checks the Host header against DNS rebinding and allows only localhost and
+      # private IPs by default; the replicas and jobs call it as mlflow:5000 on the compose network.
+      - --allowed-hosts
+      - mlflow,mlflow:5000,localhost,localhost:5001,127.0.0.1,127.0.0.1:5001,host.docker.internal:5001
     environment:
       MLFLOW_S3_ENDPOINT_URL: http://rustfs:9000
-      AWS_ACCESS_KEY_ID: ${NW_S3_ACCESS_KEY:-nw}
-      AWS_SECRET_ACCESS_KEY: ${NW_S3_SECRET_KEY:-northwind-secret}
+      AWS_ACCESS_KEY_ID: ${NW_S3_ACCESS_KEY:-}
+      AWS_SECRET_ACCESS_KEY: ${NW_S3_SECRET_KEY:-}
       MLFLOW_DISABLE_AGENT_HINT: "1"
-    ports: ["5001:5000"]
+    ports: ["127.0.0.1:5001:5000"]
     depends_on:
       postgres: { condition: service_healthy }
       rustfs-init: { condition: service_completed_successfully }
@@ -225,11 +237,12 @@ services:
     # RAG Engine on Vector Search here. REST on :6333, gRPC on :6334, /metrics for Prometheus.
     image: qdrant/qdrant:v1.19.1@sha256:12364fe851b9f17356fc88189fc06d1b521262e04659ec7345975b00c9246a10
     profiles: [platform]
-    ports: ["6333:6333", "6334:6334"]
+    ports: ["127.0.0.1:6333:6333", "127.0.0.1:6334:6334"]
     volumes: ["qdrant-data:/qdrant/storage"]
     healthcheck:
       # the image ships bash and nothing else: a raw HTTP probe over /dev/tcp
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/6333 && printf 'GET /healthz HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q 200"]
+      # the image's /bin/sh is dash, which has no /dev/tcp; bash does
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333 && printf 'GET /healthz HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q 200"]
       interval: 15s
       timeout: 3s
       retries: 5
@@ -247,7 +260,7 @@ services:
       OLLAMA_KEEP_ALIVE: ${NW_OLLAMA_KEEP_ALIVE:-5m}
       OLLAMA_MAX_LOADED_MODELS: "2"
       OLLAMA_NUM_PARALLEL: "1"
-    ports: ["${NW_OLLAMA_PORT:-11435}:11434"]
+    ports: ["127.0.0.1:${NW_OLLAMA_PORT:-11435}:11434"]
     volumes: ["${NW_OLLAMA_MODELS_DIR:-ollama-models}:/root/.ollama"]
     healthcheck:
       test: ["CMD", "ollama", "list"]
@@ -261,8 +274,11 @@ services:
     profiles: [platform]
     entrypoint: ["/bin/sh", "/pull.sh"]
     environment:
-      OLLAMA_HOST: http://ollama:11434
-      NW_OLLAMA_PULL: ${NW_OLLAMA_PULL:-llama-guard3:1b gpt-oss:20b}
+      # Pull into the Ollama the stack uses: the native one on a Mac when
+      # NW_COMPOSE_OLLAMA_INTERNAL_URL points there, so the in-compose store stays empty.
+      OLLAMA_HOST: ${NW_COMPOSE_OLLAMA_INTERNAL_URL:-http://ollama:11434}
+      # Unset pulls the defaults; set and empty (NW_OLLAMA_PULL=) pulls nothing.
+      NW_OLLAMA_PULL: ${NW_OLLAMA_PULL-llama-guard3:1b gpt-oss:20b}
     volumes: ["./deploy/local/ollama/pull.sh:/pull.sh:ro"]
     depends_on:
       ollama: { condition: service_healthy }
@@ -289,20 +305,25 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >-
+        if [ -z "$$LITELLM_MASTER_KEY" ] || [ -z "$$NW_DB_PASSWORD" ]; then
+        echo "no LITELLM_MASTER_KEY or NW_DB_PASSWORD: run make local-up (deploy/local/secrets.sh writes them to .env)"; exit 1; fi;
         cfg=/config/config.yaml;
         if [ -n "$$ANTHROPIC_API_KEY" ]; then cfg=/config/config-cloud-judge.yaml; fi;
         echo "gateway config $$cfg";
         exec /app/docker/prod_entrypoint.sh --config $$cfg --port 4000
     environment:
-      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-nw-master-change-me}
-      DATABASE_URL: postgresql://nw:${NW_DB_PASSWORD:-northwind}@postgres:5432/litellm
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-}
+      DATABASE_URL: postgresql://nw:${NW_DB_PASSWORD:-}@postgres:5432/litellm
+      NW_DB_PASSWORD: ${NW_DB_PASSWORD:-}
       STORE_MODEL_IN_DB: "false"
       NW_OLLAMA_INTERNAL_URL: ${NW_COMPOSE_OLLAMA_INTERNAL_URL:-http://ollama:11434}
       NW_GATEWAY_WORKHORSE: ${NW_GATEWAY_WORKHORSE:-ollama_chat/gpt-oss:20b}
+      # Economy, and the weaker local judge alias: the laptop-sized model (qwen3:4b with SMALL=1).
+      NW_GATEWAY_LOCAL_MODEL: ${NW_GATEWAY_LOCAL_MODEL:-ollama_chat/gpt-oss:20b}
       NW_GUARD_FAIL_OPEN: ${NW_GUARD_FAIL_OPEN:-0}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       LITELLM_LOG: ${LITELLM_LOG:-INFO}
-    ports: ["4000:4000"]
+    ports: ["127.0.0.1:4000:4000"]
     volumes: ["./deploy/local/litellm:/config:ro"]
     depends_on:
       postgres: { condition: service_healthy }
@@ -318,10 +339,13 @@ services:
     image: curlimages/curl:8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da16bbe3f92dec39ec7785166777
     profiles: [platform]
     entrypoint: ["/bin/sh", "/config/keys.sh"]
+    # Root in the container, so it reads tenant-keys.tsv, which is 600 on the host.
+    user: "0:0"
     environment:
       LITELLM_URL: http://litellm:4000
-      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-nw-master-change-me}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-}
       TENANTS_FILE: /config/tenants.tsv
+      KEYS_FILE: /config/tenant-keys.tsv
     volumes: ["./deploy/local/litellm:/config:ro"]
     depends_on:
       litellm: { condition: service_healthy }
@@ -334,7 +358,7 @@ services:
     build: { context: deploy/local/evidently }
     profiles: [platform]
     command: ["evidently", "ui", "--host", "0.0.0.0", "--port", "8000", "--workspace", "/workspace"]
-    ports: ["8030:8000"]
+    ports: ["127.0.0.1:8030:8000"]
     volumes: ["evidently-workspace:/workspace"]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/')"]
@@ -383,15 +407,15 @@ services:
       mlflow: { condition: service_healthy }
   serving-canary:
     # The canary replica: models:/...@canary, the share of traffic set by `make local-canary`.
+    # The same image as serving-stable, which builds it; one build, not two.
     image: ${NW_REGISTRY:-localhost:5050}/nw-serving:${NW_IMAGE_TAG:-dev}
-    build:
-      context: deploy/local/serving
-      args: { BASE: "${NW_REGISTRY:-localhost:5050}/nw-triage:${NW_IMAGE_TAG:-dev}" }
+    pull_policy: never
     profiles: [platform]
     environment:
       MLFLOW_TRACKING_URI: http://mlflow:5000
       NW_SERVING_MODEL: ${NW_ENVIRONMENT:-northwind}-${NW_TENANT:-solo}-triage
       NW_SERVING_ALIAS: canary
+      NW_SERVING_FALLBACK_ALIAS: live
     depends_on:
       mlflow: { condition: service_healthy }
   proxy:
@@ -399,7 +423,7 @@ services:
     # deploy/local/proxy/upstream.conf (CodeDeploy's traffic shift and the Vertex split here).
     image: nginx:1.30.5-alpine@sha256:0985e772fb9f729e6fa0980da05fca5d9c468e870eed43071545afa9d2e27d94
     profiles: [platform]
-    ports: ["8005:8000"]
+    ports: ["127.0.0.1:8005:8000"]
     volumes:
       - ./deploy/local/proxy/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./deploy/local/proxy:/etc/nginx/nw:ro
@@ -427,12 +451,13 @@ services:
       MLFLOW_TRACKING_URI: http://mlflow:5000
       NW_SERVING_MODEL: higher-${NW_TENANT:-solo}-triage
       NW_SERVING_ALIAS: canary
+      NW_SERVING_FALLBACK_ALIAS: live
     depends_on:
       mlflow: { condition: service_healthy }
   proxy-higher:
     image: nginx:1.30.5-alpine@sha256:0985e772fb9f729e6fa0980da05fca5d9c468e870eed43071545afa9d2e27d94
     profiles: [higher]
-    ports: ["8105:8000"]
+    ports: ["127.0.0.1:8105:8000"]
     volumes:
       - ./deploy/local/proxy/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./deploy/local/proxy/higher:/etc/nginx/nw:ro
@@ -451,13 +476,13 @@ services:
     profiles: [observability]
     command: ["--config=/etc/otel/config.yaml"]
     volumes: ["./deploy/local/otel-collector.yaml:/etc/otel/config.yaml:ro"]
-    ports: ["4318:4318"]
+    ports: ["127.0.0.1:4318:4318"]
     depends_on: [jaeger]
   jaeger:
     # Jaeger v2 (the all-in-one image is v1 and frozen); UI on 16686, OTLP gRPC on 4317.
     image: jaegertracing/jaeger:2.21.0@sha256:3d0ac795ff98aa04d1be04311d2dac6c25b4bfc8322dc02e53bc5b170c5018c3
     profiles: [observability]
-    ports: ["16686:16686", "4317:4317"]
+    ports: ["127.0.0.1:16686:16686", "127.0.0.1:4317:4317"]
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:16686/"]
       interval: 15s
@@ -467,7 +492,7 @@ services:
     image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
     profiles: [observability]
     command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=7d"]
-    ports: ["9090:9090"]
+    ports: ["127.0.0.1:9090:9090"]
     volumes:
       - ./deploy/local/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
@@ -478,16 +503,25 @@ services:
       retries: 5
   grafana:
     # One dashboard, provisioned: deploy/local/grafana/dashboards/northwind.json. Login
-    # admin / NW_GRAFANA_PASSWORD (northwind); anonymous viewers allowed.
+    # admin / NW_GRAFANA_PASSWORD from .env; anonymous viewers allowed (127.0.0.1 only). Without
+    # a password (`make up-observability` on a cloud track) it generates one at first start and
+    # prints it to the container log, never a known default.
     image: grafana/grafana:13.2.2@sha256:ac461fb352abc50da10a51c7d02462e9c05488f11f53f14b3ad79a8145f638a0
     profiles: [observability]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        if [ -z "$$GF_SECURITY_ADMIN_PASSWORD" ]; then
+        GF_SECURITY_ADMIN_PASSWORD=$$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n'); export GF_SECURITY_ADMIN_PASSWORD;
+        echo "no NW_GRAFANA_PASSWORD: generated admin password $$GF_SECURITY_ADMIN_PASSWORD (applies on the first start only)"; fi;
+        exec /run.sh
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${NW_GRAFANA_PASSWORD:-northwind}
+      GF_SECURITY_ADMIN_PASSWORD: ${NW_GRAFANA_PASSWORD:-}
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_NEWS_NEWS_FEED_ENABLED: "false"
-    ports: ["3000:3000"]
+    ports: ["127.0.0.1:3000:3000"]
     volumes:
       - ./deploy/local/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./deploy/local/grafana/dashboards:/var/lib/grafana/dashboards:ro

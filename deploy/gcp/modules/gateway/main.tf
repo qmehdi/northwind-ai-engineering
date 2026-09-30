@@ -4,12 +4,28 @@
 # the proxy by scripts/gcp_gateway_keys.sh once the proxy is up. Virtual keys need Postgres,
 # so Cloud SQL (db-f1-micro) is created unless `database` is false, in which case only the
 # master key works.
+#
+# Secrets are write-only: the values come from ephemeral random passwords and go to Secret
+# Manager through `secret_data_wo` (and to Cloud SQL through `password_wo`), so neither the
+# state nor a plan file holds them. `secrets_generation` rotates the master key, the database
+# password and the tenant keys on the next apply; the salt key never rotates (LiteLLM encrypts
+# stored credentials with it). The platform secrets carry the tag class `platform`, which the
+# IAM deny policy in modules/guardrails keeps from every tenant and workload identity.
+#
+# The image is pinned by digest (variable `gateway_image` in the root); this container holds the
+# master key, the database credentials and the model credentials.
 variable "project" { type = string }
 variable "region" { type = string }
 variable "environment" { type = string }
 variable "labels" { type = map(string) }
 variable "tenants" { type = list(string) }
-variable "tenant_members" { type = map(string) }
+variable "tenant_users" {
+  type        = map(string)
+  description = "Tenant to tenant identity email (modules/identity), which may read its own gateway key"
+}
+variable "secret_class_key" { type = string }
+variable "secret_class_values" { type = map(string) }
+variable "secrets_generation" { type = number }
 variable "remote_registry" { type = string }
 variable "image" { type = string }
 variable "database" { type = bool }
@@ -49,6 +65,8 @@ locals {
       store_model_in_db                = false
       disable_spend_logs               = false
       allow_requests_on_db_unavailable = false
+      # Spend logs are operational data: 90 days (docs/governance retention table).
+      maximum_spend_logs_retention_period = "90d"
     } : {})
   })
 }
@@ -59,6 +77,8 @@ resource "google_service_account" "gateway" {
   display_name = "${var.environment} model gateway"
 }
 
+# The gateway is the one identity that calls the models (roles/aiplatform.user covers the
+# publisher models' predict); no tenant can change what it runs.
 resource "google_project_iam_member" "gateway" {
   for_each = toset(concat(["roles/aiplatform.user", "roles/logging.logWriter", "roles/monitoring.metricWriter"], var.database ? ["roles/cloudsql.client"] : []))
   project  = var.project
@@ -68,49 +88,60 @@ resource "google_project_iam_member" "gateway" {
 
 # ----- secrets ------------------------------------------------------------------------------
 
-resource "random_password" "master" {
+ephemeral "random_password" "master" {
   length  = 40
   special = false
 }
 
-resource "random_password" "salt" {
+ephemeral "random_password" "salt" {
   length  = 32
   special = false
 }
 
-resource "random_password" "db" {
+ephemeral "random_password" "db" {
   length  = 32
   special = false
 }
 
 locals {
-  secrets = merge({
-    "master-key" = "sk-${random_password.master.result}"
-    "salt-key"   = random_password.salt.result
+  # The names are plain; the values are ephemeral and reach only write-only arguments.
+  secret_names = concat(["master-key", "salt-key", "config"], var.database ? ["database-url"] : [])
+  secret_values = merge({
+    "master-key" = "sk-${ephemeral.random_password.master.result}"
+    "salt-key"   = ephemeral.random_password.salt.result
     "config"     = local.config
     }, var.database ? {
-    "database-url" = "postgresql://litellm:${random_password.db.result}@localhost/litellm?host=/cloudsql/${var.project}:${var.region}:${local.service}-db"
+    "database-url" = "postgresql://litellm:${ephemeral.random_password.db.result}@localhost/litellm?host=/cloudsql/${var.project}:${var.region}:${local.service}-db"
   } : {})
+  # The salt key is written once and never rotated; the config follows its content.
+  secret_generations = {
+    "master-key"   = tostring(var.secrets_generation)
+    "salt-key"     = "1"
+    "config"       = sha256(local.config)
+    "database-url" = tostring(var.secrets_generation)
+  }
 }
 
 resource "google_secret_manager_secret" "gateway" {
-  for_each  = local.secrets
+  for_each  = toset(local.secret_names)
   project   = var.project
   secret_id = "${local.service}-${each.key}"
   labels    = merge(var.labels, { area = "gateway" })
+  tags      = { (var.secret_class_key) = var.secret_class_values["platform"] }
   replication {
     auto {}
   }
 }
 
 resource "google_secret_manager_secret_version" "gateway" {
-  for_each    = local.secrets
-  secret      = google_secret_manager_secret.gateway[each.key].id
-  secret_data = each.value
+  for_each               = toset(local.secret_names)
+  secret                 = google_secret_manager_secret.gateway[each.key].id
+  secret_data_wo         = local.secret_values[each.key]
+  secret_data_wo_version = local.secret_generations[each.key]
 }
 
 resource "google_secret_manager_secret_iam_member" "gateway" {
-  for_each  = local.secrets
+  for_each  = toset(local.secret_names)
   project   = var.project
   secret_id = google_secret_manager_secret.gateway[each.key].secret_id
   role      = "roles/secretmanager.secretAccessor"
@@ -157,7 +188,9 @@ resource "google_sql_user" "litellm" {
   project  = var.project
   instance = google_sql_database_instance.gateway[0].name
   name     = "litellm"
-  password = random_password.db.result
+  # Same ephemeral value as the database-url secret, in the same apply.
+  password_wo         = ephemeral.random_password.db.result
+  password_wo_version = var.secrets_generation
 }
 
 # ----- the proxy on Cloud Run ---------------------------------------------------------------
@@ -203,7 +236,7 @@ resource "google_cloud_run_v2_service" "gateway" {
     }
 
     containers {
-      image = "${var.remote_registry}/${var.image}"
+      image = "${var.remote_registry}/${var.image}" # repository@sha256:digest
       args  = ["--config", "/config/config.yaml", "--port", "4000"]
 
       ports {
@@ -294,69 +327,54 @@ resource "google_cloud_run_v2_service_iam_member" "public" {
   member   = "allUsers"
 }
 
-# ----- per tenant: a virtual key and an identity ---------------------------------------------
-# The key value is generated here so Terraform can hand it to the tenant's services and agent;
-# scripts/gcp_gateway_keys.sh registers the same value with the proxy (POST /key/generate
-# accepts a caller-chosen key) with the tenant's budget and labels.
+# ----- per tenant: a virtual key --------------------------------------------------------------
+# The key value is generated here (ephemeral, write-only) so Terraform can hand the secret to
+# the tenant's services and agent by reference; scripts/gcp_gateway_keys.sh reads it from Secret
+# Manager and registers the same value with the proxy (POST /key/generate accepts a
+# caller-chosen key) with the tenant's budget and labels. `live` is the key of the live services
+# that Cloud Deploy creates (deploy/gcp/platform/delivery/run-*.yaml).
 
-resource "random_password" "tenant_key" {
-  for_each = toset(var.tenants)
+locals {
+  key_owners = concat(var.tenants, ["live"])
+}
+
+ephemeral "random_password" "tenant_key" {
+  for_each = toset(local.key_owners)
   length   = 32
   special  = false
 }
 
 resource "google_secret_manager_secret" "tenant_key" {
-  for_each  = toset(var.tenants)
+  for_each  = toset(local.key_owners)
   project   = var.project
   secret_id = "${var.environment}-${each.key}-gateway-key"
   labels    = merge(var.labels, { area = "gateway", tenant = each.key })
+  tags      = { (var.secret_class_key) = var.secret_class_values["service"] }
   replication {
     auto {}
   }
 }
 
 resource "google_secret_manager_secret_version" "tenant_key" {
-  for_each    = toset(var.tenants)
-  secret      = google_secret_manager_secret.tenant_key[each.key].id
-  secret_data = "sk-nw-${each.key}-${random_password.tenant_key[each.key].result}"
+  for_each               = toset(local.key_owners)
+  secret                 = google_secret_manager_secret.tenant_key[each.key].id
+  secret_data_wo         = "sk-nw-${each.key}-${ephemeral.random_password.tenant_key[each.key].result}"
+  secret_data_wo_version = tostring(var.secrets_generation)
 }
 
-# The tenant identity: what a learner's notebook and pipeline steps act as when they call the
-# Agent Platform directly (roles/aiplatform.user), so audit logs and cost attribution carry the
-# tenant label. A learner listed in tenant_members may impersonate it.
-resource "google_service_account" "identity" {
-  for_each     = toset(var.tenants)
-  project      = var.project
-  account_id   = "nw-${each.key}-user"
-  display_name = "${var.environment}-${each.key} tenant identity"
-}
-
-resource "google_project_iam_member" "identity" {
-  for_each = toset(var.tenants)
-  project  = var.project
-  role     = "roles/aiplatform.user"
-  member   = "serviceAccount:${google_service_account.identity[each.key].email}"
-}
-
-resource "google_service_account_iam_member" "impersonate" {
-  for_each           = { for t, member in var.tenant_members : t => member if contains(var.tenants, t) }
-  service_account_id = google_service_account.identity[each.key].name
-  role               = "roles/iam.serviceAccountTokenCreator"
-  member             = "user:${each.value}"
-}
-
+# The tenant identity reads its own key (preflight, notebooks); nothing else of the gateway.
 resource "google_secret_manager_secret_iam_member" "identity_key" {
   for_each  = toset(var.tenants)
   project   = var.project
   secret_id = google_secret_manager_secret.tenant_key[each.key].secret_id
   role      = "roles/secretmanager.secretAccessor"
-  member    = "serviceAccount:${google_service_account.identity[each.key].email}"
+  member    = "serviceAccount:${var.tenant_users[each.key]}"
 }
 
 output "url" { value = google_cloud_run_v2_service.gateway.uri }
 output "service_name" { value = google_cloud_run_v2_service.gateway.name }
 output "service_account" { value = google_service_account.gateway.email }
 output "master_key_secret" { value = google_secret_manager_secret.gateway["master-key"].secret_id }
-output "tenant_key_secrets" { value = { for k, s in google_secret_manager_secret.tenant_key : k => s.secret_id } }
-output "identity_accounts" { value = { for k, sa in google_service_account.identity : k => sa.email } }
+output "tenant_key_secrets" { value = { for k, s in google_secret_manager_secret.tenant_key : k => s.secret_id if k != "live" } }
+output "live_key_secret" { value = google_secret_manager_secret.tenant_key["live"].secret_id }
 output "tenant_budget_usd" { value = var.tenant_budget_usd }

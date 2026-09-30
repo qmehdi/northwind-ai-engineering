@@ -1,4 +1,6 @@
 {
+ "legacy": true,
+ "legacy_reason": "measured 2026-09-08 with Claude Sonnet 5 on Bedrock at launch pricing, with agent_version null and no model ids, before the benign golden cases and pass^k. The gate refuses to compare with it and the drift monitor does not use its costs. Kept for the record; the per-track baselines are in data/golden/baselines/ (see README.md there).",
  "agent_version": null,
  "written_at": "2026-09-28T00:00:00+00:00",
  "source": "artifacts/agent_eval.json (course team run, 2026-09-08, Claude Sonnet 5 on Bedrock at launch pricing)",

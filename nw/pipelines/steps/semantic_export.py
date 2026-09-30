@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from nw.pipelines.steps import localize, package, write_result
+from nw.pipelines.steps import local_path, localize, package, write_result
 from nw.semantic.artifacts import newest_candidate
 from nw.semantic.export import run as export
 
@@ -31,7 +31,7 @@ def run(
     config: Any = None,
     tokenizer: Any = None,
 ) -> dict[str, Any]:
-    out = Path(out)
+    out = local_path(out)
     version = version or newest_candidate(out).name
     report = export(out / version, localize(data), n, config=config, tokenizer=tokenizer)
     result = {
@@ -51,11 +51,13 @@ def run(
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--out", type=Path, default=Path("artifacts/semantic"))
+    ap.add_argument(
+        "--out", default="artifacts/semantic", help="the artifact tree: a path or gs:// URI"
+    )
     ap.add_argument("--version", default=None, help="artifact version; default is the newest")
-    ap.add_argument("--data", type=Path, default=Path("data/tickets.jsonl"))
+    ap.add_argument("--data", default="data/tickets.jsonl", help="a path, gs:// or s3:// URI")
     ap.add_argument("--n", type=int, default=20)
-    ap.add_argument("--package-dir", type=Path, default=None)
+    ap.add_argument("--package-dir", default=None)
     args = ap.parse_args(argv)
     result = run(args.out, args.version, args.data, n=args.n, package_dir=args.package_dir)
     return 0 if result["parity_fp32_ok"] else 1

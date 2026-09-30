@@ -64,7 +64,7 @@ def load_finetuned(
 
 
 def export_onnx(model: TicketEncoder, tokenizer: Any, path: Path, max_length: int = 256) -> Path:
-    raise NotImplementedError("Step 8: torch.onnx.export with dynamic axes")
+    raise NotImplementedError("Export to ONNX: torch.onnx.export with dynamic axes")
 
 
 def quantize(src: Path, dst: Path) -> Path:

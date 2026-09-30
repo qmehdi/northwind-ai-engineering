@@ -64,8 +64,12 @@ def drift_baseline(
     refusal_rate = sum(1 for c in cases if c.must_refuse) / len(cases) if cases else 0.0
     lengths = None
     if baseline_run and baseline_run.exists():
-        results = json.loads(baseline_run.read_text(encoding="utf-8")).get("results", [])
-        lengths = [len(r["answer"]) for r in results if not r.get("refused")] or None
+        run = json.loads(baseline_run.read_text(encoding="utf-8"))
+        # A legacy baseline (another model, another golden set) says nothing about this
+        # service's answers: no length reference rather than a wrong one.
+        if not run.get("legacy"):
+            results = run.get("results", [])
+            lengths = [len(r["answer"]) for r in results if not r.get("refused")] or None
     return make_baseline(confidences, refusal_rate, lengths) | {"source": f"golden:{golden}"}
 
 
@@ -137,6 +141,16 @@ def check(corpus: Path, out: Path) -> int:
     return 0
 
 
+def track_baseline_run() -> Path | None:
+    """This track's no-judge baseline, whose `results` carry the Workhorse's answers: the
+    answer-length reference for the drift monitor. None until one is written (`make
+    eval-policy-baseline`); the legacy `data/golden/baseline.json` is never used."""
+    from nw.config import settings
+
+    path = Path(f"data/golden/baselines/policy-{settings().track.value}-no_judge.json")
+    return path if path.exists() else None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--corpus", type=Path, default=Path("data/policies"))
@@ -144,7 +158,13 @@ def main() -> int:
     ap.add_argument("--max-tokens", type=int, default=350)
     ap.add_argument("--overlap", type=int, default=60)
     ap.add_argument("--golden", type=Path, default=Path("data/golden/policy_qa.jsonl"))
-    ap.add_argument("--baseline", type=Path, default=Path("data/golden/baseline.json"))
+    ap.add_argument(
+        "--baseline",
+        type=Path,
+        default=None,
+        help="an evaluation report with answers, for the answer-length reference; default this "
+        "track's no-judge baseline (data/golden/baselines/policy-<track>-no_judge.json)",
+    )
     ap.add_argument(
         "--capture",
         type=Path,
@@ -170,7 +190,7 @@ def main() -> int:
         overlap=args.overlap,
         reranker=reranker,
         golden=args.golden,
-        baseline_run=args.baseline,
+        baseline_run=args.baseline or track_baseline_run(),
         capture=args.capture,
     )
     print(json.dumps({k: v for k, v in manifest.items() if k != "baseline"}, indent=1))

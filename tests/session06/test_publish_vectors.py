@@ -1,5 +1,5 @@
 """Acceptance: the deploy script's publish step fills the managed index from the same
-chunks file the Session path bakes into the image."""
+chunks file the in-process retriever bakes into the image."""
 
 import pytest
 

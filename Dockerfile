@@ -33,20 +33,49 @@ COPY --from=uv /uv /bin/uv
 WORKDIR /app
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never
 COPY pyproject.toml uv.lock .python-version README.md ./
+# Slow or flaky networks: uv retries each download for up to UV_HTTP_TIMEOUT seconds.
+ARG UV_HTTP_TIMEOUT=300
+ENV UV_HTTP_TIMEOUT=${UV_HTTP_TIMEOUT} UV_HTTP_RETRIES=5
 ARG EXTRAS="--extra dl --extra agents --extra agents-aws --extra agents-gcp --extra platform-azure"
 RUN uv sync --frozen --no-dev --no-install-project $EXTRAS
 COPY nw ./nw
 RUN uv sync --frozen --no-dev $EXTRAS
 
-# Pick the artifacts this service needs. Training checkpoints and the fp32 ONNX graph
-# never ship; the int8 graph and the indexes do.
+# Pick the artifacts this service needs. Training checkpoints never ship. The fp32 ONNX graph
+# ships only where the promotion gate chose to serve it (`serving.json` with "quantized": false);
+# everywhere else the int8 graph and the indexes are enough.
 FROM ${PYTHON_IMAGE} AS artifacts
 ARG ARTIFACTS="triage"
-COPY artifacts/ /src/
-RUN mkdir -p /out && for a in $ARTIFACTS; do cp -r "/src/$a" "/out/$a"; done \
-    && rm -f /out/*/model.onnx /out/*/checkpoint.pt /out/*/best.pt /out/*/*/model.onnx /out/*/*/checkpoint.pt /out/*/*/best.pt
+# Read through a bind mount of the build context, not COPY: a fresh fork has no `artifacts/`
+# (it is gitignored and made by training), and COPY of a missing directory fails the build.
+# An artifact that does not exist yet is skipped; the service then reports not ready until the
+# model is trained and the image rebuilt, or the platform serves it (NW_MODEL_URI).
+RUN --mount=type=bind,target=/ctx mkdir -p /out && for a in $ARTIFACTS; do \
+      if [ -e "/ctx/artifacts/$a" ]; then cp -r "/ctx/artifacts/$a" "/out/$a"; \
+      else echo "no artifacts/$a in the build context: the image ships without it"; fi; \
+    done \
+    && rm -f /out/*/checkpoint.pt /out/*/best.pt /out/*/*/checkpoint.pt /out/*/*/best.pt \
+    && for f in /out/*/model.onnx /out/*/*/model.onnx; do \
+      [ -e "$f" ] || continue; \
+      grep -qs '"quantized": false' "$(dirname "$f")/serving.json" || rm -f "$f"; \
+    done
 
 FROM ${PYTHON_IMAGE} AS runtime
+# Everything every service image shares comes first, before any per-image ARG: an ARG in scope
+# is part of each later RUN's cache key, so declaring APP or LAMBDA above these lines gave every
+# service its own copy of the 2 GB virtualenv layer (and filled a 70 GB Docker disk on Local).
+RUN useradd --create-home --uid 10001 nw && mkdir -p /app/hf /tmp/traces && chown -R nw:nw /app /tmp/traces
+WORKDIR /app
+COPY --from=builder --chown=nw:nw /app/.venv /app/.venv
+COPY --from=builder --chown=nw:nw /app/nw /app/nw
+# The lock the image was built from: lineage records its hash, and a pipeline's source bundle
+# warns when its own lock differs (nw/pipelines/source.py).
+COPY --from=builder --chown=nw:nw /app/uv.lock /app/uv.lock
+COPY --chown=nw:nw data/accounts.json /app/data/accounts.json
+# The committed production summaries (two small files): a pipeline step run with the repo
+# defaults finds them where `nw.pipelines.params` says. .dockerignore lets only these through.
+COPY --chown=nw:nw data/golden/triage_production.json data/golden/semantic_production.json /app/data/golden/
+# Per image from here on.
 ARG APP=nw.triage.service:app
 ARG HF_MODELS=0
 ARG PORT=8000
@@ -57,15 +86,7 @@ ARG LAMBDA=0
 COPY --from=lambda-adapter /lambda-adapter /tmp/lambda-adapter
 RUN if [ "$LAMBDA" = "1" ]; then mkdir -p /opt/extensions && mv /tmp/lambda-adapter /opt/extensions/lambda-adapter; else rm -f /tmp/lambda-adapter; fi
 ENV AWS_LWA_PORT=${PORT} AWS_LWA_READINESS_CHECK_PATH=/readyz AWS_LWA_ASYNC_INIT=true AWS_LWA_INVOKE_MODE=buffered
-RUN useradd --create-home --uid 10001 nw && mkdir -p /app/hf /tmp/traces && chown -R nw:nw /app /tmp/traces
-WORKDIR /app
-COPY --from=builder --chown=nw:nw /app/.venv /app/.venv
-COPY --from=builder --chown=nw:nw /app/nw /app/nw
 COPY --from=artifacts --chown=nw:nw /out/ /app/artifacts/
-COPY --chown=nw:nw data/accounts.json /app/data/accounts.json
-# The committed production summaries (two small files): a pipeline step run with the repo
-# defaults finds them where `nw.pipelines.params` says. .dockerignore lets only these through.
-COPY --chown=nw:nw data/golden/triage_production.json data/golden/semantic_production.json /app/data/golden/
 ENV PATH="/app/.venv/bin:$PATH" HF_HOME=/app/hf HF_HUB_OFFLINE=0 \
     NW_TRIAGE_MODEL=/app/artifacts/triage/latest NW_SEMANTIC_ARTIFACT=/app/artifacts/semantic \
     NW_INDEX=/app/artifacts/index NW_POLICY_INDEX=/app/artifacts/policy \
@@ -80,6 +101,11 @@ RUN if [ "$APP" = "pipelines" ]; then python -c "\
 from transformers import AutoModel, AutoTokenizer; \
 AutoTokenizer.from_pretrained('distilbert-base-uncased'); AutoModel.from_pretrained('distilbert-base-uncased')" ; fi
 ENV HF_HUB_OFFLINE=1
+# The commit the image was built from (the image scripts pass it): lineage falls back to it when a
+# container has no git (nw/platform/lineage.py). Last, so a new commit rebuilds only this layer.
+ARG GIT_SHA=
+LABEL org.opencontainers.image.revision=${GIT_SHA}
+ENV NW_IMAGE_GIT_SHA=${GIT_SHA}
 EXPOSE ${PORT}
 HEALTHCHECK --interval=15s --timeout=3s --start-period=60s CMD python -c "import urllib.request,os;urllib.request.urlopen(f'http://127.0.0.1:{os.environ[\"PORT\"]}/readyz')" || exit 1
 # The MCP image runs the server directly; every other image runs uvicorn, on AIP_HTTP_PORT when
@@ -96,3 +122,7 @@ CMD ["sh", "-c", "if [ \"$NW_APP\" = mcp ]; then exec python -m nw.agent.mcp_ser
 FROM runtime AS serving
 ENV PORT=8080 AIP_HTTP_PORT=8080 AIP_HEALTH_ROUTE=/health AIP_PREDICT_ROUTE=/predict
 EXPOSE 8080
+
+# The default build target (no --target) must be the plain runtime: the `serving` stage above bakes
+# the Agent Platform's AIP_* port settings in, which only platform serving images want.
+FROM runtime AS app

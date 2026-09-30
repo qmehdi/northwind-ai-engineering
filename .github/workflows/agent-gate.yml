@@ -1,51 +1,70 @@
-# The agent's regression gate. Two jobs:
+# The agent's regression gate. Three jobs:
 #
-# - `offline` runs on every dispatch with no credentials. First the two AgentOps checks:
-#   every agent in code has an approved use case whose allowed tools cover what it sees
-#   (`nw.agent.catalog --check`), and every agent card in data/agents matches the code it
-#   describes: tools, prompt hash, version (`nw.agent.registry --check`). Then the fifteen
-#   adversarial cases go through the real loop, registry and scorer with a scripted model
-#   that follows each case's expectations, and the tiered gate (tool, turn, session, system)
-#   compares the result with the bars in data/golden/agent_baseline.json. It proves the
-#   loop, the tools, the scorer, the catalog, the registry and the gate still agree; it
-#   proves nothing about a model. It costs nothing.
-# - `gate` runs against a real track and spends about 2.5 USD per run. It needs cloud
-#   credentials, so it is never part of the push CI: configure an OIDC role for GitHub
-#   Actions in your account and store its ARN as the repository secret AWS_ROLE_ARN (or
-#   GCP_WORKLOAD_IDENTITY_PROVIDER and GCP_SERVICE_ACCOUNT for the gcp track), and the URLs
-#   of the deployed Project 1 to 3 services as NW_TRIAGE_URL, NW_SEMANTIC_URL and
-#   NW_POLICY_URL: the tools call them over HTTP because the artifacts they would load in
-#   process do not exist in CI.
-#
-# Pass counts move by one or two between identical runs; the gate allows one. A failure on
-# the pass count alone is a reason to run it again before it is a reason to stop a release.
+# - `offline` runs on every dispatch and on pull requests that touch the agent, with no
+#   credentials. First the two AgentOps checks: every agent in code has an approved use case
+#   whose allowed tools cover what it sees (`nw.agent.catalog --check`), and every agent card
+#   in data/agents matches the code it describes (`nw.agent.registry --check`). Then the
+#   adversarial cases and the benign golden cases (data/golden/agent_cases.jsonl) go through
+#   the real loop, registry and scorer with a scripted model that follows each case's
+#   expectations, and the tiered gate compares the result with
+#   data/golden/baselines/agent-offline.json. It proves the loop, the tools, the scorer, the
+#   catalog, the registry and the gate still agree; it proves nothing about a model. Free.
+# - `replay` (on dispatch, when a cassette is committed at data/golden/cassettes/<track>.jsonl):
+#   plays a recorded live run back through the current loop and tools with no model call, so
+#   a change to the loop or a tool is measured against the decisions a real model made. Free.
+# - `gate` runs against a real track. Every case runs `repeats` times (default 3) and the gate
+#   reads pass^k, the cases that passed every run, counted against the track's baseline
+#   data/golden/baselines/agent-<track>.json. About 0.30 to 0.40 USD per repeat with the Judge. It first
+#   calibrates the turn Judge on data/golden/agent_judge_calibration.jsonl (about 0.25 USD):
+#   the judge bar applies only when that report measured the same Judge id. It records every
+#   completion to a cassette for the replay job. `write_baseline=true` writes the baseline when
+#   none exists or the gate passed; it lands in the run's artifact and a person commits it.
+#   Configure an OIDC role and store its ARN as AWS_ROLE_ARN (aws), GCP_WORKLOAD_IDENTITY_PROVIDER,
+#   GCP_SERVICE_ACCOUNT and GCP_PROJECT (gcp), or AZURE_CLIENT_ID, AZURE_TENANT_ID and
+#   AZURE_SUBSCRIPTION_ID (azure), and the URLs of the deployed Project 1 to 3 services as
+#   NW_TRIAGE_URL, NW_SEMANTIC_URL and NW_POLICY_URL: the tools call them over HTTP because the
+#   artifacts they would load in process do not exist in CI.
 name: agent-gate
 on:
+  pull_request:
+    paths:
+      - nw/agent/**
+      - data/adversarial/**
+      - data/golden/agent_cases.jsonl
+      - data/golden/baselines/agent-*.json
+      - .github/workflows/agent-gate.yml
   workflow_dispatch:
     inputs:
       track:
-        description: aws or gcp
+        description: aws, gcp or azure
         default: aws
         type: choice
-        options: [aws, gcp]
+        options: [aws, gcp, azure]
       live:
-        description: also run the fifteen cases against the track (about 2.5 USD)
+        description: also run the cases against the track (about 0.30 to 0.40 USD per repeat)
         default: "false"
         type: choice
         options: ["false", "true"]
+      repeats:
+        description: runs per case on the track; the gate reads pass^k
+        default: "3"
+        type: choice
+        options: ["1", "3", "5"]
       write_baseline:
-        description: a passed live gate replaces data/golden/agent_baseline.json in the run's artifact
+        description: a passed live gate writes data/golden/baselines/agent-<track>.json into the run's artifact
         default: "false"
         type: choice
         options: ["false", "true"]
+permissions:
+  contents: read
 jobs:
   offline:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
       - run: uv python install 3.12
       - run: uv sync --locked --extra dev --extra agents
       - name: Every agent in code has an approved use case that allows its tools
@@ -56,63 +75,101 @@ jobs:
         env:
           NW_TRACK: local
         run: uv run python -m nw.agent.registry --check
-      - name: The adversarial set through the loop with a scripted model, then the tiered gate
+      - name: Adversarial and benign cases through the loop with a scripted model, then the tiered gate
         env:
           NW_TRACK: local
         run: uv run python -m nw.agent.evaluate --provider fake --gate --out artifacts/agent_eval_offline.json --traces artifacts/traces-offline
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: agent-eval-offline
           path: |
             artifacts/agent_eval_offline.json
             artifacts/agent_gate.jsonl
+  replay:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+      - run: uv python install 3.12
+      - run: uv sync --locked --extra dev --extra agents
+      - name: Replay the recorded live run for this track, if one is committed
+        env:
+          NW_TRACK: local
+          CASSETTE: data/golden/cassettes/${{ inputs.track }}.jsonl
+        run: |
+          if [ ! -f "$CASSETTE" ]; then echo "no cassette at $CASSETTE: record one with the gate job"; exit 0; fi
+          uv run python -m nw.agent.evaluate --provider replay --replay "$CASSETTE" --out artifacts/agent_eval_replay.json --traces artifacts/traces-replay
   gate:
-    if: inputs.live == 'true'
+    if: github.event_name == 'workflow_dispatch' && inputs.live == 'true'
     runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
       - run: uv python install 3.12
       - run: uv sync --locked --extra dev --extra agents --extra agents-aws --extra agents-gcp
       - if: inputs.track == 'aws'
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: us-east-1
       - if: inputs.track == 'gcp'
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - if: inputs.track == 'azure'
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       - name: The catalog and the registry, before any model is paid for
         env:
           NW_TRACK: ${{ inputs.track }}
         run: |
           uv run python -m nw.agent.catalog --check
           uv run python -m nw.agent.registry --check
-      - name: Run the adversarial set on the track and apply the tiered gate (plus one Judge call per case)
+      - name: Calibrate the turn Judge on this track (about 0.25 USD)
         env:
           NW_TRACK: ${{ inputs.track }}
           NW_AWS_REGION: us-east-1
           NW_GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
-          NW_SPEND_CAP_USD: "6"
+        run: uv run python -m nw.agent.evaluate --calibrate-judge
+      - name: Run every case k times on the track and apply the tiered gate on pass^k
+        env:
+          NW_TRACK: ${{ inputs.track }}
+          NW_AWS_REGION: us-east-1
+          NW_GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+          NW_SPEND_CAP_USD: "20"
           NW_TRIAGE_URL: ${{ secrets.NW_TRIAGE_URL }}
           NW_SEMANTIC_URL: ${{ secrets.NW_SEMANTIC_URL }}
           NW_POLICY_URL: ${{ secrets.NW_POLICY_URL }}
+          REPEATS: ${{ inputs.repeats }}
+          WRITE: ${{ inputs.write_baseline }}
+          TRACK: ${{ inputs.track }}
         run: |
-          if [ "${{ inputs.write_baseline }}" = "true" ]; then uv run python -m nw.agent.evaluate --backend http --gate --write-baseline; else uv run python -m nw.agent.evaluate --backend http --gate; fi
+          flags="--backend http --gate --repeats $REPEATS --record data/golden/cassettes/$TRACK.jsonl"
+          if [ "$WRITE" = "true" ]; then flags="$flags --write-baseline"; fi
+          uv run python -m nw.agent.evaluate $flags
       - name: The escalation queue must not exist after an evaluation
         run: test ! -f artifacts/escalations.jsonl
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: agent-eval-${{ inputs.track }}
           path: |
             artifacts/agent_eval.json
             artifacts/agent_gate.jsonl
+            artifacts/agent_judge_calibration.json
             artifacts/traces
-            data/golden/agent_baseline.json
+            data/golden/baselines/
+            data/golden/cassettes/

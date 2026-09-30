@@ -8,6 +8,7 @@ tests hand in fakes. Install the SDKs with `uv sync --extra platform-azure`.
 
     uv run python -m nw.platform.azure describe         # what build(settings) resolved, the names
     uv run python -m nw.platform.azure pipeline-definition triage   # the Azure ML job as YAML
+    uv run python -m nw.platform.azure bootstrap         # register and approve artifacts/*/latest
 
 Configuration comes from the environment (`NW_AZURE_*`) and, after `make deploy-azure`, from
 `deploy/azure/outputs.json`, a flat JSON object keyed by the same `NW_AZURE_*` names (the ARM
@@ -48,6 +49,7 @@ from typing import Any
 
 from nw.config import Settings, Track, read_azure_outputs
 from nw.platform.base import (
+    STEP_BACK,
     Hit,
     ModelVersion,
     PipelineRun,
@@ -56,15 +58,21 @@ from nw.platform.base import (
     RunStatus,
     Stage,
     Tenant,
+    clamp_score,
+    default_prompt,
 )
 
 OUTPUTS = Path(__file__).resolve().parents[2] / "deploy" / "azure" / "outputs.json"
 LIVE = "live"
 SCOPE = "https://ai.azure.com/.default"
 STAGE_TAG = "stage"
-# Which stage wins when several versions claim one; the previous holder steps back.
-STAGE_PRIORITY: tuple[Stage, ...] = (Stage.LIVE, Stage.APPROVED, Stage.RETIRED, Stage.CANDIDATE)
-STEP_BACK = {Stage.LIVE: Stage.RETIRED, Stage.APPROVED: Stage.CANDIDATE}
+# The live endpoint's colours, recorded as endpoint tags so promote and rollback never guess
+# them from the traffic (at 50/50, or after a full cutover, the traffic cannot say).
+STABLE_TAG = "nw.stable"
+CANARY_TAG = "nw.canary"
+# Hybrid search fuses BM25 and the vector query by reciprocal rank, 1 / (60 + rank) per list;
+# the best a document can score with both lists is 2 / 61.
+RRF_MAX = 2 / 61
 # Azure ML job states (azure.ai.ml JobStatus) onto the course's run states.
 JOB_STATES: Mapping[str, RunStatus] = {
     "NotStarted": RunStatus.QUEUED,
@@ -237,6 +245,9 @@ class AzureConfig:
     # (NW_AZURE_TENANT_DATA_COLLECTION=1), sampled at NW_AZURE_DATA_SAMPLING_RATE.
     tenant_data_collection: bool = False
     data_sampling_rate: float = 1.0
+    # The Key Vault EC key the delivery signs images with (cosign); deployments verify against
+    # it. `NW_ALLOW_UNSIGNED=1` skips the check (a laptop experiment, never a cohort).
+    signing_key: str = ""
     images: dict[str, str] = field(default_factory=dict)  # project -> image, NW_AZURE_IMAGE_*
 
     @classmethod
@@ -310,6 +321,7 @@ class AzureConfig:
             live_endpoint_sku=pick("LIVE_ENDPOINT_SKU", None, "Standard_DS3_v2"),
             tenant_data_collection=pick("TENANT_DATA_COLLECTION").lower() in ("1", "true", "yes"),
             data_sampling_rate=float(pick("DATA_SAMPLING_RATE", None, "1.0")),
+            signing_key=pick("SIGNING_KEY"),
             images=images,
         )
 
@@ -470,9 +482,27 @@ class AzureClients:
 # ----- blob documents ---------------------------------------------------------------------
 
 
+class Conflict(RuntimeError):
+    """An etag precondition kept failing: another writer is updating the document."""
+
+
+_CONFLICTS = ("ResourceModifiedError", "ResourceExistsError", "HttpResponseError")
+
+
+def _conflict(exc: BaseException) -> bool:
+    name = type(exc).__name__
+    status = getattr(exc, "status_code", None)
+    return name in _CONFLICTS[:2] or (name == _CONFLICTS[2] and status in (409, 412))
+
+
 class Documents:
     """JSON documents in the artifacts container: the store for everything the platform has
-    no resource for. Thin on purpose so a fake needs a handful of methods."""
+    no resource for. Updates of a shared document (`update`, `append`) are read-modify-write
+    with the blob's etag (`match_condition=IfNotModified`; a blob that must not exist yet is
+    written with `overwrite=False`) and retried from a fresh read on a conflict, so two
+    tenants of a cohort never lose each other's update."""
+
+    ATTEMPTS = 8
 
     def __init__(self, clients: AzureClients, container: str) -> None:
         self.clients = clients
@@ -494,22 +524,67 @@ class Documents:
         text = self.read_text(path)
         return default if text is None else json.loads(text)
 
-    def write_text(self, path: str, text: str, content_type: str = "text/plain") -> str:
-        blob = self._blob(path)
-        kwargs: dict[str, Any] = {"overwrite": True}
+    @staticmethod
+    def _settings(content_type: str) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {}
         with contextlib.suppress(ImportError):
             from azure.storage.blob import ContentSettings
 
             kwargs["content_settings"] = ContentSettings(content_type=content_type)
-        blob.upload_blob(text.encode("utf-8"), **kwargs)
+        return kwargs
+
+    def write_text(self, path: str, text: str, content_type: str = "text/plain") -> str:
+        """A blob only its owner writes (one version's record): a plain overwrite."""
+        self._blob(path).upload_blob(
+            text.encode("utf-8"), overwrite=True, **self._settings(content_type)
+        )
         return self.url(path)
 
     def write(self, path: str, doc: Any) -> str:
         return self.write_text(path, json.dumps(doc, indent=2, sort_keys=True), "application/json")
 
+    def update_text(self, path: str, mutate: Callable[[str | None], str], content_type: str) -> str:
+        from azure.core import MatchConditions
+
+        for _ in range(self.ATTEMPTS):
+            blob = self._blob(path)
+            if blob.exists():
+                downloaded = blob.download_blob()
+                current: str | None = downloaded.readall().decode("utf-8")
+                etag = getattr(getattr(downloaded, "properties", None), "etag", None)
+                condition: dict[str, Any] = {
+                    "overwrite": True,
+                    "etag": etag,
+                    "match_condition": MatchConditions.IfNotModified,
+                }
+            else:
+                current, condition = None, {"overwrite": False}
+            new = mutate(current)
+            try:
+                blob.upload_blob(new.encode("utf-8"), **condition, **self._settings(content_type))
+                return new
+            except Exception as exc:  # noqa: BLE001  azure.core errors without the import
+                if not _conflict(exc):
+                    raise
+        raise Conflict(f"{self.url(path)} kept changing under {self.ATTEMPTS} attempts")
+
+    def update(self, path: str, mutate: Callable[[Any], Any], default: Any) -> Any:
+        """Read, mutate a copy, write back only if nobody wrote in between; returns the doc."""
+        import copy
+
+        out: dict[str, Any] = {}
+
+        def apply(text: str | None) -> str:
+            doc = json.loads(text) if text is not None else copy.deepcopy(default)
+            out["doc"] = mutate(doc)
+            return json.dumps(out["doc"], indent=2, sort_keys=True)
+
+        self.update_text(path, apply, "application/json")
+        return out["doc"]
+
     def append(self, path: str, row: Mapping[str, Any]) -> None:
-        text = self.read_text(path) or ""
-        self.write_text(path, text + json.dumps(row, sort_keys=True) + "\n", "application/x-ndjson")
+        line = json.dumps(row, sort_keys=True) + "\n"
+        self.update_text(path, lambda text: (text or "") + line, "application/x-ndjson")
 
     def url(self, path: str) -> str:
         return f"{self.clients.cfg.blob_url}/{self.container}/{path}"
@@ -690,11 +765,13 @@ class AzureMLPipelineRunner:
         *,
         sleep: Callable[[float], None] = time.sleep,
         poll_s: float = 30.0,
+        bundler: Callable[[], Any] | None = None,
     ) -> None:
         self.cfg = cfg
         self.clients = clients
         self.sleep = sleep
         self.poll_s = poll_s
+        self.bundler = bundler
 
     def deployed_defaults(self, tenant: Tenant, pipeline: str) -> dict[str, str]:
         """Where the deploy puts the tickets and the production summaries on the workspace's
@@ -727,19 +804,37 @@ class AzureMLPipelineRunner:
             defaults=self.deployed_defaults(tenant, pipeline),
         )
 
-    def job(self, tenant: Tenant, pipeline: str, params: Mapping[str, Any] | None = None) -> Any:
-        """The `PipelineJob`, built locally; what `submit` sends."""
+    def job(
+        self,
+        tenant: Tenant,
+        pipeline: str,
+        params: Mapping[str, Any] | None = None,
+        *,
+        ship: bool = False,
+    ) -> Any:
+        """The `PipelineJob`, built locally; what `submit` sends. With `ship` the checkout's
+        source bundle (`nw.pipelines.source`) becomes the `source_uri` input, uploaded with the
+        submission, so every step runs the learner's `nw/`."""
         from nw.pipelines.azureml import definition
+        from nw.pipelines.source import default_bundle
 
         values = {
             k: v for k, v in (params or {}).items() if k not in ("template_path", "image_uri")
         }
+        if ship and not values.get("source_uri"):
+            values["source_uri"] = str((self.bundler or default_bundle)().path)
         return definition(pipeline, self.pipeline_config(tenant, pipeline, params or {}), values)
 
     def submit(self, tenant: Tenant, pipeline: str, params: Mapping[str, Any]) -> PipelineRun:
         from nw.pipelines import canonical
+        from nw.pipelines.source import default_bundle
 
-        job = self.job(tenant, pipeline, params)
+        params = dict(params)
+        if not params.get("source_uri"):
+            bundle = Path((self.bundler or default_bundle)().path)
+            params["source_uri"] = str(bundle)
+            self.publish_latest(tenant, bundle)
+        job = self.job(tenant, pipeline, params, ship=True)
         created = self.clients.ml.jobs.create_or_update(
             job, experiment_name=tenant.resource(canonical(pipeline))
         )
@@ -749,6 +844,15 @@ class AzureMLPipelineRunner:
             status=JOB_STATES.get(str(created.status), RunStatus.QUEUED),
             url=getattr(created, "studio_url", None),
         )
+
+    def publish_latest(self, tenant: Tenant, bundle: Path) -> str:
+        """Copy the submitted bundle to `<prefix>/source/latest.tar.gz` in the artifacts
+        container: the weekly retrain schedule runs `--source-uri` from there, so it trains the
+        code last submitted, as on Google Cloud. Returns the blob path."""
+        path = f"{tenant.prefix}/source/latest.tar.gz"
+        blob = self.clients.blob.get_blob_client(container=self.cfg.artifacts_container, blob=path)
+        blob.upload_blob(Path(bundle).read_bytes(), overwrite=True)
+        return path
 
     def status(self, tenant: Tenant, run: PipelineRun) -> PipelineRun:
         job = self.clients.ml.jobs.get(run.run_id)
@@ -777,8 +881,15 @@ class AzureMLPipelineRunner:
             self.sleep(self.poll_s)
 
     def logs(self, tenant: Tenant, run: PipelineRun) -> Iterator[str]:
-        """`jobs.stream`, which prints the run's log to stdout until the run ends, captured
-        line by line. Following a running job blocks until it finishes."""
+        """The run's log once it has ended (`jobs.stream` prints it and returns); a running job
+        yields its status and the studio link instead, because `stream` follows a running job
+        until it ends and would block the caller with no deadline. `wait` first, then `logs`."""
+        current = self.status(tenant, run)
+        if current.status not in (RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.STOPPED):
+            yield f"run {run.run_id} is {current.status.value}: logs follow once it ends"
+            if current.url:
+                yield current.url
+            return
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
             self.clients.ml.jobs.stream(run.run_id)
@@ -788,13 +899,44 @@ class AzureMLPipelineRunner:
 # ----- EndpointClient: Azure ML managed online endpoints ----------------------------------
 
 
+def _forbidden(exc: BaseException) -> bool:
+    status = getattr(exc, "status_code", None)
+    text = str(exc)
+    return status == 403 or "AuthorizationFailed" in text or "does not have authorization" in text
+
+
+def cosign_verify(image: str, key: str) -> None:
+    """`cosign verify --key azurekms://<vault>.vault.azure.net/<key> <image>`."""
+    import subprocess
+
+    try:
+        done = subprocess.run(
+            ["cosign", "verify", "--key", key, image],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "cosign is not installed (brew install cosign); it verifies the image signature "
+            "before a deployment, NW_ALLOW_UNSIGNED=1 skips it"
+        ) from exc
+    if done.returncode != 0:
+        raise RuntimeError(f"{image} failed signature verification: {done.stderr.strip()[-400:]}")
+
+
 class AzureMLEndpointClient:
     """Managed online endpoints, created on first deploy. A tenant's endpoint
     `nw-<tenant>-<name>-<h5>` runs one small `blue` deployment that each deploy replaces. The
-    live endpoint `nw-live-<name>-<h5>` runs blue and green: `deploy(live=True,
-    canary_percent=N)` puts the version on the colour that is not serving and sends it N
-    percent of the traffic (100 when 0); `promote` moves the rest and removes the old colour,
-    `rollback` sends everything back.
+    live endpoint `nw-live-<name>-<h5>` runs blue and green, and its tags `nw.stable` and
+    `nw.canary` say which colour is which (the traffic cannot: at 50/50 both colours look the
+    same, and after a cutover the new colour holds the most). `deploy(live=True,
+    canary_percent=N)` puts the version on the colour that is not the stable one and sends it N
+    percent of the traffic; at 0 or 100, or with nothing serving yet, the version takes all the
+    traffic and the other colour is deleted. `promote` gives the canary everything and deletes
+    the old stable colour; `rollback` sends everything back to the stable colour and deletes the
+    canary.
 
     The deployment is the course's own serving image as a custom container (nw/serving/vertex.py:
     `/health` and `/predict` on 8080 once `AIP_HTTP_PORT` is set), the registered model mounted
@@ -813,9 +955,47 @@ class AzureMLEndpointClient:
 
     COLLECTIONS = ("model_inputs", "model_outputs", "request", "response")
 
-    def __init__(self, cfg: AzureConfig, clients: AzureClients) -> None:
+    def __init__(
+        self,
+        cfg: AzureConfig,
+        clients: AzureClients,
+        verifier: Callable[[str, str], None] | None = None,
+    ) -> None:
         self.cfg = cfg
         self.clients = clients
+        self.verifier = verifier or cosign_verify
+
+    def signing_key_uri(self) -> str:
+        key = self.cfg.signing_key
+        if key.startswith("azurekms://"):
+            return key
+        return f"azurekms://{self.cfg.key_vault}.vault.azure.net/{key}"
+
+    def verify_image(self, image: str) -> None:
+        """The image's cosign signature against the delivery's Key Vault key, before anything
+        is deployed. Refuses an unsigned or tampered image; `NW_ALLOW_UNSIGNED=1` skips."""
+        if os.environ.get("NW_ALLOW_UNSIGNED", "").strip() == "1":
+            return
+        if not (self.cfg.signing_key and self.cfg.key_vault):
+            raise ValueError(
+                f"cannot verify {image}: NW_AZURE_SIGNING_KEY or NW_AZURE_KEY_VAULT is not set "
+                "(deploy/azure/outputs.json); NW_ALLOW_UNSIGNED=1 skips the check"
+            )
+        self.verifier(image, self.signing_key_uri())
+
+    def _live_guard(self, tenant: Tenant, action: str, call: Callable[[], Any]) -> Any:
+        """Run a live-endpoint operation; an authorization failure says who may do it."""
+        try:
+            return call()
+        except Exception as exc:  # noqa: BLE001  azure.core errors without the import
+            if _forbidden(exc):
+                raise PermissionError(
+                    f"{action} on the live endpoint is not a tenant's to do: the live model is "
+                    "promoted by the live identity or the instructor (`scripts/deploy_azure.sh`, "
+                    f"or NW_TENANT=live with the live credentials). {tenant.name} deploys to its "
+                    "own endpoint only."
+                ) from exc
+            raise
 
     def _data_collector(self, live: bool) -> Any | None:
         """The deployment's `data_collector`, or None for a tenant that has not opted in."""
@@ -882,70 +1062,108 @@ class AzureMLEndpointClient:
             tags={"model_version": version.version, "tenant": tenant.name},
         )
 
+    @staticmethod
+    def colours(endpoint: Any) -> tuple[str | None, str | None]:
+        """(stable, canary) from the endpoint's tags; a stable colour with no record is the
+        only colour with traffic, when there is exactly one."""
+        tags = dict(getattr(endpoint, "tags", None) or {})
+        traffic = {k: int(v) for k, v in (getattr(endpoint, "traffic", None) or {}).items()}
+        stable = tags.get(STABLE_TAG) or None
+        canary = tags.get(CANARY_TAG) or None
+        if stable is None:
+            serving = [c for c, pct in traffic.items() if pct > 0]
+            stable = serving[0] if len(serving) == 1 else None
+        return stable, canary
+
+    def _save(
+        self, endpoint: Any, traffic: Mapping[str, int], stable: str | None, canary: str | None
+    ) -> Any:
+        if sum(traffic.values()) not in (0, 100):
+            raise ValueError(f"traffic must add up to 100: {dict(traffic)}")
+        endpoint.traffic = dict(traffic)
+        endpoint.tags = {
+            **dict(getattr(endpoint, "tags", None) or {}),
+            STABLE_TAG: stable or "",
+            CANARY_TAG: canary or "",
+        }
+        return self.clients.ml.online_endpoints.begin_create_or_update(endpoint).result()
+
     def deploy(
         self, tenant: Tenant, version: ModelVersion, *, live: bool = False, canary_percent: int = 0
     ) -> str:
         if not 0 <= canary_percent <= 100:
             raise ValueError(f"canary_percent {canary_percent}: 0 to 100")
+        self.verify_image(self.cfg.image_for(version.name))
+        if live:
+            return self._live_guard(
+                tenant, "deploy", lambda: self._deploy(tenant, version, True, canary_percent)
+            )
+        return self._deploy(tenant, version, False, canary_percent)
+
+    def _deploy(
+        self, tenant: Tenant, version: ModelVersion, live: bool, canary_percent: int
+    ) -> str:
         ml = self.clients.ml
         name = self.endpoint(tenant, version.name, live)
         endpoint = self._ensure_endpoint(name, tenant, version.name)
-        traffic = {k: int(v) for k, v in (getattr(endpoint, "traffic", None) or {}).items()}
-        serving = max(traffic, key=lambda k: traffic[k]) if any(traffic.values()) else None
-        if live and serving:
-            color = next(c for c in DEPLOYMENT_COLORS if c != serving)
-        else:
-            color = serving or DEPLOYMENT_COLORS[0]
-        ml.online_deployments.begin_create_or_update(
-            self._deployment(tenant, version, name, color, live)
-        ).result()
         percent = canary_percent or 100
-        if live and serving and serving != color and percent < 100:
-            endpoint.traffic = {color: percent, serving: 100 - percent}
+        stable, _ = self.colours(endpoint) if live else (None, None)
+        colour = (
+            next(c for c in DEPLOYMENT_COLORS if c != stable) if stable else DEPLOYMENT_COLORS[0]
+        )
+        ml.online_deployments.begin_create_or_update(
+            self._deployment(tenant, version, name, colour, live)
+        ).result()
+        if live and stable and percent < 100:
+            updated = self._save(endpoint, {colour: percent, stable: 100 - percent}, stable, colour)
         else:
-            endpoint.traffic = {
-                color: 100,
-                **({serving: 0} if serving and serving != color else {}),
+            others = {
+                c: 0 for c in DEPLOYMENT_COLORS if c != colour and c in (endpoint.traffic or {})
             }
-        updated = ml.online_endpoints.begin_create_or_update(endpoint).result()
+            updated = self._save(endpoint, {colour: 100, **others}, colour, None)
+            for other in others:
+                ml.online_deployments.begin_delete(name=other, endpoint_name=name).result()
         return getattr(updated, "scoring_uri", None) or name
 
     def set_traffic(
         self, tenant: Tenant, name: str, traffic: Mapping[str, int]
     ) -> Mapping[str, int]:
-        if sum(traffic.values()) not in (0, 100):
-            raise ValueError(f"traffic must add up to 100: {dict(traffic)}")
-        ml = self.clients.ml
-        endpoint = ml.online_endpoints.get(self.endpoint(tenant, name))
-        endpoint.traffic = dict(traffic)
-        ml.online_endpoints.begin_create_or_update(endpoint).result()
+        endpoint = self.clients.ml.online_endpoints.get(self.endpoint(tenant, name))
+        stable, canary = self.colours(endpoint)
+        self._save(endpoint, traffic, stable, canary)
         return dict(traffic)
 
     def promote(self, tenant: Tenant, name: str) -> str:
-        """The canary takes all the traffic and the old colour is deleted."""
+        """The canary takes all the traffic, the old stable colour is deleted, and the canary is
+        recorded as the stable colour."""
+        return self._live_guard(tenant, "promote", lambda: self._promote(tenant, name))
+
+    def _promote(self, tenant: Tenant, name: str) -> str:
         ml = self.clients.ml
         endpoint_id = self.endpoint(tenant, name)
         endpoint = ml.online_endpoints.get(endpoint_id)
-        traffic = {k: int(v) for k, v in (endpoint.traffic or {}).items()}
-        if len(traffic) < 2:
-            return next(iter(traffic), "")
-        canary = min(traffic, key=lambda k: traffic[k])
-        old = max(traffic, key=lambda k: traffic[k])
-        self.set_traffic(tenant, name, {canary: 100, old: 0})
-        ml.online_deployments.begin_delete(name=old, endpoint_name=endpoint_id).result()
+        stable, canary = self.colours(endpoint)
+        if not canary:
+            raise KeyError(f"{endpoint_id} has no canary to promote (stable {stable})")
+        self._save(endpoint, {canary: 100, **({stable: 0} if stable else {})}, canary, None)
+        if stable and stable != canary:
+            ml.online_deployments.begin_delete(name=stable, endpoint_name=endpoint_id).result()
         return canary
 
     def rollback(self, tenant: Tenant, name: str) -> str:
-        """Everything back to the colour with the most traffic; the canary is deleted."""
+        """Everything back to the stable colour; the canary is deleted."""
+        return self._live_guard(tenant, "rollback", lambda: self._rollback(tenant, name))
+
+    def _rollback(self, tenant: Tenant, name: str) -> str:
         ml = self.clients.ml
         endpoint_id = self.endpoint(tenant, name)
         endpoint = ml.online_endpoints.get(endpoint_id)
-        traffic = {k: int(v) for k, v in (endpoint.traffic or {}).items()}
-        if len(traffic) < 2:
-            return next(iter(traffic), "")
-        stable = max(traffic, key=lambda k: traffic[k])
-        canary = min(traffic, key=lambda k: traffic[k])
-        self.set_traffic(tenant, name, {stable: 100, canary: 0})
+        stable, canary = self.colours(endpoint)
+        if not stable:
+            raise KeyError(f"{endpoint_id} has no stable colour to roll back to")
+        if not canary:
+            return stable
+        self._save(endpoint, {stable: 100, canary: 0}, stable, None)
         ml.online_deployments.begin_delete(name=canary, endpoint_name=endpoint_id).result()
         return stable
 
@@ -991,6 +1209,8 @@ class AzureMLEndpointClient:
             "name": endpoint_id,
             "scoring_uri": getattr(endpoint, "scoring_uri", None),
             "traffic": dict(getattr(endpoint, "traffic", None) or {}),
+            "stable": self.colours(endpoint)[0],
+            "canary": self.colours(endpoint)[1],
             "deployments": deployments,
         }
 
@@ -1003,8 +1223,7 @@ class AzureMLEndpointClient:
             ml.online_endpoints.begin_delete(name=endpoint_id).result()
             return
         endpoint = ml.online_endpoints.get(endpoint_id)
-        endpoint.traffic = {}
-        ml.online_endpoints.begin_create_or_update(endpoint).result()
+        self._save(endpoint, {}, None, None)
         for d in list(ml.online_deployments.list(endpoint_name=endpoint_id)):
             ml.online_deployments.begin_delete(name=d.name, endpoint_name=endpoint_id).result()
 
@@ -1091,25 +1310,24 @@ class AzurePromptStore:
             "text_url": url,
         }
         self.docs.write(f"{directory}/{sha}.json", doc)
-        index = self.docs.read(f"{directory}/index.json", {"versions": {}})
-        index["versions"][sha] = Stage.CANDIDATE.value
-        self.docs.write(f"{directory}/index.json", index)
+
+        def add(index: dict[str, Any]) -> dict[str, Any]:
+            index.setdefault("versions", {})[sha] = Stage.CANDIDATE.value
+            order = index.setdefault("order", list(index["versions"]))
+            if sha not in order:
+                order.append(sha)
+            return index
+
+        self.docs.update(f"{directory}/index.json", add, {"versions": {}})
         return self._record(doc)
 
     def get(self, tenant: Tenant, name: str, version: str | None = None) -> PromptVersion:
         directory = self._dir(tenant, name)
-        index = self.docs.read(f"{directory}/index.json")
-        if not index or not index.get("versions"):
-            raise KeyError(f"no prompt {tenant.resource(name)}")
         if version is None:
-            stages = index["versions"]
-            for stage in (Stage.LIVE, Stage.APPROVED, Stage.CANDIDATE):
-                hits = [v for v, s in stages.items() if s == stage.value]
-                if hits:
-                    version = hits[-1]
-                    break
-            if version is None:
-                version = list(stages)[-1]
+            found = self.versions(tenant, name)
+            if not found:
+                raise KeyError(f"no prompt {tenant.resource(name)}")
+            return default_prompt(found)
         doc = self.docs.read(f"{directory}/{version}.json")
         if not doc:
             raise KeyError(f"prompt {tenant.resource(name)} has no version {version}")
@@ -1120,30 +1338,40 @@ class AzurePromptStore:
         doc = self.docs.read(f"{directory}/{version}.json")
         if not doc:
             raise KeyError(f"prompt {tenant.resource(name)} has no version {version}")
-        index = self.docs.read(f"{directory}/index.json", {"versions": {}})
-        changed: dict[str, Stage] = {version: stage}
-        if stage in STEP_BACK:
-            for v, s in list(index["versions"].items()):
-                if s == stage.value and v != version:
-                    changed[v] = STEP_BACK[stage]
+        changed: dict[str, Stage] = {}
+
+        def move(index: dict[str, Any]) -> dict[str, Any]:
+            changed.clear()
+            versions = index.setdefault("versions", {})
+            if stage in STEP_BACK:
+                for v, held in list(versions.items()):
+                    if held == stage.value and v != version:
+                        changed[v] = STEP_BACK[stage]
+                        versions[v] = STEP_BACK[stage].value
+            changed[version] = stage
+            versions[version] = stage.value
+            return index
+
+        self.docs.update(f"{directory}/index.json", move, {"versions": {}})
         for v, new in changed.items():
             record = doc if v == version else self.docs.read(f"{directory}/{v}.json")
             if not record:
                 continue
             record["stage"] = new.value
-            index["versions"][v] = new.value
             self.docs.write(f"{directory}/{v}.json", record)
             self._asset(tenant, name, v, record.get("text_url") or "", new, record.get("tags", {}))
-        self.docs.write(f"{directory}/index.json", index)
         return self._record(doc)
 
     def versions(self, tenant: Tenant, name: str) -> Sequence[PromptVersion]:
+        """Every version, oldest first (the index keeps the registration order)."""
         directory = self._dir(tenant, name)
         index = self.docs.read(f"{directory}/index.json")
         if not index:
             return []
+        order = list(index.get("order") or [])
+        order += [v for v in index.get("versions", {}) if v not in order]
         out = []
-        for v in index.get("versions", {}):
+        for v in order:
             doc = self.docs.read(f"{directory}/{v}.json")
             if doc:
                 out.append(self._record(doc))
@@ -1164,7 +1392,12 @@ class AISearchVectorStore:
     profile whose vectorizer is the Foundry embedding deployment, so a query without a vector is
     embedded by the service (integrated vectorization). `search` is hybrid: BM25 over the text
     and the vector query, fused by reciprocal rank. Upserts without vectors are embedded here
-    through the same deployment on the Foundry v1 endpoint."""
+    through the same deployment on the Foundry v1 endpoint.
+
+    Scores: the fused `@search.score` is a reciprocal-rank sum, 0.016 to 0.033, not a cosine,
+    so a bar tuned on the other tracks would refuse everything. The hit's score is that sum over
+    its maximum (2 / 61, first in both lists), on the contract's 0 to 1 scale; it measures rank
+    agreement, and the raw value stays in `raw_score`."""
 
     VECTOR = "vector"
     PROFILE = "nw-hnsw-profile"
@@ -1297,12 +1530,13 @@ class AISearchVectorStore:
                 meta = json.loads(r.get("metadata") or "{}")
             except ValueError:
                 meta = {}
+            raw = float(r.get("@search.score") or 0.0)
             hits.append(
                 Hit(
                     id=r["id"],
                     text=r["text"],
-                    score=float(r.get("@search.score") or 0.0),
-                    metadata=meta,
+                    score=clamp_score(raw / RRF_MAX),
+                    metadata={**meta, "raw_score": raw, "score_kind": "rrf"},
                 )
             )
         return hits
@@ -1422,6 +1656,13 @@ class FoundryHostedAgentRuntime:
         )
         merged.setdefault("NW_TENANT", tenant.name)
         merged.setdefault("NW_ENVIRONMENT", tenant.environment)
+        # Foundry authenticates every call to a hosted agent; the contract routes defer to it.
+        merged.setdefault("NW_RUNTIME_AUTH", "platform")
+        merged.setdefault("NW_REDACT_DETECTOR", "heuristic")
+        # No NW_OPS_STORE here: a hosted agent runs as the Foundry project's identity, which is
+        # shared by every tenant and holds no lake role (it would reach every tenant's prefix),
+        # so a tenant's hosted agent keeps trajectories in its container until a per-agent
+        # identity exists. The live agent on Container Apps writes the ops store.
         # The model route comes from the platform, so a caller that passes only the gateway key
         # (or an empty NW_GATEWAY_URL, which means LiteLLM and is not set on this track) still
         # deploys an agent that reaches its models: API Management first, else Foundry itself.
@@ -1537,22 +1778,24 @@ class FoundryHostedAgentRuntime:
         }
 
     def _upsert_registry(self, tenant: Tenant, entry: Mapping[str, Any]) -> str:
+        """One cohort-wide document, updated under its etag so concurrent tenants both land."""
         entry = {**entry, "tenant": tenant.name}
-        registry = self.docs.read(
-            self.REGISTRY_PATH, {"environment": tenant.environment, "agents": []}
+
+        def merge(registry: dict[str, Any]) -> dict[str, Any]:
+            agents = registry.get("agents", [])
+            mine = [
+                a for a in agents if a.get("tenant") == tenant.name and a.get("id") == entry["id"]
+            ]
+            kept = [a for a in agents if a not in mine]
+            kept.append({**(mine[0] if mine else {}), **entry})
+            registry["agents"] = sorted(kept, key=lambda a: (a.get("tenant", ""), a.get("id", "")))
+            registry["updated"] = _now()
+            return registry
+
+        self.docs.update(
+            self.REGISTRY_PATH, merge, {"environment": tenant.environment, "agents": []}
         )
-        agents = registry.get("agents", [])
-        previous = next(
-            (a for a in agents if a.get("tenant") == tenant.name and a.get("id") == entry["id"]),
-            {},
-        )
-        kept = [
-            a for a in agents if not (a.get("tenant") == tenant.name and a.get("id") == entry["id"])
-        ]
-        kept.append({**previous, **entry})
-        registry["agents"] = sorted(kept, key=lambda a: (a.get("tenant", ""), a.get("id", "")))
-        registry["updated"] = _now()
-        return self.docs.write(self.REGISTRY_PATH, registry)
+        return self.docs.url(self.REGISTRY_PATH)
 
 
 def _field(obj: Any, name: str) -> Any:
@@ -1615,6 +1858,10 @@ def main(argv: list[str] | None = None) -> int:
     if command == "describe":
         print("\n".join(describe()))
         return 0
+    if command == "bootstrap":
+        from nw.platform.bootstrap import main as bootstrap_main
+
+        return bootstrap_main(argv[1:], track="azure")
     if command == "pipeline-definition":
         import yaml
 
@@ -1629,7 +1876,8 @@ def main(argv: list[str] | None = None) -> int:
             print(yaml.safe_dump(as_dict(runner.job(tenant, name)), sort_keys=False))
         return 0
     print(
-        "usage: python -m nw.platform.azure describe | pipeline-definition [triage|semantic ...]",
+        "usage: python -m nw.platform.azure describe | pipeline-definition [triage|semantic ...]"
+        " | bootstrap [triage|semantic ...] [--force]",
         file=sys.stderr,
     )
     return 2

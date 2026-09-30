@@ -15,16 +15,17 @@ from aws_cdk import aws_secretsmanager as sm
 from constructs import Construct
 
 from stacks.areas.agents import Agents
-from stacks.areas.data import DataGovernance
+from stacks.areas.data import APPROVER_KINDS, DataGovernance
 from stacks.areas.delivery import Delivery
 from stacks.areas.gateway import ModelGateway
 from stacks.areas.identity import Identity, Observability
-from stacks.areas.network import Network
+from stacks.areas.network import AgentNetwork, Network
 from stacks.areas.pipelines import Pipelines
 from stacks.areas.prompts import PromptsRetrieval
 from stacks.areas.serving import Serving
+from stacks.areas.tenants import Tenants
 from stacks.areas.tracking import TrackingRegistry
-from stacks.common import LIVE, MODEL_IDS, check_stage, prefix
+from stacks.common import EU_MODEL_IDS, LIVE, MODEL_IDS, check_stage, invoke_id, prefix
 
 
 class PlatformStack(Stack):
@@ -43,6 +44,7 @@ class PlatformStack(Stack):
         github_repo: str,
         github_branch: str,
         lake_formation: bool,
+        agent_egress: str = "vpc",
         **kw,
     ) -> None:
         super().__init__(scope, id, **kw)
@@ -51,7 +53,14 @@ class PlatformStack(Stack):
         self.tenants = tenants
 
         network = Network(self, "Network", prefix=pre)
-        data = DataGovernance(self, "Data", prefix=pre, lake_formation=lake_formation)
+        if agent_egress not in ("vpc", "public"):
+            raise ValueError("-c agentEgress must be vpc (the default) or public")
+        agent_network = (
+            AgentNetwork(self, "AgentNetwork", prefix=pre) if agent_egress == "vpc" else None
+        )
+        data = DataGovernance(
+            self, "Data", prefix=pre, owners=[*tenants, LIVE], lake_formation=lake_formation
+        )
         identity = Identity(
             self, "Identity", prefix=pre, env_name=env_name, alert_email=alert_email
         )
@@ -112,6 +121,7 @@ class PlatformStack(Stack):
             "Serving",
             prefix=pre,
             env_name=env_name,
+            tenants=tenants,
             artifacts=data.artifacts,
             key=data.key,
             topic=identity.topic,
@@ -122,6 +132,7 @@ class PlatformStack(Stack):
             gateway_key=gateway_key,
             knowledge_base_id=live_kb,
             region=self.region,
+            ops=data,
         )
         agents = Agents(
             self,
@@ -135,6 +146,29 @@ class PlatformStack(Stack):
             knowledge_base_id=live_kb,
             topic=identity.topic,
             cognito_domain_url=identity.domain_url,
+            knowledge_bases={
+                o: kb.attr_knowledge_base_id for o, kb in prompts.knowledge_bases.items()
+            },
+            tenant_gateway_keys=dict(gateway.key_secrets),
+            profiles=gateway.profiles,
+            network=agent_network,
+            ops=data,
+        )
+        # The agent's quality alarms page (AgentCore has no canary to roll back); its runtimes
+        # export EMF into the runtime log group, where the quality_alert lines land too.
+        serving.agent_quality_alarms, _ = serving.quality_alarms("agent", env_name)
+        serving.quality_alert_filter(agents.log_group, "agent", env_name)
+        learners = Tenants(
+            self,
+            "Tenants",
+            prefix=pre,
+            tenants=tenants,
+            tracking=tracking,
+            prompts=prompts,
+            agents=agents,
+            gateway=gateway,
+            serving=serving,
+            data=data,
         )
         delivery = Delivery(
             self,
@@ -154,6 +188,12 @@ class PlatformStack(Stack):
             github_repo=github_repo,
             github_branch=github_branch,
         )
+        # Approvers (ADR 0005): a learner approves its own tenant's proposals from the laptop
+        # (NW_OPS_STORE set, `make approve`), the approvers role the live ones. Only they write
+        # approvals/; the runtimes' roles stop at trajectories/ and feedback/.
+        for tenant, role in learners.roles.items():
+            data.grant_ops(role, tenant, APPROVER_KINDS)
+        data.grant_ops(agents.approvers_role, LIVE, APPROVER_KINDS)
         # The deployer and the tenants' roles may read the gateway master key to mint virtual keys.
         gateway.grant_use(delivery.deployer)
         Observability(
@@ -172,6 +212,11 @@ class PlatformStack(Stack):
             gateway=gateway,
             agents=agents,
             profiles=gateway.profiles,
+            stop_roles=[
+                *learners.roles.values(),
+                *tracking.tenant_roles.values(),
+                *agents.tenant_runtime_roles.values(),
+            ],
         )
         self.areas = {
             "network": network,
@@ -184,6 +229,7 @@ class PlatformStack(Stack):
             "serving": serving,
             "agents": agents,
             "delivery": delivery,
+            "tenants": learners,
         }
         CfnOutput(self, "Environment", value=pre).override_logical_id("Environment")
         CfnOutput(self, "Mode", value=mode).override_logical_id("Mode")
@@ -194,9 +240,18 @@ class PlatformStack(Stack):
             "LiveGatewayKeyArn"
         )
         CfnOutput(self, "DataBucket", value=data.data.bucket_name).override_logical_id("DataBucket")
+        CfnOutput(self, "OpsStore", value=data.ops_uri).override_logical_id("OpsStore")
         CfnOutput(self, "ArtifactsBucket", value=data.artifacts.bucket_name).override_logical_id(
             "ArtifactsBucket"
         )
         CfnOutput(
             self, "Models", value=",".join(f"{r}={m}" for r, m in MODEL_IDS.items())
         ).override_logical_id("Models")
+        CfnOutput(
+            self,
+            "ModelProfiles",
+            value=",".join(f"{r}={invoke_id(r, self.region)}" for r in MODEL_IDS),
+        ).override_logical_id("ModelProfiles")
+        CfnOutput(
+            self, "EuModels", value=",".join(f"{r}={m}" for r, m in EU_MODEL_IDS.items())
+        ).override_logical_id("EuModels")

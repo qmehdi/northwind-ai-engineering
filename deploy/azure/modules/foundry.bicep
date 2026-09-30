@@ -172,7 +172,11 @@ resource tracing 'Microsoft.CognitiveServices/accounts/projects/connections@2026
   }
 }
 
-// The agents' Azure AI Search tool reaches the indexes with the project's identity.
+// The agents' Azure AI Search tool reaches the indexes with the project's identity. Known
+// limit: the project is shared, and so is this connection and the identity's reader role on
+// the whole service, so any agent in the project (any tenant's) can read every tenant's
+// index. Tenants' own identities read only their own index (deploy_azure.sh indexes); a
+// project per tenant is the organisation's answer.
 resource search 'Microsoft.CognitiveServices/accounts/projects/connections@2026-07-01' = {
   parent: project
   name: '${environment}-search'
@@ -225,6 +229,39 @@ resource registry 'Microsoft.ContainerRegistry/registries@2025-11-01' existing =
   name: acrName
 }
 
+// A tenant's rights in the shared project: read it, build agents and run evaluations (the
+// `AIServices/agents` and `AIServices/evaluations` data actions, named on the Foundry pages
+// "Role-based access control for Microsoft Foundry" and "Disable preview features",
+// 2026-09-30). Foundry User would add every data action of the account, model inference
+// included, which would let a tenant call the deployments past the gateway's key, token limit
+// and quota; this role leaves inference out. The remaining path, a known limit: an agent
+// built in the project runs on the account's deployments, so its tokens are billed to the
+// project, not to the tenant's gateway quota (deploy/azure/README.md, "Identity and security
+// notes").
+resource tenantProjectRole 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
+  name: guid(resourceGroup().id, environment, 'tenant-project')
+  properties: {
+    roleName: '${environment} tenant on the Foundry project (${resourceGroup().name})'
+    description: 'Northwind course: agents and evaluations in the shared Foundry project, no direct model inference'
+    type: 'CustomRole'
+    assignableScopes: [resourceGroup().id]
+    permissions: [
+      {
+        actions: [
+          'Microsoft.CognitiveServices/*/read'
+          'Microsoft.Authorization/*/read'
+        ]
+        notActions: []
+        dataActions: [
+          'Microsoft.CognitiveServices/accounts/AIServices/agents/*'
+          'Microsoft.CognitiveServices/accounts/AIServices/evaluations/*'
+        ]
+        notDataActions: []
+      }
+    ]
+  }
+}
+
 // If nw/platform/azure.py deploys a Foundry hosted agent, the project pulls the agent image from
 // the platform registry (hosted agents page: Container Registry Repository Reader; AcrPull for a
 // registry in the default permissions mode).
@@ -252,4 +289,6 @@ output projectEndpoint string = 'https://${accountName}.services.ai.azure.com/ap
 output projectPrincipalId string = project.identity.principalId
 output accountPrincipalId string = account.outputs.systemAssignedMIPrincipalId!
 output raiPolicyName string = shields.name
+output contentFilters array = concat(harmFilters, shieldFilters)
+output tenantProjectRoleId string = tenantProjectRole.id
 output deploymentNames array = [for (m, i) in models: deployments[i].name]

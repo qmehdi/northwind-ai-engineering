@@ -1,6 +1,23 @@
 """Identity and observability: the Cognito user pool for the web entry, the CloudTrail trail,
 the platform dashboard, the alerts topic and the budget.
 
+The trail has its own KMS key whose policy is the one the CloudTrail guide requires
+(create-kms-key-policy-for-cloudtrail, fetched 2026-09-30): `kms:GenerateDataKey*` for
+`cloudtrail.amazonaws.com` conditioned on `aws:SourceArn` (this trail) and the
+`aws:cloudtrail:arn` encryption context, `kms:DescribeKey` for the trail, and `kms:Decrypt` for
+the account's principals on CloudTrail ciphertext only. Without those statements CreateTrail
+fails with InsufficientEncryptionPolicyException and the stack rolls back; synth and cdk-nag do
+not catch it, `tests/test_synth.py` does.
+
+Bedrock model invocation logging is on, metadata only (model, identity, token counts; no
+prompt or completion text, which carries customer PII), to a log group kept 400 days. It is an
+account and region setting with no CloudFormation resource, so a custom resource calls
+`PutModelInvocationLoggingConfiguration` and removes it on delete.
+
+At 100 percent of the monthly budget a Budgets action attaches a deny policy to every tenant's
+learner and execution roles (SageMaker create and start, Bedrock invoke, AgentCore create and
+invoke): a budget that only alerts does not stop a learner's forgotten endpoint.
+
 Every alarm in every area pages the one topic. The dashboard shows the platform as the
 figures draw it: the live endpoints, the policy API and its Lambda, the model gateway and its
 database, Bedrock tokens per inference profile (one per tenant and role, so the panel is the
@@ -10,18 +27,22 @@ cost line per learner), and the exported `Northwind` series with the drift alert
 from __future__ import annotations
 
 from aws_cdk import CfnOutput, Duration, RemovalPolicy, Stack
+from aws_cdk import aws_budgets as budgets
 from aws_cdk import aws_cloudtrail as cloudtrail
 from aws_cdk import aws_cloudwatch as cw
 from aws_cdk import aws_cloudwatch_actions as cw_actions
 from aws_cdk import aws_cognito as cognito
 from aws_cdk import aws_elasticloadbalancingv2 as elbv2
+from aws_cdk import aws_iam as iam
 from aws_cdk import aws_kms as kms
 from aws_cdk import aws_logs as logs
 from aws_cdk import aws_s3 as s3
 from aws_cdk import aws_sns as sns
+from aws_cdk import custom_resources as cr
 from constructs import Construct
 
-from stacks.common import LIVE, MODEL_IDS, PROJECTS, alerts_topic, monthly_budget
+from stacks.areas.data import RETENTION
+from stacks.common import LIVE, PROJECTS, alerts_topic, invoke_id, monthly_budget
 
 
 class Identity(Construct):
@@ -104,15 +125,61 @@ class Observability(Construct):
         gateway,
         agents,
         profiles,
+        stop_roles: list[iam.IRole] | None = None,
     ) -> None:
         super().__init__(scope, id)
         stack = Stack.of(self)
+        trail_name = f"{prefix}-platform"
+        trail_arn = f"arn:aws:cloudtrail:{stack.region}:{stack.account}:trail/{trail_name}"
+        self.trail_key = kms.Key(
+            self,
+            "TrailKey",
+            alias=f"alias/{prefix}-trail",
+            description=f"{prefix} CloudTrail log and digest files",
+            enable_key_rotation=True,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+        self.trail_key.add_to_resource_policy(
+            iam.PolicyStatement(
+                sid="AllowCloudTrailEncryptLogs",
+                principals=[iam.ServicePrincipal("cloudtrail.amazonaws.com")],
+                actions=["kms:GenerateDataKey*"],
+                resources=["*"],
+                conditions={
+                    "StringEquals": {"aws:SourceArn": trail_arn},
+                    "StringLike": {
+                        "kms:EncryptionContext:aws:cloudtrail:arn": f"arn:aws:cloudtrail:*:{stack.account}:trail/*"
+                    },
+                },
+            )
+        )
+        self.trail_key.add_to_resource_policy(
+            iam.PolicyStatement(
+                sid="AllowCloudTrailDescribeKey",
+                principals=[iam.ServicePrincipal("cloudtrail.amazonaws.com")],
+                actions=["kms:DescribeKey"],
+                resources=["*"],
+                conditions={"StringEquals": {"aws:SourceArn": trail_arn}},
+            )
+        )
+        self.trail_key.add_to_resource_policy(
+            iam.PolicyStatement(
+                sid="EnableCloudTrailLogDecryptPermissions",
+                principals=[iam.AccountRootPrincipal()],
+                actions=["kms:Decrypt", "kms:ReEncryptFrom"],
+                resources=["*"],
+                conditions={
+                    "StringEquals": {"kms:CallerAccount": stack.account},
+                    "Null": {"kms:EncryptionContext:aws:cloudtrail:arn": "false"},
+                },
+            )
+        )
         trail_bucket = s3.Bucket(
             self,
             "TrailBucket",
             bucket_name=f"{prefix}-trail-{stack.account}-{stack.region}",
             encryption=s3.BucketEncryption.KMS,
-            encryption_key=key,
+            encryption_key=self.trail_key,
             bucket_key_enabled=True,
             enforce_ssl=True,
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
@@ -120,21 +187,25 @@ class Observability(Construct):
             server_access_logs_prefix="trail/",
             removal_policy=RemovalPolicy.DESTROY,
             auto_delete_objects=True,
-            lifecycle_rules=[s3.LifecycleRule(expiration=Duration.days(90))],
+            lifecycle_rules=[
+                s3.LifecycleRule(id="audit", expiration=Duration.days(RETENTION["audit"]))
+            ],
         )
         self.trail = cloudtrail.Trail(
             self,
             "Trail",
-            trail_name=f"{prefix}-platform",
+            trail_name=trail_name,
             bucket=trail_bucket,
-            encryption_key=key,
+            encryption_key=self.trail_key,
             send_to_cloud_watch_logs=True,
-            cloud_watch_logs_retention=logs.RetentionDays.ONE_MONTH,
+            cloud_watch_logs_retention=logs.RetentionDays.THIRTEEN_MONTHS,
             management_events=cloudtrail.ReadWriteType.ALL,
             is_multi_region_trail=False,
             include_global_service_events=True,
             enable_file_validation=True,
         )
+        self.trail.node.add_dependency(self.trail_key)
+        self._invocation_logging(prefix)
 
         alb_5xx = cw.Alarm(
             self,
@@ -271,10 +342,10 @@ class Observability(Construct):
                         namespace="AWS/Bedrock",
                         metric_name=m,
                         statistic="Sum",
-                        dimensions_map={"ModelId": model_id},
+                        dimensions_map={"ModelId": invoke_id(role, stack.region)},
                         label=f"{m} {role}",
                     )
-                    for role, model_id in MODEL_IDS.items()
+                    for role in ("workhorse", "judge", "economy")
                     for m in ("Invocations", "InvocationThrottles")
                 ],
             ),
@@ -295,5 +366,162 @@ class Observability(Construct):
                 title="drift and gateway alarms", alarms=[agents.drift_alarm, alb_5xx]
             ),
         )
-        monthly_budget(self, limit_usd=budget_usd, email=alert_email, stage=env_name)
+        budget = monthly_budget(self, limit_usd=budget_usd, email=alert_email, stage=env_name)
+        if stop_roles:
+            self._budget_stop(prefix, budget, topic, stop_roles)
         CfnOutput(self, "OutDashboard", value=f"{prefix}-platform").override_logical_id("Dashboard")
+
+    def _invocation_logging(self, prefix: str) -> None:
+        """Bedrock model invocation logging, metadata only, through a custom resource."""
+        stack = Stack.of(self)
+        group = logs.LogGroup(
+            self,
+            "BedrockInvocations",
+            log_group_name=f"/{prefix}/bedrock-invocations",
+            retention=logs.RetentionDays.THIRTEEN_MONTHS,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+        role = iam.Role(
+            self,
+            "BedrockLoggingRole",
+            role_name=f"{prefix}-bedrock-logging",
+            assumed_by=iam.ServicePrincipal(
+                "bedrock.amazonaws.com",
+                conditions={
+                    "StringEquals": {"aws:SourceAccount": stack.account},
+                    "ArnLike": {
+                        "aws:SourceArn": f"arn:aws:bedrock:{stack.region}:{stack.account}:*"
+                    },
+                },
+            ),
+            description="Bedrock writes model invocation log records to CloudWatch Logs",
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["logs:CreateLogStream", "logs:PutLogEvents"],
+                resources=[f"{group.log_group_arn}:log-stream:*"],
+            )
+        )
+        config = {
+            "loggingConfig": {
+                "cloudWatchConfig": {
+                    "logGroupName": group.log_group_name,
+                    "roleArn": role.role_arn,
+                },
+                "textDataDeliveryEnabled": False,
+                "imageDataDeliveryEnabled": False,
+                "embeddingDataDeliveryEnabled": False,
+                "videoDataDeliveryEnabled": False,
+            }
+        }
+        call = cr.AwsSdkCall(
+            service="bedrock",
+            action="PutModelInvocationLoggingConfiguration",
+            parameters=config,
+            physical_resource_id=cr.PhysicalResourceId.of(f"{prefix}-bedrock-invocation-logging"),
+        )
+        logging_cr = cr.AwsCustomResource(
+            self,
+            "InvocationLogging",
+            on_create=call,
+            on_update=call,
+            on_delete=cr.AwsSdkCall(
+                service="bedrock", action="DeleteModelInvocationLoggingConfiguration"
+            ),
+            policy=cr.AwsCustomResourcePolicy.from_statements(
+                [
+                    iam.PolicyStatement(
+                        actions=[
+                            "bedrock:PutModelInvocationLoggingConfiguration",
+                            "bedrock:DeleteModelInvocationLoggingConfiguration",
+                        ],
+                        resources=["*"],
+                    ),
+                    iam.PolicyStatement(actions=["iam:PassRole"], resources=[role.role_arn]),
+                ]
+            ),
+            install_latest_aws_sdk=False,
+        )
+        logging_cr.node.add_dependency(role)
+        logging_cr.node.add_dependency(group)
+
+    def _budget_stop(self, prefix: str, budget, topic: sns.ITopic, roles: list[iam.IRole]) -> None:
+        """At 100 percent actual spend, attach a deny policy to the tenants' roles."""
+        stack = Stack.of(self)
+        deny = iam.ManagedPolicy(
+            self,
+            "BudgetStop",
+            managed_policy_name=f"{prefix}-budget-stop",
+            description="Attached by the Budgets action at 100 percent: stops new spend",
+            statements=[
+                iam.PolicyStatement(
+                    effect=iam.Effect.DENY,
+                    actions=[
+                        "sagemaker:CreateTrainingJob",
+                        "sagemaker:CreateProcessingJob",
+                        "sagemaker:CreateTransformJob",
+                        "sagemaker:CreateEndpoint",
+                        "sagemaker:CreateEndpointConfig",
+                        "sagemaker:UpdateEndpoint",
+                        "sagemaker:StartPipelineExecution",
+                        "sagemaker:CreateApp",
+                        "bedrock:InvokeModel",
+                        "bedrock:InvokeModelWithResponseStream",
+                        "bedrock:Converse",
+                        "bedrock:ConverseStream",
+                        "bedrock:StartIngestionJob",
+                        "bedrock-agentcore:CreateAgentRuntime",
+                        "bedrock-agentcore:UpdateAgentRuntime",
+                        "bedrock-agentcore:InvokeAgentRuntime",
+                    ],
+                    resources=["*"],
+                )
+            ],
+        )
+        action_role = iam.Role(
+            self,
+            "BudgetActionRole",
+            role_name=f"{prefix}-budget-action",
+            assumed_by=iam.ServicePrincipal(
+                "budgets.amazonaws.com",
+                conditions={"StringEquals": {"aws:SourceAccount": stack.account}},
+            ),
+            description="AWS Budgets attaches the stop policy to the tenants' roles",
+        )
+        action_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["iam:AttachRolePolicy", "iam:DetachRolePolicy"],
+                resources=[r.role_arn for r in roles],
+                conditions={"ArnEquals": {"iam:PolicyARN": deny.managed_policy_arn}},
+            )
+        )
+        topic.add_to_resource_policy(
+            iam.PolicyStatement(
+                sid="BudgetsPublish",
+                principals=[iam.ServicePrincipal("budgets.amazonaws.com")],
+                actions=["sns:Publish"],
+                resources=[topic.topic_arn],
+                conditions={"StringEquals": {"aws:SourceAccount": stack.account}},
+            )
+        )
+        action = budgets.CfnBudgetsAction(
+            self,
+            "BudgetStopAction",
+            budget_name=budget.ref,
+            notification_type="ACTUAL",
+            action_type="APPLY_IAM_POLICY",
+            action_threshold=budgets.CfnBudgetsAction.ActionThresholdProperty(
+                type="PERCENTAGE", value=100
+            ),
+            execution_role_arn=action_role.role_arn,
+            approval_model="AUTOMATIC",
+            subscribers=[
+                budgets.CfnBudgetsAction.SubscriberProperty(type="SNS", address=topic.topic_arn)
+            ],
+            definition=budgets.CfnBudgetsAction.DefinitionProperty(
+                iam_action_definition=budgets.CfnBudgetsAction.IamActionDefinitionProperty(
+                    policy_arn=deny.managed_policy_arn, roles=[r.role_name for r in roles]
+                )
+            ),
+        )
+        action.node.add_dependency(action_role)

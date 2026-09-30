@@ -7,6 +7,11 @@ The same `gate` as `nw.triage.promote`, with the bars as arguments so a retraini
 tighten them. Nothing moves `latest` here: a pipeline registers the candidate and a human
 approves it in the registry. The decision is written twice, into the version directory and
 into `steps/triage_evaluate.json`, whose `passed_int` a SageMaker ConditionStep compares.
+
+The champion (`--champion`, `nw.pipelines.champion`): `registry` compares against the tenant's
+live version, else the production summary; `summary` against the summary file only. A named
+`--production-summary` that does not exist fails the step (`none` means a first model on
+purpose); URIs are strings, so `gs://` survives the command line.
 """
 
 from __future__ import annotations
@@ -18,7 +23,15 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from nw.pipelines.steps import add_flag, localize, truthy, write_json, write_result
+from nw.pipelines.champion import CHAMPIONS, choose, tenant_for_steps
+from nw.pipelines.steps import (
+    add_flag,
+    local_path,
+    truthy,
+    write_json,
+    write_result,
+)
+from nw.platform.base import ModelRegistry, Tenant
 from nw.triage.promote import (
     PRODUCTION_SUMMARY,
     GatePolicy,
@@ -33,18 +46,35 @@ from nw.triage.promote import (
 STEP = "triage_evaluate"
 
 
+def _summarise(artifact: Path) -> dict[str, Any]:
+    return summary(read_metadata(artifact))
+
+
 def run(
-    out: Path,
+    out: Path | str,
     version: str | None = None,
     *,
-    production_summary: Path = PRODUCTION_SUMMARY,
+    production_summary: str | Path | None = None,
     policy: GatePolicy | None = None,
     force: bool = False,
+    champion: str = "summary",
+    registry: ModelRegistry | None = None,
+    tenant: Tenant | None = None,
 ) -> dict[str, Any]:
-    out = Path(out)
+    out = local_path(out)
     version = version or newest_candidate(out)
     candidate = summary(read_metadata(out / version))
-    production = current_production(out, localize(production_summary, ".json"))
+    production, champion_source = choose(
+        "triage",
+        out,
+        production_summary,
+        champion,
+        summarise=_summarise,
+        default=PRODUCTION_SUMMARY,
+        current=current_production,
+        registry=registry,
+        tenant=tenant,
+    )
     if production and production["version"] == candidate["version"]:
         production = None
     decision = gate(candidate, production, policy)
@@ -58,7 +88,8 @@ def run(
         "reason": "; ".join(decision.reasons) or "all bars cleared",
         "data_sha256_12": candidate["data_sha256_12"],
         "metrics": {**candidate["test"], "p0_threshold": candidate["p0_threshold"]},
-        "production_summary": str(production_summary),
+        "production_summary": str(production_summary or PRODUCTION_SUMMARY),
+        "champion_source": champion_source,
     }
     write_json(out / version / "gate.json", result)
     write_result(out, STEP, result)
@@ -89,9 +120,16 @@ def policy_from(args: argparse.Namespace) -> GatePolicy:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--out", type=Path, default=Path("artifacts/triage"))
+    ap.add_argument("--out", default="artifacts/triage", help="the run's tree: a path or gs:// URI")
     ap.add_argument("--version", default=None, help="artifact version; default is the newest")
-    ap.add_argument("--production-summary", type=Path, default=PRODUCTION_SUMMARY)
+    ap.add_argument(
+        "--production-summary",
+        default=None,
+        help=f"a path or URI that must exist, or `none`; default {PRODUCTION_SUMMARY} if present",
+    )
+    ap.add_argument("--champion", choices=CHAMPIONS, default="summary")
+    ap.add_argument("--tenant", default=None, help="whose live version is the champion")
+    ap.add_argument("--environment", default=None)
     add_flag(ap, "--force", "pass the gate anyway, recorded as forced")
     ap.add_argument(
         "--strict", action="store_true", help="exit 1 on a failed gate instead of recording it"
@@ -104,6 +142,10 @@ def main(argv: list[str] | None = None) -> int:
         production_summary=args.production_summary,
         policy=policy_from(args),
         force=truthy(args.force),
+        champion=args.champion,
+        tenant=tenant_for_steps(args.tenant, args.environment)
+        if args.champion == "registry"
+        else None,
     )
     return 1 if args.strict and not result["passed"] else 0
 

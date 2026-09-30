@@ -29,7 +29,8 @@ def test_upsert_search_count_drop(store, tenant):
     assert store.count(tenant, "policies") == 3
     hits = store.search(tenant, "policies", "uptime commitment percent", k=2)
     assert [h.id for h in hits][0] == "sla-2023#1"
-    assert hits[0].metadata == {"doc": "sla-2023"} and hits[0].score > hits[1].score
+    assert hits[0].metadata["doc"] == "sla-2023" and hits[0].score > hits[1].score
+    assert hits[0].metadata["score_kind"] == "cosine" and 0 <= hits[0].score <= 1
     store.drop(tenant, "policies")
     assert store.count(tenant, "policies") == 0
     assert store.search(tenant, "policies", "anything") == []

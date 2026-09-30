@@ -6,6 +6,11 @@ each step its own output folder, while the shared steps expect one artifact tree
 step after the first copies its predecessor's tree into its own output before it runs (a
 few megabytes for Project 1, the ONNX files for Project 2). The last node's output is the
 run's whole tree, written under `output_root` when that is an `azureml://` path.
+
+Every step runs the launcher (`nw.pipelines.source`) on the optional input `source`: the source
+bundle of the checkout that submitted the run, which `AzureMLPipelineRunner.submit` builds and
+passes as the job input `source_uri` (uploaded with the submission, like a local data file). So
+the steps run the learner's `nw/`, and the image supplies only the dependencies.
 """
 
 from __future__ import annotations
@@ -20,9 +25,12 @@ from nw.platform.base import Tenant
 
 # Parameters that are files: a local path (uploaded at submission), or an `azureml://`
 # datastore URI on the platform.
-FILE_PARAMS = ("data_uri", "production_summary")
+FILE_PARAMS = ("data_uri", "production_summary", "source_uri")
+# File parameters a run may leave out (the bundle is set by the platform client on submit).
+OPTIONAL_FILES = ("source_uri",)
 # Parameters whose flag is omitted when the value is empty, as the steps expect.
 OPTIONAL_FLAGS = ("base", "max_length", "triage_artifact")
+LAUNCH = "python -m nw.pipelines.source run $[[--source ${{inputs.source}}]] --"
 # Parameters whose step flag is not the parameter's name.
 FLAG_NAMES = {"parity_n": "--n", "triage_artifact": "--triage"}
 COPY = "cp -R ${{inputs.tree}}/. ${{outputs.artifacts}}/ && "
@@ -61,7 +69,7 @@ def _signature(pipeline: str) -> inspect.Signature:
     out = []
     for p in BY_PIPELINE[pipeline]:
         if p.name in FILE_PARAMS:
-            annotation: Any = Input(type="uri_file")
+            annotation: Any = Input(type="uri_file", optional=p.name in OPTIONAL_FILES)
             default: Any = None
         else:
             annotation, default = p.kind, p.default
@@ -122,7 +130,8 @@ def _component(
         inputs["tree"] = Input(type="uri_folder")
     if data:
         inputs["data"] = Input(type="uri_file")
-    run = body or f"python -m {module} {args} {_flags(params)}".strip()
+    inputs["source"] = Input(type="uri_file", optional=True)
+    run = body or f"{LAUNCH} {module} {args} {_flags(params)}".strip()
     env = {
         "NW_TRACK": "azure",
         "NW_TENANT": config.tenant.name,
@@ -146,12 +155,16 @@ def _component(
     )
 
 
+def _tenant_flags(config: AzureMLConfig) -> str:
+    return f"--tenant {config.tenant.name} --environment {config.tenant.environment}"
+
+
 def _register(config: AzureMLConfig, pipeline: str) -> Any:
     """Registers the candidate that cleared the gate through `nw.platform.azure`'s registry
     (`NW_PIPELINE_REGISTRY`), a candidate tagged with the gate, the git and data hashes and the
     trigger. `register_model=false` records the decision and registers nothing."""
     step = (
-        "python -m nw.pipelines.steps.register"
+        f"{LAUNCH} nw.pipelines.steps.register"
         f" --pipeline {pipeline} --out ${{{{outputs.artifacts}}}}"
         f" --tenant {config.tenant.name} --environment {config.tenant.environment}"
         " --trigger ${{inputs.trigger}}"
@@ -211,6 +224,9 @@ def _build(
     values.update({k: v for k, v in (params or {}).items() if k in values})
     values["tenant"], values["environment"] = config.tenant.name, config.tenant.environment
     for name in FILE_PARAMS:
+        if name in OPTIONAL_FILES and not values.get(name):
+            values[name] = None
+            continue
         values[name] = Input(type="uri_file", path=str(values[name]))
 
     def body(**inputs: Any) -> Any:
@@ -235,6 +251,11 @@ def _pick(inputs: Mapping[str, Any], *names: str) -> dict[str, Any]:
 def _optional(inputs: Mapping[str, Any], values: Mapping[str, Any], *names: str) -> dict[str, Any]:
     """Optional inputs are wired only when the run sets them, so `$[[...]]` drops the flag."""
     return {n: inputs[n] for n in names if values.get(n)}
+
+
+def _source(inputs: Mapping[str, Any], values: Mapping[str, Any]) -> dict[str, Any]:
+    """The bundle as every step's `source` input, when the run has one."""
+    return {"source": inputs["source_uri"]} if values.get("source_uri") else {}
 
 
 def triage_pipeline(config: AzureMLConfig, params: Mapping[str, Any] | None = None) -> Any:
@@ -262,7 +283,7 @@ def triage_pipeline(config: AzureMLConfig, params: Mapping[str, Any] | None = No
         "triage",
         "evaluate",
         "nw.pipelines.steps.triage_evaluate",
-        args="--out ${{outputs.artifacts}}",
+        args=f"--out ${{{{outputs.artifacts}}}} {_tenant_flags(config)}",
         params=(
             "production_summary",
             "min_p0_recall",
@@ -271,16 +292,20 @@ def triage_pipeline(config: AzureMLConfig, params: Mapping[str, Any] | None = No
             "max_brier_increase",
             "max_p0_recall_drop",
             "force",
+            "champion",
         ),
+        extra_env={"NW_PIPELINE_REGISTRY": REGISTRY_FACTORY, **config.platform_env},
     )
     register_c = _register(config, "triage")
 
     def graph(i: dict[str, Any], values: dict[str, Any]) -> Any:
-        data_check = check_c(data=i["data_uri"])
+        src = _source(i, values)
+        data_check = check_c(data=i["data_uri"], **src)
         train = train_c(
             tree=data_check.outputs.artifacts,
             data=i["data_uri"],
             **_pick(i, "target_recall", "min_precision", "seed"),
+            **src,
         )
         evaluate = evaluate_c(
             tree=train.outputs.artifacts,
@@ -293,10 +318,12 @@ def triage_pipeline(config: AzureMLConfig, params: Mapping[str, Any] | None = No
                 "max_brier_increase",
                 "max_p0_recall_drop",
                 "force",
+                "champion",
             ),
+            **src,
         )
         register = register_c(
-            tree=evaluate.outputs.artifacts, **_pick(i, "register_model", "trigger")
+            tree=evaluate.outputs.artifacts, **_pick(i, "register_model", "trigger"), **src
         )
         return {"artifacts": register.outputs.artifacts}
 
@@ -347,7 +374,7 @@ def semantic_pipeline(config: AzureMLConfig, params: Mapping[str, Any] | None = 
         "semantic",
         "gate",
         "nw.pipelines.steps.semantic_gate",
-        args="--out ${{outputs.artifacts}}",
+        args=f"--out ${{{{outputs.artifacts}}}} {_tenant_flags(config)}",
         params=(
             "production_summary",
             "min_p0_recall",
@@ -356,24 +383,31 @@ def semantic_pipeline(config: AzureMLConfig, params: Mapping[str, Any] | None = 
             "max_tag_micro_f1_drop",
             "max_priority_macro_f1_drop",
             "force",
+            "champion",
         ),
+        extra_env={"NW_PIPELINE_REGISTRY": REGISTRY_FACTORY, **config.platform_env},
     )
     register_c = _register(config, "semantic")
 
     def graph(i: dict[str, Any], values: dict[str, Any]) -> Any:
-        data_prep = prep_c(data=i["data_uri"])
+        src = _source(i, values)
+        data_prep = prep_c(data=i["data_uri"], **src)
         train = train_c(
             tree=data_prep.outputs.artifacts,
             data=i["data_uri"],
             **_pick(i, "epochs", "subset", "lr", "batch_size", "seed"),
             **_optional(i, values, "base", "max_length"),
+            **src,
         )
-        export = export_c(tree=train.outputs.artifacts, data=i["data_uri"], parity_n=i["parity_n"])
+        export = export_c(
+            tree=train.outputs.artifacts, data=i["data_uri"], parity_n=i["parity_n"], **src
+        )
         benchmark = benchmark_c(
             tree=export.outputs.artifacts,
             data=i["data_uri"],
             latency_n=i["latency_n"],
             **_optional(i, values, "triage_artifact"),
+            **src,
         )
         gate = gate_c(
             tree=benchmark.outputs.artifacts,
@@ -386,9 +420,13 @@ def semantic_pipeline(config: AzureMLConfig, params: Mapping[str, Any] | None = 
                 "max_tag_micro_f1_drop",
                 "max_priority_macro_f1_drop",
                 "force",
+                "champion",
             ),
+            **src,
         )
-        register = register_c(tree=gate.outputs.artifacts, **_pick(i, "register_model", "trigger"))
+        register = register_c(
+            tree=gate.outputs.artifacts, **_pick(i, "register_model", "trigger"), **src
+        )
         return {"artifacts": register.outputs.artifacts}
 
     return _build("semantic", config, graph, params)

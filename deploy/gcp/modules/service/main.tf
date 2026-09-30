@@ -60,10 +60,45 @@ variable "invoke_models" {
   default     = false
   description = "Grant roles/aiplatform.user so the service can call the Agent Platform directly (the gateway is the normal path)"
 }
-variable "buckets_read" {
+variable "folders_read" {
+  type = map(object({
+    bucket = string
+    folder = string
+  }))
+  default     = {}
+  description = "Managed folders the service reads model artifacts from, by a static key (never a whole bucket)"
+}
+variable "folders_write" {
+  type = map(object({
+    bucket = string
+    folder = string
+  }))
+  default     = {}
+  description = "Managed folders the service writes (the ops store's kinds), by a static key"
+}
+variable "project_roles" {
+  type        = map(string)
+  default     = {}
+  description = "Extra project roles by a static key, such as the RAG reader for the policy service"
+}
+variable "probe_path" {
+  type        = string
+  default     = "/readyz"
+  description = "HTTP readiness path; empty uses a TCP probe (the MCP server has no health route)"
+}
+variable "liveness_path" {
+  type    = string
+  default = "/healthz"
+}
+variable "operators" {
   type        = list(string)
   default     = []
-  description = "Buckets the service reads model artifacts from"
+  description = "Members that may update the service (a registry deploy rewrites NW_MODEL_URI), invoke it and act as its service account: the owning tenant's identity"
+}
+variable "invokers" {
+  type        = list(string)
+  default     = []
+  description = "Members that may invoke the service; with public = false the only way in"
 }
 variable "canary_percent" {
   type    = number
@@ -105,11 +140,27 @@ resource "google_project_iam_member" "logs" {
   member  = "serviceAccount:${google_service_account.svc.email}"
 }
 
-resource "google_storage_bucket_iam_member" "read" {
-  for_each = toset(var.buckets_read)
-  bucket   = each.value
-  role     = "roles/storage.objectViewer"
+resource "google_project_iam_member" "extra" {
+  for_each = var.project_roles
+  project  = var.project
+  role     = each.value
   member   = "serviceAccount:${google_service_account.svc.email}"
+}
+
+resource "google_storage_managed_folder_iam_member" "read" {
+  for_each       = var.folders_read
+  bucket         = each.value.bucket
+  managed_folder = each.value.folder
+  role           = "roles/storage.objectViewer"
+  member         = "serviceAccount:${google_service_account.svc.email}"
+}
+
+resource "google_storage_managed_folder_iam_member" "write" {
+  for_each       = var.folders_write
+  bucket         = each.value.bucket
+  managed_folder = each.value.folder
+  role           = "roles/storage.objectUser"
+  member         = "serviceAccount:${google_service_account.svc.email}"
 }
 
 # Only this service account may read the secrets it is handed.
@@ -176,6 +227,9 @@ resource "google_cloud_run_v2_service" "svc" {
           NW_TRACE_EXPORT   = "cloudtrace",
           OTEL_SERVICE_NAME = var.name,
           NW_METRICS_FORMAT = "json",
+          # Cloud Run's front end is one proxy hop: the client address is the last
+          # X-Forwarded-For entry it appends (rate limits key on it).
+          NW_TRUSTED_PROXY_HOPS = "1",
         }, var.env)
         content {
           name  = env.key
@@ -201,18 +255,30 @@ resource "google_cloud_run_v2_service" "svc" {
         period_seconds        = 10
         failure_threshold     = 12
         timeout_seconds       = 5
-        http_get {
-          path = "/readyz"
-          port = 8000
+        dynamic "http_get" {
+          for_each = var.probe_path == "" ? [] : [var.probe_path]
+          content {
+            path = http_get.value
+            port = 8000
+          }
+        }
+        dynamic "tcp_socket" {
+          for_each = var.probe_path == "" ? [1] : []
+          content {
+            port = 8000
+          }
         }
       }
 
-      liveness_probe {
-        period_seconds    = 30
-        failure_threshold = 3
-        http_get {
-          path = "/healthz"
-          port = 8000
+      dynamic "liveness_probe" {
+        for_each = var.liveness_path == "" ? [] : [var.liveness_path]
+        content {
+          period_seconds    = 30
+          failure_threshold = 3
+          http_get {
+            path = liveness_probe.value
+            port = 8000
+          }
         }
       }
     }
@@ -250,6 +316,31 @@ resource "google_cloud_run_v2_service_iam_member" "public" {
   name     = google_cloud_run_v2_service.svc.name
   role     = "roles/run.invoker"
   member   = "allUsers"
+}
+
+resource "google_cloud_run_v2_service_iam_member" "operators" {
+  for_each = { for pair in setproduct(range(length(var.operators)), ["roles/run.developer", "roles/run.invoker"]) : "${pair[0]}:${pair[1]}" => { member = var.operators[pair[0]], role = pair[1] } }
+  project  = var.project
+  location = var.region
+  name     = google_cloud_run_v2_service.svc.name
+  role     = each.value.role
+  member   = each.value.member
+}
+
+resource "google_service_account_iam_member" "operators" {
+  for_each           = { for i, m in var.operators : tostring(i) => m }
+  service_account_id = google_service_account.svc.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = each.value
+}
+
+resource "google_cloud_run_v2_service_iam_member" "invokers" {
+  for_each = { for i, m in var.invokers : tostring(i) => m }
+  project  = var.project
+  location = var.region
+  name     = google_cloud_run_v2_service.svc.name
+  role     = "roles/run.invoker"
+  member   = each.value
 }
 
 output "url" { value = google_cloud_run_v2_service.svc.uri }

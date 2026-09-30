@@ -9,8 +9,10 @@ output "tenants" {
       agent_engine           = module.agents.engines[t]
       agent_service_account  = module.agents.service_accounts[t]
       pipelines_sa           = module.tracking.service_accounts[t]
-      identity_sa            = module.gateway.identity_accounts[t]
+      identity_sa            = module.identity.user_accounts[t]
+      api_key_secret         = module.identity.api_key_secrets[t]
       gateway_key_secret     = module.gateway.tenant_key_secrets[t]
+      mcp_url                = module.serving.mcp_urls[t]
       rag_corpus             = module.prompts.corpora[t]
       retrain_scheduler_job  = module.tracking.scheduler_jobs[t]
       pipeline_root          = "gs://${module.data.pipelines_bucket}/${var.environment}-${t}"
@@ -30,18 +32,31 @@ output "buckets" {
 output "bigquery_tickets" { value = module.data.tickets_table }
 output "live_endpoints" { value = module.live.endpoint_ids }
 output "live_service_account" { value = module.live.service_account }
+output "approvers_service_account" { value = module.live.approvers_service_account }
+output "ops_store" {
+  description = "NW_OPS_STORE: trajectories, feedback and approvals under <environment>-<owner>/"
+  value       = module.data.ops_store
+}
 output "model_armor_template" { value = module.agents.model_armor_template }
 output "agent_registry" { value = module.agents.registry_uri }
 output "delivery_pipeline" { value = module.delivery.pipeline }
 output "delivery_target" { value = module.delivery.target }
 output "deployer_service_account" { value = module.delivery.deployer_service_account }
+output "builder_service_account" { value = module.delivery.builder_service_account }
 output "image_registry" { value = local.registry }
 output "dashboard" { value = module.observability.dashboard }
 output "organization_policies" {
   description = "Constraints an organisation would set at the folder; listed here, not applied (the course has no organisation)"
   value       = module.observability.organization_policies
 }
-output "api_key" {
-  value     = random_password.api_key.result
-  sensitive = true
+# Keys are write-only and never in state: read one with
+#   gcloud secrets versions access latest --secret <secret id>
+output "api_key_secret" {
+  description = "Secret id of the live services' and instructor's API key"
+  value       = google_secret_manager_secret.api_key.secret_id
 }
+output "live_gateway_key_secret" { value = module.gateway.live_key_secret }
+output "custom_roles" { value = module.identity.roles }
+output "audit_log_bucket" { value = module.guardrails.audit_bucket }
+output "deny_policy" { value = module.guardrails.deny_policy }
+output "capture_dataset" { value = module.data.capture_dataset_id }

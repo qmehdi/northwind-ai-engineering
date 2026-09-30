@@ -47,10 +47,10 @@ promote-triage:   ## Project 1: run the promotion gate on the newest candidate (
 backtest-triage:  ## Project 1: compare two versions on the test split (A=<dir> B=<dir>)
 	uv run python -m nw.triage.backtest --a $(A) --b $(B)
 
-mlflow-ui:        ## Project 1: the MLflow UI on :5000 over NW_MLFLOW_URI from the shell or .env (default artifacts/mlflow.db)
+mlflow-ui:        ## Project 1: the MLflow UI on :5002 (5000 is AirPlay on macOS, 5001 the Local stack) over NW_MLFLOW_URI from the shell or .env (default artifacts/mlflow.db)
 	@uv run $(ENV_FILE) sh -c 'uri="$${NW_MLFLOW_URI:-sqlite:///artifacts/mlflow.db}"; case "$$uri" in \
 	  http://*|https://*) echo "$$uri is an MLflow server and serves its own UI: open $$uri" ;; \
-	  *) exec mlflow ui --backend-store-uri "$$uri" --port 5000 ;; \
+	  *) exec mlflow ui --backend-store-uri "$$uri" --port 5002 ;; \
 	esac'
 
 serve-triage:     ## Run the Project 1 service on :8001
@@ -89,7 +89,7 @@ runs-semantic:    ## Project 2: the experiment table from artifacts/semantic/run
 promote-semantic: ## Project 2: the gate on the newest candidate (CANDIDATE=<version>); needs export and benchmark first
 	uv run python -m nw.semantic.promote $(if $(CANDIDATE),--candidate $(CANDIDATE),)
 
-backtest-semantic: ## Project 2: two versions on the test split, int8 as served (A=<dir> B=<dir>)
+backtest-semantic: ## Project 2: two versions on the test split, each graph as served (A=<dir> B=<dir>)
 	uv run python -m nw.semantic.backtest --a $(A) --b $(B)
 
 # ----- the training pipelines (ADR 0008, 0011): shared steps, Kubeflow and SageMaker definitions -----
@@ -150,8 +150,8 @@ eval-policy-free: ## Project 3: the retrieval-only harness, no model call, gated
 feedback-policy:  ## Project 3: wrong and unsafe verdicts from /feedback as golden-set candidates
 	uv run python -m nw.policy.feedback --to-golden
 
-calibrate-judge:  ## Project 3: judge agreement with human labels (about 0.10 USD)
-	uv run python -m nw.policy.calibrate
+calibrate-judge:  ## Project 3: judge agreement with human labels, 102 judgements (about 0.65 USD); SHARE=1 also writes data/golden/calibrations/ for the cohort
+	uv run python -m nw.policy.calibrate $(if $(SHARE),--share,)
 
 eval-policy:      ## Run the golden set against the index and apply the regression gate
 	uv run python -m nw.policy.evaluate
@@ -163,10 +163,10 @@ session05:        ## Session 5 acceptance tests
 	uv run pytest -q tests/session05
 
 agent-eval:       ## The adversarial set through the hand-built loop, every check labelled with its tier
-	uv run python -m nw.agent.evaluate
+	uv run python -m nw.agent.evaluate $(if $(NO_JUDGE),--no-judge,)
 
-agent-gate:       ## Project 4: the 15 cases on your track against the tier bars in data/golden/agent_baseline.json (about 3 USD with the Judge)
-	uv run python -m nw.agent.evaluate --gate
+agent-gate:       ## Project 4: the 35 cases (17 adversarial, 18 benign) on your track against data/golden/baselines/agent-<track>.json, provenance checked
+	uv run python -m nw.agent.evaluate --gate $(if $(NO_JUDGE),--no-judge,)
 
 agent-gate-offline: ## Project 4: the loop, tools, scorer and tiered gate with a scripted model: free, what CI runs
 	uv run python -m nw.agent.evaluate --provider fake --gate --out artifacts/agent_eval_offline.json --traces artifacts/traces-offline
@@ -193,7 +193,7 @@ registry-check:   ## AgentOps: every card matches the code it describes: tools, 
 agentops-check:   ## AgentOps: catalog, registry and the offline tiered gate, what agent-gate.yml runs
 	$(MAKE) catalog-check registry-check agent-gate-offline
 
-approve:          ## Project 4: pending proposals; make approve RUN=<run_id> TOOL=escalate resumes one with approval
+approve:          ## Project 4: pending proposals; make approve RUN=<run_id> TOOL=escalate executes the recorded action once, as you
 	uv run python -m nw.agent.approve $(if $(RUN),--run $(RUN) --approve $(TOOL),)
 
 review:           ## Project 4: sample ten recent traces into artifacts/review.jsonl for a person to label
@@ -214,7 +214,7 @@ agent-eval-adk:   ## GCP track: same evaluation through ADK
 mcp:              ## The tool registry as an MCP server on :8020
 	uv run python -m nw.agent.mcp_server
 
-# ----- Session 6: deployment. Read deploy/COSTS.md before any of these. -----
+# ----- Deployment: read deploy/COSTS-platform.md before any of these. -----
 TIER ?= session
 CANARY ?= 0
 
@@ -248,9 +248,9 @@ audit:            ## pip-audit over the locked set, every extra
 WEIGHT ?= 10
 
 setup-local:      ## Local track: the platform clients (MLflow, kfp local runner, Qdrant) into the virtualenv
-	uv sync --extra dev --extra dl --extra agents --extra mlops --extra local
+	uv sync --inexact --extra dev --extra dl --extra agents --extra mlops --extra local
 	@docker compose version >/dev/null 2>&1 || { echo "Docker Compose v2 is required (Docker Desktop or the docker-compose-plugin)"; exit 1; }
-	@echo "next: make local-up (16 GB for Docker; the first start pulls about 16 GB of models)"
+	@echo "next: make local-up. A Mac needs 32 GB (Docker at 16 GB plus native Ollama with gpt-oss:20b); on 16 GB run make local-up SMALL=1 OBSERVABILITY=0 (qwen3:4b). See deploy/local/README.md"
 
 local-up:         ## Local track: build (the nw-pipelines image too), push to the local registry on :5050, start platform and observability, register the local triage model
 	deploy/local/local.sh up
@@ -334,8 +334,8 @@ images-gcp:       ## GCP: build and push every image, the pipelines image includ
 deploy-gcp:       ## GCP: validate, plan, apply the platform. NW_TENANTS=alice,bob or NW_MODE=solo
 	scripts/deploy_gcp.sh apply
 
-rotate-key:       ## Rotate the cohort API key and roll every service. TRACK=aws|gcp
-	TRACK=$(TRACK) scripts/rotate_key.sh
+rotate-key:       ## Rotate the services' API key per owner and roll every reader. TRACK=aws|gcp|azure [TENANT=<handle>|live|all] [DRY_RUN=1]
+	TRACK=$(TRACK) TENANT=$(or $(TENANT),all) scripts/rotate_key.sh $(if $(DRY_RUN),--dry-run)
 
 validate-gcp:     ## GCP: terraform fmt, init and validate the platform root
 	scripts/deploy_gcp.sh validate
@@ -375,7 +375,7 @@ platform-gcp-test: ## GCP: the platform client tests and the Terraform validate 
 
 .PHONY: setup-azure platform-azure-test describe-azure pipeline-definition-azure
 setup-azure:      ## Azure track: the platform clients (Azure ML, Foundry projects, AI Search, Blob, identity) into the virtualenv, and the Bicep CLI
-	uv sync --extra dev --extra platform-azure
+	uv sync --inexact --extra dev --extra platform-azure
 	scripts/deploy_azure.sh setup
 
 platform-azure-test: ## Azure: the platform client, naming, provider and Azure ML pipeline tests, no subscription needed
@@ -429,3 +429,74 @@ indexes-azure:    ## Azure: create the per-owner search indexes and their index-
 
 bicep-azure-test: ## Azure: the Bicep build, lint and naming tests, no subscription needed
 	uv run pytest -q tests/platform/test_azure_bicep.py
+
+# ----- Agent H: governance, data and CI supply chain -----
+.PHONY: pii-eval governance-check
+
+pii-eval:         ## Redaction recall and precision on the fictitious PII overlay (DETECTOR=none|heuristic|presidio)
+	uv run python -m nw.policy.redact --eval data/pii/messages.jsonl --detector $(or $(DETECTOR),none)
+
+governance-check: ## Catalog (EU AI Act class, DPIA section, privacy approver, derived data reach), cards, data manifest
+	$(MAKE) catalog-check registry-check check-data
+
+# ----- Agent F: Google Cloud infrastructure -----
+.PHONY: state-bucket-gcp
+
+state-bucket-gcp: ## GCP: create the versioned Terraform state bucket <project>-<environment>-tfstate (once, before deploy-gcp)
+	scripts/deploy_gcp.sh state-bucket
+
+# ----- Agent C: platform and pipelines (audit 2026-09-29) ---------------------------------
+.PHONY: bootstrap-aws bootstrap-gcp bootstrap-azure source-bundle
+
+bootstrap-aws:    ## AWS: register and approve artifacts/*/latest for your tenant, the mid-course recovery (NAMES="triage", FORCE=1)
+	uv run python -m nw.platform.aws bootstrap $(NAMES) $(if $(FORCE),--force)
+
+bootstrap-gcp:    ## GCP: register and approve artifacts/*/latest for your tenant, the mid-course recovery (NAMES="triage", FORCE=1)
+	uv run python -m nw.platform.gcp bootstrap $(NAMES) $(if $(FORCE),--force)
+
+bootstrap-azure:  ## Azure: register and approve artifacts/*/latest for your tenant, the mid-course recovery (NAMES="triage", FORCE=1)
+	uv run python -m nw.platform.azure bootstrap $(NAMES) $(if $(FORCE),--force)
+
+source-bundle:    ## The bundle of nw/ every cloud pipeline submit ships, into artifacts/source (what the steps will run)
+	uv run python -m nw.pipelines.source build --out artifacts/source
+
+# ----- Agent D: ops practice (audit 2026-09-29) ---------------------------------------------
+.PHONY: eval-policy-baseline eval-policy-baseline-free calibrate-judge-candidates agent-gate-live agent-baseline-offline agent-baseline-live agent-calibrate-judge agent-record agent-replay drift-triage-central quality-triage retrain-trigger
+
+eval-policy-baseline: ## Project 3: this track's no-judge baseline in data/golden/baselines (JUDGE=1 judged; about 0.05 or 0.35 USD); REASON="..." rebases one the gate refuses
+	uv run $(ENV_FILE) python -m nw.policy.evaluate $(if $(JUDGE),,--no-judge) --write-baseline $(if $(REASON),--rebase "$(REASON)",)
+
+eval-policy-baseline-free: ## Project 3: rewrite the retrieval-only baseline after a corpus or golden-set change (free)
+	rm -f data/golden/baselines/policy-retrieval_only.json
+	NW_TRACK=local uv run python -m nw.policy.evaluate --retrieval-only --write-baseline
+
+calibrate-judge-candidates: ## Project 3: the last eval.json's answers as unlabelled calibration cases for a person to label
+	uv run python -m nw.policy.calibrate --from-eval artifacts/policy/eval.json
+
+agent-gate-live: ## Project 4: every case K times on your track (K=3), the tiered gate on pass^k (about 0.30 to 0.40 USD per repeat, 1 to 1.25 for K=3)
+	uv run $(ENV_FILE) python -m nw.agent.evaluate --gate --repeats $(or $(K),3) $(if $(NO_JUDGE),--no-judge,)
+
+agent-baseline-offline: ## Project 4: rewrite data/golden/baselines/agent-offline.json after a case file changed (free)
+	rm -f data/golden/baselines/agent-offline.json
+	NW_TRACK=local uv run python -m nw.agent.evaluate --provider fake --gate --write-baseline --out artifacts/agent_eval_offline.json --traces artifacts/traces-offline
+
+agent-baseline-live: ## Project 4: write data/golden/baselines/agent-<track>.json from a passed live run (K=3)
+	uv run $(ENV_FILE) python -m nw.agent.evaluate --gate --repeats $(or $(K),3) --write-baseline
+
+agent-calibrate-judge: ## Project 4: the turn Judge against 40 graded turns (about 0.25 USD); the live gate needs it; SHARE=1 also writes data/golden/calibrations/
+	uv run $(ENV_FILE) python -m nw.agent.evaluate --calibrate-judge $(if $(SHARE),--share,)
+
+agent-record:     ## Project 4: a live run that records every completion (CASSETTE=artifacts/cassette.jsonl)
+	uv run $(ENV_FILE) python -m nw.agent.evaluate --record $(or $(CASSETTE),artifacts/cassette.jsonl)
+
+agent-replay:     ## Project 4: replay a recorded run through the current loop and tools, no model (CASSETTE=...)
+	uv run python -m nw.agent.evaluate --provider replay --replay $(or $(CASSETTE),artifacts/cassette.jsonl)
+
+drift-triage-central: ## Project 1: drift over every instance's capture (CAPTURE="captures/*.jsonl", PROFILE=...)
+	uv run python -m nw.triage.monitor drift --profile $(or $(PROFILE),artifacts/triage/latest/data_profile.json) --capture $(CAPTURE)
+
+quality-triage:   ## Project 1: live P0 recall and precision from delayed labels (CAPTURE=..., OUTCOMES=...)
+	uv run python -m nw.triage.monitor quality --capture $(CAPTURE) --outcomes $(OUTCOMES)
+
+retrain-trigger:  ## Project 1: would a retrain run now? (NEW_LABELS=0)
+	uv run python -m nw.triage.monitor trigger --new-labels $(or $(NEW_LABELS),0)

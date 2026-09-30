@@ -1,11 +1,15 @@
 # The documented alternative to deploy/azure/pipelines/azure-pipelines.yml: the same three stages
-# in GitHub Actions, signing in to Azure with OpenID Connect (no secret; the `northwind-deployer`
-# identity trusts this repository through the federated credentials that `NW_GITHUB_REPOSITORY`
-# adds). Not active here: copy it to .github/workflows/azure-delivery.yml to use it, and create
-# the GitHub environment `northwind-live` with required reviewers (the manual approval).
+# in GitHub Actions, signing in to Azure with OpenID Connect (no secret). Two identities, set up
+# by `NW_GITHUB_REPOSITORY` at deploy (deploy/azure/modules/delivery.bicep):
+#   - `northwind-builder` trusts `ref:refs/heads/main` and can only push images: the build job.
+#   - `northwind-deployer` trusts only the environments `northwind-canary` and `northwind-live`:
+#     the release jobs. A job on main without one of those environments cannot sign in as it.
+# Not active here: copy it to .github/workflows/azure-delivery.yml to use it, and create the
+# GitHub environments `northwind-canary` and `northwind-live`, both with the deployment branch
+# rule "main only", and required reviewers on `northwind-live` (the manual approval).
 #
-# Repository secrets: AZURE_CLIENT_ID (the output NW_AZURE_DEPLOYER_CLIENT_ID), AZURE_TENANT_ID,
-# AZURE_SUBSCRIPTION_ID.
+# Repository secrets: AZURE_BUILDER_CLIENT_ID (NW_AZURE_BUILDER_CLIENT_ID), AZURE_CLIENT_ID
+# (NW_AZURE_DEPLOYER_CLIENT_ID), AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID.
 name: azure-delivery
 
 on:
@@ -29,16 +33,22 @@ jobs:
       - uses: actions/checkout@v4
       - uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          client-id: ${{ secrets.AZURE_BUILDER_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       - uses: docker/setup-buildx-action@v3
+      # images_azure.sh signs every digest with the Key Vault key; release verifies it.
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.6.5
       - run: scripts/deploy_azure.sh outputs
       - run: NW_IMAGE_TAG=$(git rev-parse --short HEAD) IMAGES="policy agent mcp" scripts/images_azure.sh
 
   canary:
     needs: build
     runs-on: ubuntu-latest
+    # The deployer trusts this environment (main only, no reviewers: the alarms judge a canary).
+    environment: northwind-canary
     steps:
       - uses: actions/checkout@v4
       - uses: azure/login@v2
@@ -46,6 +56,9 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.6.5
       - run: scripts/deploy_azure.sh outputs
       - run: NW_IMAGE_TAG=$(git rev-parse --short HEAD) scripts/deploy_azure.sh release
 

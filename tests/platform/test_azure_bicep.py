@@ -575,12 +575,14 @@ def test_names_carry_the_tenant_prefix(template: dict, fixture: str, tenants: li
             or (r.type.endswith(children) and r.name.split("/")[0].startswith("northwind-"))
             # Role assignment names are GUIDs of runtime resource ids.
             or (r.type == "Microsoft.Authorization/roleAssignments" and r.name == "RUNTIME")
+            # A storage account has one lifecycle policy and Azure names it `default`.
+            or (r.type.endswith("/managementPolicies") and r.name.endswith("/default"))
         )
     ]
     assert not bad, bad
     # No-hyphen names stay within their limits: storage and Key Vault 24, registry 50.
     for r in resources:
-        if r.name.startswith("nw") and "-" not in r.name:
+        if r.name.startswith("nw") and "-" not in r.name and "/" not in r.name:
             assert re.fullmatch(r"nw[a-z]+[a-z0-9]{6}", r.name) and len(r.name) <= 24, r.name
 
 
@@ -630,7 +632,7 @@ def test_cohort_yields_per_tenant_resources(template: dict) -> None:
         assert (
             len([n for n in names if re.fullmatch(rf"northwind-{kind}-[0-9a-z]{{6}}", n)]) == 1
         ), kind
-    deployments = _names(resources, "accounts/deployments")
+    deployments = [n for n in _names(resources, "accounts/deployments") if "-eu-" not in n]
     assert sorted(n.rsplit("/", 1)[-1] for n in deployments) == [
         "claude-opus-5",
         "gpt-oss-120b",
@@ -814,3 +816,292 @@ def test_apim_url_never_travels_as_the_litellm_variable() -> None:
 @needs_bicep
 def test_content_safety_endpoint_is_an_output(template: dict) -> None:
     assert template["outputs"]["NW_AZURE_CONTENT_SAFETY_ENDPOINT"]["type"] == "string"
+
+
+# ----- the 2026-09-29 audit fixes (lens 02 and 06, Azure) ----------------------------------------
+
+
+def _read(*parts: str) -> str:
+    return (ROOT.joinpath(*parts)).read_text()
+
+
+def _role(resources: list[Planned], role_name_part: str) -> dict:
+    for r in resources:
+        if r.type == "Microsoft.Authorization/roleDefinitions" and role_name_part in str(
+            (r.properties or {}).get("roleName", "")
+        ):
+            return r.properties["permissions"][0]
+    raise AssertionError(f"no role {role_name_part!r}")
+
+
+@needs_bicep
+def test_tenant_workspace_role_deletes_nothing_shared_and_calls_no_endpoint(
+    template: dict,
+) -> None:
+    """02 H5: an allow-list, no wildcard write, delete or action, and no key, token or score
+    on any online endpoint through the workspace role."""
+    resources = plan(template, fixture_params("cohort"))
+    role = _role(resources, "tenant on the workspace")
+    actions = [a.lower() for a in role["actions"]]
+    assert not any(a.endswith(("/delete", "/*/write", "/*/action", "/*")) for a in actions), actions
+    for forbidden in ("listkeys", "token", "score", "listsecrets", "readsecrets", "computes/"):
+        assert not any(forbidden in a for a in actions), forbidden
+    for needed in ("jobs/write", "models/versions/write", "experiments/runs/submit/action"):
+        assert any(a.endswith(needed) for a in actions), needed
+    endpoint = _role(resources, "endpoint operator")
+    assert any("listkeys" in a.lower() for a in endpoint["actions"])
+
+
+def test_live_endpoint_role_only_for_live_admin_and_deployer() -> None:
+    """02 H5: tenants hold the endpoint role on their own endpoints only."""
+    tenant = _read("modules", "tenant.bicep")
+    assert "liveEndpoint" not in tenant and "operatesLiveEndpoint" not in tenant
+    assert "onLiveEndpoints" in _read("modules", "admin.bicep")
+    assert "operatesLiveEndpoints" in _read("modules", "delivery.bicep")
+
+
+@needs_bicep
+def test_tenants_reach_foundry_through_agents_and_evaluations_only(template: dict) -> None:
+    """02 M5: no Foundry User (all data actions, inference included) for tenants."""
+    resources = plan(template, fixture_params("cohort"))
+    role = _role(resources, "tenant on the Foundry project")
+    assert sorted(role["dataActions"]) == [
+        "Microsoft.CognitiveServices/accounts/AIServices/agents/*",
+        "Microsoft.CognitiveServices/accounts/AIServices/evaluations/*",
+    ]
+    assert "53ca6127-db72-4b80-b1b0-d745d6d5456d" not in _read("modules", "tenant.bicep")
+
+
+@needs_bicep
+def test_allowed_sizes_policy_is_assigned_to_the_group(template: dict) -> None:
+    """02 H6: a deny policy on ML compute sizes and online deployment sizes and counts."""
+    resources = plan(template, fixture_params("cohort"))
+    [definition] = [r for r in resources if r.type.endswith("policyDefinitions")]
+    rule = json.dumps(definition.properties["policyRule"])
+    assert '"deny"' in rule
+    for alias in (
+        "workspaces/computes/vmSize",
+        "onlineEndpoints/deployments/instanceType",
+        "onlineEndpoints/deployments/sku.capacity",
+    ):
+        assert alias in rule, alias
+    [assignment] = [r for r in resources if r.type.endswith("policyAssignments")]
+    assert assignment.name == "northwind-ml-sizes"
+    sizes = assignment.properties["parameters"]["allowedSizes"]["value"]
+    assert "Standard_DS3_v2" in sizes and "Standard_F2s_v2" in sizes
+    assert not any(s.startswith(("Standard_N", "Standard_ND")) for s in sizes)
+
+
+@needs_bicep
+def test_apim_has_a_monthly_token_quota_per_tenant(template: dict) -> None:
+    """02 M5: llm-token-limit with token-quota over a Monthly period, keyed by subscription."""
+    resources = plan(template, fixture_params("cohort"))
+    for r in [r for r in resources if r.type.endswith("apis/policies")]:
+        value = r.properties["value"]
+        assert 'token-quota-period="Monthly"' in value
+        assert 'token-quota="6000000"' in value
+        assert 'counter-key="@(context.Subscription.Id)"' in value
+
+
+def test_litellm_is_pinned_and_its_database_is_private() -> None:
+    """02 H10, M12: digest pin, no 0.0.0.0 rule, no public database endpoint, salt key."""
+    gateway = _read("modules", "gateway.bicep")
+    assert "main-stable" not in gateway
+    assert re.search(r"ghcr\.io/berriai/litellm:v[0-9.]+@sha256:[0-9a-f]{64}", gateway)
+    assert "0.0.0.0" not in gateway
+    db = gateway.split("module database", 1)[1].split("module litellm", 1)[0]
+    assert "publicNetworkAccess: 'Disabled'" in db and "delegatedSubnetResourceId" in db
+    assert "LITELLM_SALT_KEY" in gateway
+
+
+@needs_bicep
+def test_apps_run_in_a_network_with_egress_limited_to_azure(template: dict) -> None:
+    """02 M12: the apps subnet denies outbound internet; the database zone exists for LiteLLM."""
+    for fixture in ("cohort", "solo"):
+        resources = plan(template, fixture_params(fixture))
+        [nsg] = [r for r in resources if r.type.endswith("networkSecurityGroups")]
+        rules = {x["name"]: x["properties"] for x in nsg.properties["securityRules"]}
+        assert rules["deny-internet"]["access"] == "Deny"
+        assert rules["deny-internet"]["destinationAddressPrefix"] == "Internet"
+        assert all(
+            x["access"] == "Allow" and x["destinationPortRange"] in ("443", "*")
+            for n, x in rules.items()
+            if n != "deny-internet"
+        )
+        zones = [r for r in resources if r.type.endswith("privateDnsZones")]
+        assert len(zones) == (1 if fixture == "solo" else 0), fixture
+    main = _read("main.bicep")
+    assert "infrastructureSubnetResourceId: network.outputs.appsSubnetId" in main
+
+
+@needs_bicep
+def test_retention_rules(template: dict) -> None:
+    """06 H7: capture and traces 90 days, audit 400 days, per owner; the data collector's
+    prefix in the workspace storage 90 days."""
+    resources = plan(template, fixture_params("cohort"))
+    policies = [r for r in resources if r.type.endswith("managementPolicies")]
+    lake = next(r for r in policies if r.name.startswith("nwdata"))
+    rules = {x["name"]: x for x in lake.properties["policy"]["rules"]}
+    for owner in ("alice", "bob", "live"):
+        capture = rules[f"capturenorthwind{owner}"]["definition"]
+        assert f"artifacts/northwind-{owner}/traces/" in capture["filters"]["prefixMatch"]
+        # The ops store's kinds (nw/agent/opstore.py): trajectories 90 days, approvals 400.
+        assert f"artifacts/northwind-{owner}/trajectories/" in capture["filters"]["prefixMatch"]
+        assert f"artifacts/northwind-{owner}/feedback/" in capture["filters"]["prefixMatch"]
+        assert capture["actions"]["baseBlob"]["delete"]["daysAfterModificationGreaterThan"] == 90
+        audit = rules[f"auditnorthwind{owner}"]["definition"]
+        assert f"artifacts/northwind-{owner}/registry/" in audit["filters"]["prefixMatch"]
+        assert f"artifacts/northwind-{owner}/approvals/" in audit["filters"]["prefixMatch"]
+        assert audit["actions"]["baseBlob"]["delete"]["daysAfterModificationGreaterThan"] == 400
+    assert "modelDataCollector/" in _read("modules", "tracking.bicep")
+
+
+@needs_bicep
+def test_every_live_endpoint_and_app_has_alerts(template: dict) -> None:
+    """Low (02): alerts on the semantic endpoint and every live app, not only triage."""
+    names = [r.name for r in plan(template, fixture_params("cohort"))]
+    for alert in (
+        "northwind-live-5xx",
+        "northwind-live-p95",
+        "northwind-live-semantic-5xx",
+        "northwind-live-semantic-p95",
+        "northwind-live-policy-5xx",
+        "northwind-live-agent-5xx",
+        "northwind-live-mcp-5xx",
+    ):
+        assert names.count(alert) == 1, alert
+
+
+def test_apps_get_their_owner_key_and_secrets_by_reference() -> None:
+    """02 M4, Low: a key per owner, the Application Insights string from Key Vault, and no
+    connection string in the plain environment of apps or jobs."""
+    agents = _read("modules", "agents.bicep")
+    assert "secrets/${environment}-${a.owner}-api-key" in agents
+    assert "secrets/${environment}-api-key'" not in agents
+    assert "{ name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', secretRef: 'appinsights' }" in agents
+    settings = _read("main.bicep").split("var platformSettings = {", 1)[1].split("}", 1)[0]
+    assert "CONNECTION_STRING" not in settings
+
+
+def test_deployer_is_scoped_and_main_only_builds() -> None:
+    """02 M8: the deployer's role is assigned on the live apps, not the group; the main
+    branch credential belongs to the builder, which can only push images."""
+    delivery = _read("modules", "delivery.bicep")
+    deployer_creds = delivery.split("var deployerCredentials", 1)[1].split(
+        "var builderCredentials"
+    )[0]
+    assert "refs/heads/main" not in deployer_creds
+    builder_creds = delivery.split("var builderCredentials", 1)[1].split("module deployer")[0]
+    assert "refs/heads/main" in builder_creds
+    deploys = delivery.split("resource deploysLiveApps", 1)[1].split("\n}", 1)[0]
+    assert "scope: liveApps[i]" in deploys
+    # No assignment of the deployer role at resource group scope.
+    for block in delivery.split("resource ")[1:]:
+        if "roleDefinitionId: deployerRole.id" in block:
+            assert "scope:" in block, block[:60]
+
+
+def test_scripts_fail_closed_and_clean_up() -> None:
+    """02 M14, Low, 06: index isolation fails instead of widening; tenant removal deletes
+    every assignment of the tenant's principals; destroy purges the workspace and the policy."""
+    script = (ROOT.parents[1] / "scripts" / "deploy_azure.sh").read_text()
+    indexes = script.split("create_indexes() {", 1)[1].split("\n}", 1)[0]
+    assert "granted on the service instead" not in indexes
+    assert '--scope "$search_id" ' not in indexes
+    remove = script.split("      remove)", 1)[1].split(";;", 1)[0]
+    assert "remove_assignments" in remove
+    helper = script.split("remove_assignments() {", 1)[1].split("\n}", 1)[0]
+    assert "role assignment list" in helper and "--all" in helper
+    destroy = script.split("  destroy)", 1)[1].split(";;", 1)[0]
+    assert "--permanently-delete" in destroy
+    assert "policy definition delete" in destroy
+
+
+def test_images_are_signed_and_verified_before_release() -> None:
+    """02 M11 on Azure: images_azure.sh signs with the Key Vault key; release verifies first."""
+    images = (ROOT.parents[1] / "scripts" / "images_azure.sh").read_text()
+    assert "cosign sign" in images and "azurekms://" in images
+    script = (ROOT.parents[1] / "scripts" / "deploy_azure.sh").read_text()
+    release = script.split("  release)", 1)[1].split(";;", 1)[0]
+    assert release.index("verify_image") < release.index("containerapp update")
+    verify = script.split("verify_image() {", 1)[1].split("\n}", 1)[0]
+    assert "cosign verify" in verify and "return 1" in verify
+    delivery = _read("modules", "delivery.bicep")
+    assert "keyOps: ['sign', 'verify']" in delivery
+
+
+@needs_bicep
+def test_eu_resource_serves_eu_accounts_in_the_eu_data_zone(template: dict) -> None:
+    """06 H5 on Azure: an EU Foundry resource with Data Zone Standard deployments, its
+    endpoint an output and in the apps' settings; LiteLLM names them eu/<id>."""
+    assert template["outputs"]["NW_AZURE_FOUNDRY_EU_ENDPOINT"]["type"] == "string"
+    for fixture in ("cohort", "solo"):
+        resources = plan(template, fixture_params(fixture))
+        eu = [r for r in resources if r.type.endswith("accounts/deployments") and "-eu-" in r.name]
+        assert [r.name.rsplit("/", 1)[-1] for r in eu] == ["Mistral-Large-3"]
+    main = _read("main.bicep")
+    assert "sku: 'DataZoneStandard'" in main and "NW_AZURE_FOUNDRY_EU_ENDPOINT: euEndpoint" in main
+    assert "model_name: 'eu/${m.name}'" in _read("modules", "gateway.bicep")
+
+
+@needs_bicep
+def test_runtimes_keep_ops_state_but_never_write_approvals(template: dict) -> None:
+    """ADR 0005 on the data plane: the owner identity the apps and jobs run as writes its
+    prefix except `<prefix>/approvals/`; the learner (a tenant's approver) keeps the whole
+    prefix; the platform owner (admin.bicep) approves for live."""
+    resources = plan(template, fixture_params("cohort"))
+    writes = [
+        r
+        for r in resources
+        if r.type == "Microsoft.Authorization/roleAssignments"
+        and isinstance(r.properties, dict)
+        and r.properties.get("condition")
+    ]
+    for t in ("alice", "bob", "live"):
+        mine = [r for r in writes if f"'northwind-{t}/'" in r.properties["condition"]]
+        assert mine
+        for r in mine:
+            cond = r.properties["condition"]
+            if r.properties.get("principalType") == "ServicePrincipal":
+                assert f"StringNotStartsWith 'northwind-{t}/approvals/'" in cond
+            else:
+                assert "approvals" not in cond
+    agents = _read("modules", "agents.bicep")
+    assert "a.kind == 'mcp' ? [] : [{ name: 'NW_OPS_STORE', value: opsStore }]" in agents
+    assert "{ name: 'NW_REDACT_DETECTOR', value: 'heuristic' }" in agents
+    assert "name: 'NW_RUNTIME_AUTH'" not in agents, (
+        "public ingress: the apps keep checking x-api-key"
+    )
+    assert "NW_OPS_STORE" in template["outputs"]
+    assert ".blob." in template["outputs"]["NW_OPS_STORE"]["value"] or "opsStore" in json.dumps(
+        template["outputs"]["NW_OPS_STORE"]
+    )
+
+
+@needs_bicep
+def test_quality_alerts_read_the_exported_signals(template: dict) -> None:
+    """The metrics_snapshot fields nw/metrics_export.py emits, with the bars of deploy/SLO.md;
+    the live level alert is named so the approval step's fired-alert check sees it."""
+    names = [r.name for r in plan(template, fixture_params("cohort"))]
+    for alert in (
+        "northwind-live-quality-level",
+        "northwind-quality-level",
+        "northwind-quality-shadow",
+        "northwind-quality-p0-high",
+        "northwind-quality-p0-low",
+        "northwind-quality-refusal",
+        "northwind-quality-judge",
+        "northwind-quality-alert",
+    ):
+        assert names.count(alert) == 1, alert
+    obs = _read("modules", "observability.bicep")
+    for signal, op, bar in (
+        ("quality_level", ">=", "2"),
+        ("shadow_agreement", "<", "0.9"),
+        ("p0_share_ratio", ">=", "2"),
+        ("p0_share_ratio", "<=", "0.5"),
+        ("refusal_ratio", ">=", "2"),
+        ("judge_score", "<", "3.5"),
+    ):
+        assert f"field: '{signal}'" in obs and f"op: '{op}', threshold: '{bar}'" in obs, signal
+    assert "field: 'p0_share'" not in obs and "field: 'refusal_rate'" not in obs

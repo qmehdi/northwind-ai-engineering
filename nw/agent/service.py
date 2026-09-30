@@ -1,7 +1,7 @@
 """One FastAPI app for any agent role: a specialist (`NW_AGENT_ROLE=triage|policy|resolution`)
 or the orchestrator (`NW_AGENT_ROLE=orchestrator`, with the specialists' URLs).
 
-    NW_AGENT_ROLE=resolver uv run uvicorn nw.agent.service:app --port 8010   # the Session path
+    NW_AGENT_ROLE=resolver uv run uvicorn nw.agent.service:app --port 8010   # the resolver
     NW_AGENT_ROLE=triage uv run uvicorn nw.agent.service:app --port 8011
     NW_AGENT_ROLE=policy uv run uvicorn nw.agent.service:app --port 8012
     NW_AGENT_ROLE=resolution uv run uvicorn nw.agent.service:app --port 8013
@@ -16,9 +16,18 @@ Operator controls, all environment variables: NW_AGENT_DISABLED=1 refuses /run a
 with 503 and leaves readiness alone (the platform keeps the instance, the operator stops
 the spend); NW_AGENT_MAX_CONCURRENT_RUNS (default 4) bounds runs in flight, 429 beyond it;
 NW_AGENT_CAPTURE appends one JSON line per run; NW_AGENT_BASELINE points the drift monitor
-at a baseline other than data/golden/agent_baseline.json; NW_AGENT_DRIFT_WINDOW and
-NW_AGENT_DRIFT_MIN size the window; NW_AGENT_MAX_TOTAL_TOKENS caps the tokens one resolver
-run may spend (input plus output), stopping it with BUDGET.
+at a baseline other than this track's data/golden/baselines/agent-<track>.json;
+NW_AGENT_DRIFT_WINDOW and NW_AGENT_DRIFT_MIN (default 200) size the window;
+NW_AGENT_JUDGE_SAMPLE (default 0.05) is the share of answered runs the Judge scores in the
+background for the `nw_agent_judge_score` quality signal; NW_AGENT_MAX_TOTAL_TOKENS caps the
+tokens one run may spend (input plus output), stopping it with BUDGET. A request may lower
+that cap, never raise it.
+
+Who and whose: every run records `requested_by`, the caller's API key id, so the approval
+tool can refuse self-approval, and binds its customer tools to the request's `account_id`
+(`/route` requires one; `/run` without one binds none and the account tools refuse).
+Traces go to the ops store (`nw.agent.opstore`): `NW_TRACE_DIR` on a laptop, the tenant's
+prefix in the platform's object storage when `NW_OPS_STORE` is set, redacted either way.
 
 On a platform (ADR 0008) the runtime injects NW_TENANT and NW_ENVIRONMENT (on every log line,
 every run line and every drift_alert), NW_AGENT_REGISTRY (the registry entry this agent runs
@@ -39,9 +48,12 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
+from pydantic import Field
 
 from nw.agent.loop import SYSTEM_RULES, run_agent
-from nw.agent.monitor import ALERT, AgentMonitor, RunSummary
+from nw.agent.monitor import ALERT, AgentMonitor, JudgeSampler, RunSummary
+from nw.agent.northwind import ACCOUNT_PATTERN, bind_account
+from nw.agent.opstore import LocalStore, OpsStore, store_for
 from nw.agent.orchestrator import (
     ORCHESTRATOR_SYSTEM,
     SPECIALISTS,
@@ -52,7 +64,7 @@ from nw.agent.orchestrator import (
     subset,
 )
 from nw.agent.tools import Observation, ToolRegistry
-from nw.agent.trace import Trajectory
+from nw.agent.trace import Termination, Trajectory
 from nw.agent.version import describe
 from nw.api import install_version_headers, mount_versioned, version_fields
 from nw.auth import install_api_key
@@ -108,6 +120,7 @@ class State:
     client: LLMClient | None = None
     ready = False
     trace_dir = Path("artifacts/traces")
+    traces: OpsStore | None = None  # None: a LocalStore on trace_dir, built on first use
     baseline: dict[str, Any] | None = None
     capture: Path | None = None
     max_runs: int = 4
@@ -119,6 +132,8 @@ class State:
         self.urls: dict[str, str] = {}
         self.monitor: AgentMonitor = AgentMonitor(None)
         self.slots: asyncio.Semaphore | None = None
+        self.sampler: JudgeSampler | None = None
+        self.judge_tasks: set[asyncio.Task[None]] = set()
 
 
 state = State()
@@ -144,16 +159,22 @@ def load_baseline(path: Path) -> dict[str, Any] | None:
 def configure_agentops() -> None:
     """Drift baseline, capture file and the concurrency cap, from the environment. All best
     effort: the service runs without a baseline, it just cannot compute PSI."""
-    state.baseline = load_baseline(
-        Path(os.environ.get("NW_AGENT_BASELINE", "data/golden/agent_baseline.json"))
-    )
+    from nw.agent.evaluate import baseline_path
+
+    s = settings()
+    default = baseline_path("live", s.track.value)  # this track's live baseline, if committed
+    state.baseline = load_baseline(Path(os.environ.get("NW_AGENT_BASELINE", str(default))))
     state.monitor = AgentMonitor(
         state.baseline,
-        window=int(os.environ.get("NW_AGENT_DRIFT_WINDOW", "200")),
-        min_window=int(os.environ.get("NW_AGENT_DRIFT_MIN", "20")),
+        window=int(os.environ.get("NW_AGENT_DRIFT_WINDOW", "500")),
+        min_window=int(os.environ.get("NW_AGENT_DRIFT_MIN", "200")),
+        workhorse=s.model_for(ModelRole.WORKHORSE),
     )
     if not state.monitor.enabled:
-        log.info("drift PSI off: no agent baseline with per-case steps and costs")
+        log.info("drift PSI off", extra=log_fields(reason=state.monitor.psi_off))
+    # The Judge scores a sample of live turns off the request path (NW_AGENT_JUDGE_SAMPLE,
+    # a rate from 0 to 1, default one run in twenty; 0 turns it off).
+    state.sampler = JudgeSampler(float(os.environ.get("NW_AGENT_JUDGE_SAMPLE", "0.05") or 0))
     capture = os.environ.get("NW_AGENT_CAPTURE")
     state.capture = Path(capture) if capture else None
     tokens = os.environ.get("NW_AGENT_MAX_TOTAL_TOKENS", "").strip()
@@ -168,6 +189,7 @@ async def lifespan(app: FastAPI):
     start_metrics_export("agent")
     state.role = os.environ.get("NW_AGENT_ROLE", "triage")
     state.trace_dir = Path(os.environ.get("NW_TRACE_DIR", "artifacts/traces"))
+    state.traces = store_for("trajectories", local=state.trace_dir)
     try:
         if state.role not in {*SPECIALISTS, "orchestrator", "resolver"}:
             raise ValueError(f"unknown NW_AGENT_ROLE {state.role!r}")
@@ -201,6 +223,11 @@ async def lifespan(app: FastAPI):
         log.error("agent failed to start", extra=log_fields(role=state.role, error=str(exc)))
     yield
     state.ready = False
+    http_client = getattr(state.registry, "http_client", None)
+    if http_client is not None:
+        await http_client.aclose()
+    if state.client is not None:
+        await state.client.aclose()
 
 
 app = FastAPI(title="Northwind agent", version="1.0", lifespan=lifespan)
@@ -334,40 +361,64 @@ async def admit(endpoint: str) -> AsyncIterator[None]:
 # ----- runs --------------------------------------------------------------------------
 
 
+def token_cap(requested: int | None) -> int | None:
+    """The run's token budget: the operator's cap, or the request's when it is lower. A
+    request can never raise what `NW_AGENT_MAX_TOTAL_TOKENS` allows."""
+    caps = [c for c in (requested, state.max_total_tokens) if c is not None]
+    return min(caps) if caps else None
+
+
+def caller(request: Request) -> str | None:
+    """Who is asking: the API key id the key check resolved, `key:<id>`, or None."""
+    key_id = getattr(request.state, "api_key_id", None)
+    return f"key:{key_id}" if key_id else None
+
+
 @app.post("/run", response_model=SpecialistResponse)
-async def run(req: SpecialistRequest) -> SpecialistResponse:
+async def run(req: SpecialistRequest, request: Request) -> SpecialistResponse:
     async with admit("/run"):
         assert state.client is not None
         t0 = time.perf_counter()
+        who = caller(request)
+        req = req.model_copy(update={"max_total_tokens": token_cap(req.max_total_tokens)})
         if state.role == "orchestrator":
-            t = await run_orchestrator(
-                req.task,
-                state.urls,
-                state.client,
-                max_steps=req.max_steps,
-                budget_usd=req.budget_usd,
-                hooks=[tool_metrics],
-            )
+            with bind_account(req.account_id):
+                t = await run_orchestrator(
+                    req.task,
+                    state.urls,
+                    state.client,
+                    max_steps=req.max_steps,
+                    budget_usd=req.budget_usd,
+                    hooks=[tool_metrics],
+                    account_id=req.account_id,
+                    requested_by=who,
+                )
         elif state.role in SPECIALISTS:
             assert state.registry is not None
-            if req.max_total_tokens is None and state.max_total_tokens is not None:
-                req = req.model_copy(update={"max_total_tokens": state.max_total_tokens})
             _, t = await run_specialist(
-                state.role, req, state.registry, state.client, screener=state.screener
-            )
-        else:
-            # resolver: the whole registry and the hand-built loop, the Session path's deployment
-            assert state.registry is not None
-            t = await run_agent(
-                req.task,
+                state.role,
+                req,
                 state.registry,
                 state.client,
-                max_steps=req.max_steps,
-                budget_usd=req.budget_usd,
-                agent_name=state.role,
                 screener=state.screener,
-                max_total_tokens=state.max_total_tokens,
+                requested_by=who,
             )
+        else:
+            # resolver: the whole registry and the hand-built loop
+            assert state.registry is not None
+            with bind_account(req.account_id):
+                t = await run_agent(
+                    req.task,
+                    state.registry,
+                    state.client,
+                    max_steps=req.max_steps,
+                    budget_usd=req.budget_usd,
+                    agent_name=state.role,
+                    screener=state.screener,
+                    max_total_tokens=req.max_total_tokens,
+                    account_id=req.account_id,
+                    requested_by=who,
+                )
         finish_run(t, state.role, t0)
         return _response(t)
 
@@ -384,20 +435,23 @@ def _response(t: Trajectory) -> SpecialistResponse:
 
 
 class RouteRequest(SpecialistRequest):
-    ticket_id: str = "T-000000"
-    account_id: str = "NW-00000"
+    ticket_id: str = Field(default="T-000000", pattern=r"^T-\d{6}$")
+    account_id: str = Field(default="NW-00000", pattern=ACCOUNT_PATTERN)
     subject: str = ""
 
 
 @app.post("/route", response_model=SpecialistResponse)
-async def route_ticket(req: RouteRequest) -> SpecialistResponse:
-    """Capstone endpoint: Project 1 first, then the cheapest loop that will do."""
+async def route_ticket(req: RouteRequest, request: Request) -> SpecialistResponse:
+    """Capstone endpoint: Project 1 first, then the cheapest loop that will do. The caps the
+    request sets (`max_steps`, `budget_usd`, `max_total_tokens`) lower the router's own;
+    fields left out keep the router's policy."""
     if state.registry is None:
         raise HTTPException(503, "agent not ready")
     async with admit("/route"):
         assert state.client is not None
         from nw.agent.router import route
 
+        given = req.model_fields_set
         t0 = time.perf_counter()
         t = await route(
             req.ticket_id,
@@ -407,15 +461,29 @@ async def route_ticket(req: RouteRequest) -> SpecialistResponse:
             state.registry,
             state.client,
             screener=state.screener,
+            max_steps=req.max_steps if "max_steps" in given else None,
+            budget_usd=req.budget_usd if "budget_usd" in given else None,
+            max_total_tokens=token_cap(req.max_total_tokens),
+            requested_by=caller(request),
         )
         finish_run(t, t.agent, t0)
         return _response(t)
 
 
+def trace_store() -> OpsStore:
+    if state.traces is None:
+        state.traces = LocalStore(state.trace_dir)
+    return state.traces
+
+
 def finish_run(t: Trajectory, role: str, t0: float) -> None:
-    """Everything a finished run leaves behind besides its response: the trace file, the
-    run metrics, the drift window, and the capture line."""
-    t.save(state.trace_dir)
+    """Everything a finished run leaves behind besides its response: the trace (redacted, in
+    the ops store), the run metrics, the drift window, and the capture line."""
+    try:
+        t.save(trace_store())
+    except Exception as exc:  # noqa: BLE001
+        # The customer's answer is not held hostage to the trace store; the alarm is the log.
+        log.error("trace not saved", extra=log_fields(run_id=t.run_id, error=str(exc)))
     RUNS.labels(role=role, terminated=t.terminated.value).inc()
     TERMINATIONS.labels(terminated=t.terminated.value).inc()
     STEPS.labels(role=role).observe(t.n_steps)
@@ -426,6 +494,7 @@ def finish_run(t: Trajectory, role: str, t0: float) -> None:
     summary = state.monitor.observe(t)
     _observe_drift()
     _capture(summary)
+    _sample_judge(t)
     # One line per run on every path (the loop logs its own only when a model ran), with the
     # tenant and the environment so a platform can attribute runs and cost.
     log.info(
@@ -440,6 +509,41 @@ def finish_run(t: Trajectory, role: str, t0: float) -> None:
             cost_usd=round(t.cost_usd, 5),
             **identity(),
         ),
+    )
+
+
+def _sample_judge(t: Trajectory) -> None:
+    """Score a sample of answered runs with the Judge in a background task: the customer's
+    response never waits for it, and the score feeds `nw_agent_judge_score`."""
+    if state.sampler is None or state.client is None or t.terminated is not Termination.ANSWER:
+        return
+    if not t.final or not state.sampler.should_sample():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return  # no event loop in this call path: skip the sample
+    task = loop.create_task(_judge_run(t))
+    state.judge_tasks.add(task)
+    task.add_done_callback(state.judge_tasks.discard)
+
+
+async def _judge_run(t: Trajectory) -> None:
+    from nw.agent.evaluate import live_turn_verdict
+    from nw.config import ProviderMode
+
+    offline = (state.settings or settings()).provider is ProviderMode.FAKE
+    try:
+        assert state.client is not None
+        verdict = await live_turn_verdict(state.client, t, offline=offline)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("turn not judged", extra=log_fields(run_id=t.run_id, error=str(exc)))
+        return
+    state.monitor.observe_judge(verdict.score)
+    state.monitor.snapshot()  # sets nw_agent_judge_score and logs quality_alert past the bar
+    log.info(
+        "turn_judged",
+        extra=log_fields(run_id=t.run_id, score=verdict.score, offline=offline, **identity()),
     )
 
 

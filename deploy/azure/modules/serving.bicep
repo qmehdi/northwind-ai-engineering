@@ -2,9 +2,10 @@
 // owner (tenant.bicep): one per tenant for learning, one live endpoint whose blue and green
 // deployments carry the canary. A canary is rolled back when one of these fires:
 //
-//   <environment>-live-5xx       server errors on the live endpoint (RequestsPerMinute,
-//                                statusCodeClass 5xx)
-//   <environment>-live-p95       p95 latency on the live endpoint above `latencyP95Ms`
+//   <environment>-live-5xx       server errors on the live triage endpoint (RequestsPerMinute,
+//                                statusCodeClass 5xx); `-live-semantic-5xx` on the semantic one
+//   <environment>-live-p95       p95 latency on the live triage endpoint above `latencyP95Ms`;
+//                                `-live-semantic-p95` on the semantic one
 //   <environment>-live-<app>-5xx server errors on the live policy and agent apps (the image canary)
 //
 // Metric names from the supported metrics pages of Microsoft.MachineLearningServices/workspaces/
@@ -13,82 +14,95 @@ metadata owner = 'northwind'
 
 param environment string
 param tags object
-param liveEndpointId string
+@description('Every live online endpoint: {kind, id}; triage keeps the names the guide uses.')
+param liveEndpoints array
 param liveAppIds array
 param actionGroupId string
 param latencyP95Ms int
 param enableTelemetry bool
 
-module endpoint5xx 'br/public:avm/res/insights/metric-alert:0.4.1' = {
-  name: '${environment}-live-5xx'
-  params: {
-    name: '${environment}-live-5xx'
-    alertDescription: 'Server errors on the live online endpoint: roll the canary back (set traffic to the stable deployment).'
-    location: 'global'
-    tags: tags
-    severity: 1
-    evaluationFrequency: 'PT1M'
-    windowSize: 'PT5M'
-    scopes: [liveEndpointId]
-    targetResourceType: 'Microsoft.MachineLearningServices/workspaces/onlineEndpoints'
-    autoMitigate: true
-    criteria: {
-      'odata.type': 'Microsoft.Azure.Monitor.SingleResourceMultipleMetricCriteria'
-      allof: [
-        {
-          name: 'server-errors'
-          criterionType: 'StaticThresholdCriterion'
-          metricNamespace: 'Microsoft.MachineLearningServices/workspaces/onlineEndpoints'
-          metricName: 'RequestsPerMinute'
-          dimensions: [
-            {
-              name: 'statusCodeClass'
-              operator: 'Include'
-              values: ['5xx']
-            }
-          ]
-          operator: 'GreaterThan'
-          threshold: 0
-          timeAggregation: 'Total'
-        }
-      ]
-    }
-    actions: [actionGroupId]
-    enableTelemetry: enableTelemetry
+var endpointAlerts = [
+  for e in liveEndpoints: {
+    kind: e.kind
+    id: e.id
+    stem: e.kind == 'triage' ? '${environment}-live' : '${environment}-live-${e.kind}'
   }
-}
+]
 
-module endpointP95 'br/public:avm/res/insights/metric-alert:0.4.1' = {
-  name: '${environment}-live-p95'
-  params: {
-    name: '${environment}-live-p95'
-    alertDescription: 'p95 latency on the live online endpoint above ${latencyP95Ms} ms: hold or roll back the canary.'
-    location: 'global'
-    tags: tags
-    severity: 2
-    evaluationFrequency: 'PT1M'
-    windowSize: 'PT5M'
-    scopes: [liveEndpointId]
-    targetResourceType: 'Microsoft.MachineLearningServices/workspaces/onlineEndpoints'
-    autoMitigate: true
-    criteria: {
-      'odata.type': 'Microsoft.Azure.Monitor.SingleResourceMultipleMetricCriteria'
-      allof: [
-        {
-          name: 'p95-latency'
-          criterionType: 'StaticThresholdCriterion'
-          metricNamespace: 'Microsoft.MachineLearningServices/workspaces/onlineEndpoints'
-          metricName: 'RequestLatency_P95'
-          operator: 'GreaterThan'
-          threshold: latencyP95Ms
-          timeAggregation: 'Average'
-        }
-      ]
+module endpoint5xx 'br/public:avm/res/insights/metric-alert:0.4.1' = [
+  for e in endpointAlerts: {
+    name: '${e.stem}-5xx'
+    params: {
+      name: '${e.stem}-5xx'
+      alertDescription: 'Server errors on the live ${e.kind} endpoint: roll the canary back (set traffic to the stable deployment).'
+      location: 'global'
+      tags: tags
+      severity: 1
+      evaluationFrequency: 'PT1M'
+      windowSize: 'PT5M'
+      scopes: [e.id]
+      targetResourceType: 'Microsoft.MachineLearningServices/workspaces/onlineEndpoints'
+      autoMitigate: true
+      criteria: {
+        'odata.type': 'Microsoft.Azure.Monitor.SingleResourceMultipleMetricCriteria'
+        allof: [
+          {
+            name: 'server-errors'
+            criterionType: 'StaticThresholdCriterion'
+            metricNamespace: 'Microsoft.MachineLearningServices/workspaces/onlineEndpoints'
+            metricName: 'RequestsPerMinute'
+            dimensions: [
+              {
+                name: 'statusCodeClass'
+                operator: 'Include'
+                values: ['5xx']
+              }
+            ]
+            operator: 'GreaterThan'
+            threshold: 0
+            timeAggregation: 'Total'
+          }
+        ]
+      }
+      actions: [actionGroupId]
+      enableTelemetry: enableTelemetry
     }
-    actions: [actionGroupId]
-    enableTelemetry: enableTelemetry
   }
-}
+]
+
+module endpointP95 'br/public:avm/res/insights/metric-alert:0.4.1' = [
+  for e in endpointAlerts: {
+    name: '${e.stem}-p95'
+    params: {
+      name: '${e.stem}-p95'
+      alertDescription: 'p95 latency on the live ${e.kind} endpoint above ${latencyP95Ms} ms: hold or roll back the canary.'
+      location: 'global'
+      tags: tags
+      severity: 2
+      evaluationFrequency: 'PT1M'
+      windowSize: 'PT5M'
+      scopes: [e.id]
+      targetResourceType: 'Microsoft.MachineLearningServices/workspaces/onlineEndpoints'
+      autoMitigate: true
+      criteria: {
+        'odata.type': 'Microsoft.Azure.Monitor.SingleResourceMultipleMetricCriteria'
+        allof: [
+          {
+            name: 'p95-latency'
+            criterionType: 'StaticThresholdCriterion'
+            metricNamespace: 'Microsoft.MachineLearningServices/workspaces/onlineEndpoints'
+            metricName: 'RequestLatency_P95'
+            operator: 'GreaterThan'
+            threshold: latencyP95Ms
+            timeAggregation: 'Average'
+          }
+        ]
+      }
+      actions: [actionGroupId]
+      enableTelemetry: enableTelemetry
+    }
+  }
+]
 
 module app5xx 'br/public:avm/res/insights/metric-alert:0.4.1' = [
   for a in liveAppIds: {
@@ -132,6 +146,6 @@ module app5xx 'br/public:avm/res/insights/metric-alert:0.4.1' = [
 ]
 
 output alertNames array = concat(
-  ['${environment}-live-5xx', '${environment}-live-p95'],
+  flatten(map(endpointAlerts, e => ['${e.stem}-5xx', '${e.stem}-p95'])),
   map(liveAppIds, a => '${a.name}-5xx')
 )

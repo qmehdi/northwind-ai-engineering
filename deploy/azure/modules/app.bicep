@@ -27,9 +27,7 @@ param enableTelemetry bool
 var placeholder = !startsWith(image, registryServer)
 var targetPort = placeholder ? 80 : port
 // The MCP server answers only MCP requests, so its probe is TCP; the services have /readyz.
-var probe = port == 8020
-  ? { tcpSocket: { port: targetPort } }
-  : { httpGet: { path: '/readyz', port: targetPort } }
+var probe = port == 8020 ? { tcpSocket: { port: targetPort } } : { httpGet: { path: '/readyz', port: targetPort } }
 
 module app 'br/public:avm/res/app/container-app:0.23.0' = {
   name: name

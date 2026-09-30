@@ -3,11 +3,25 @@
 - Runtime: the course MCP server as an AgentCore Runtime (MCP protocol) and the live resolver
   (HTTP protocol), both from the agent image on arm64. Tenants deploy their own resolver
   runtime through `nw.platform.AgentRuntime.deploy` (the API), named `northwind_<tenant>_resolver`,
-  with the same execution role.
+  with their own execution role `northwind-<tenant>-agentcore` (output `RuntimeRoleArns`): it
+  reaches that tenant's memory, knowledge base, endpoints, gateway key and API key and nothing
+  of another tenant's or of live. The live role (`RuntimeRoleArn`) is the only one that reads the
+  live gateway key and the service API key, and only the delivery deployer may pass it.
+- Ops state: every runtime gets `NW_OPS_STORE` (the ops bucket, `areas/data.py`) and its role
+  reads and writes its own owner's prefix only (`<environment>-<owner>/`); a tenant's resolver
+  gets the same variable from `nw.platform.AgentRuntime.deploy` (output `OpsStore`). The live
+  resolver sets `NW_RUNTIME_AUTH=platform`: AgentCore authorises every invocation with IAM.
+- Egress: with `-c agentEgress=vpc` (the default) every runtime runs in VPC mode in the agents
+  network (`areas/network.py`: private subnets, one NAT gateway, HTTPS out only, a DNS allow-list
+  of AWS endpoints and the model gateway). Tenants pass the same subnets and security group
+  (outputs `AgentSubnets`, `AgentSecurityGroup`).
 - Gateway: the MCP runtime as the target, AWS_IAM inbound, a Cedar policy engine in ENFORCE
-  mode: read tools for every caller, `escalate` only for the approvers role.
-- Memory: one AgentCore Memory per tenant and one for live, short-term events plus a semantic
-  long-term strategy, 30 days.
+  mode: read tools for every caller, `escalate` permitted for the approvers role
+  (`<Environment>Approvers`, created here) and forbidden for everyone else.
+- Memory: one AgentCore Memory per tenant and one for live. Short-term events expire after 30
+  days (`EventExpiryDuration`); the semantic long-term records have no expiry setting on the
+  resource, so erasure deletes them by namespace (`/<owner>/<actorId>/facts`) through
+  `DeleteMemoryRecord`, the retention and erasure runbook's step for memory.
 - Identity: a workload identity for the web entry and an API key credential provider holding
   the service API key so the agent fetches it through Identity instead of an environment
   variable.
@@ -19,14 +33,25 @@
 - Registry: an AWS Agent Registry (IAM discovery, manual approval) with two records the
   stack owns: the tools MCP server and the live resolver agent. Tenants register their own
   agent card through `nw.platform.AgentRuntime.register`.
-- Guardrail: prompt attack, PII masking, grounding, with a snapshot version.
+- Guardrail: prompt attack at HIGH on input, PII masking, grounding, with a snapshot version.
+- Image ownership: the live resolver's container URI comes from the SSM parameter
+  `/<environment>/images/agent` (`asset` until the delivery pipeline promotes a digest), so a
+  `cdk deploy` never rolls the runtime back to the image it built.
 """
 
 from __future__ import annotations
 
 import json
 
-from aws_cdk import CfnOutput, Duration, Fn, RemovalPolicy, Stack
+from aws_cdk import (
+    CfnCondition,
+    CfnOutput,
+    CfnParameter,
+    Duration,
+    Fn,
+    RemovalPolicy,
+    Stack,
+)
 from aws_cdk import aws_agentregistry as registry
 from aws_cdk import aws_bedrock as bedrock
 from aws_cdk import aws_bedrockagentcore as ac
@@ -39,7 +64,14 @@ from aws_cdk import aws_secretsmanager as secrets
 from aws_cdk import aws_sns as sns
 from constructs import Construct
 
-from stacks.common import LIVE, MODEL_IDS, bedrock_invoke_policy, image
+from stacks.common import (
+    LIVE,
+    bedrock_invoke_policy,
+    image,
+    image_parameter,
+    invoke_id,
+    model_arns,
+)
 
 TARGET_NAME = "northwind-tools"
 READ_TOOLS = (
@@ -50,7 +82,13 @@ READ_TOOLS = (
     "lookup_customer",
     "check_entitlement",
 )
-APPROVERS_ROLE = "NorthwindApprovers"
+APPROVERS_ROLE = "NorthwindApprovers"  # the default environment's; see approvers_role()
+
+
+def approvers_role(env_name: str) -> str:
+    return f"Northwind{env_name.capitalize()}Approvers"
+
+
 JUDGE_INSTRUCTIONS = (
     "You grade one turn of a support agent for Northwind Cloud. Read the customer's request, "
     "the tool calls and the final answer. Score how helpful and grounded the answer is: it must "
@@ -59,17 +97,25 @@ JUDGE_INSTRUCTIONS = (
 )
 
 
-def cedar_policies(account: str) -> dict[str, str]:
+def cedar_policies(account: str, approvers: str = APPROVERS_ROLE) -> dict[str, str]:
+    """Cedar denies by default: `escalate` needs a permit for the approvers as well as the
+    forbid for everyone else (the forbid stays so a later broad permit cannot open it)."""
     actions = ", ".join(f'AgentCore::Action::"{TARGET_NAME}___{t}"' for t in READ_TOOLS)
+    approver = f'principal.id like "arn:aws:sts::{account}:assumed-role/{approvers}/*"'
+    escalate = f'AgentCore::Action::"{TARGET_NAME}___escalate"'
     return {
         "AllowReadTools": (
             "permit(principal is AgentCore::IamEntity, "
             f"action in [{actions}], "
             "resource is AgentCore::Gateway);"
         ),
+        "AllowEscalateForApprovers": (
+            "permit(principal is AgentCore::IamEntity, "
+            f"action == {escalate}, resource is AgentCore::Gateway) "
+            f"when {{ {approver} }};"
+        ),
         "DenyEscalateUnlessApprover": (
-            f'forbid(principal, action == AgentCore::Action::"{TARGET_NAME}___escalate", resource) '
-            f'unless {{ principal.id like "arn:aws:sts::{account}:assumed-role/{APPROVERS_ROLE}/*" }};'
+            f"forbid(principal, action == {escalate}, resource) unless {{ {approver} }};"
         ),
     }
 
@@ -89,6 +135,11 @@ class Agents(Construct):
         knowledge_base_id: str,
         topic: sns.ITopic,
         cognito_domain_url: str,
+        knowledge_bases: dict[str, str] | None = None,
+        tenant_gateway_keys: dict[str, secrets.ISecret] | None = None,
+        profiles: dict | None = None,
+        network=None,
+        ops=None,
     ) -> None:
         super().__init__(scope, id)
         stack = Stack.of(self)
@@ -105,7 +156,7 @@ class Agents(Construct):
             content_policy_config=bedrock.CfnGuardrail.ContentPolicyConfigProperty(
                 filters_config=[
                     bedrock.CfnGuardrail.ContentFilterConfigProperty(
-                        type="PROMPT_ATTACK", input_strength="LOW", output_strength="NONE"
+                        type="PROMPT_ATTACK", input_strength="HIGH", output_strength="NONE"
                     ),
                     bedrock.CfnGuardrail.ContentFilterConfigProperty(
                         type="MISCONDUCT", input_strength="LOW", output_strength="NONE"
@@ -200,95 +251,33 @@ class Agents(Construct):
             api_key=api_key.secret_value.unsafe_unwrap(),
         )
 
-        # ----- runtime execution role (devguide runtime-permissions shape) -----
-        runtime_role = iam.Role(
-            self,
+        # ----- per-tenant API keys: what a tenant's runtime checks callers against -----
+        self.tenant_api_keys: dict[str, secrets.Secret] = {}
+        for owner in tenants:
+            self.tenant_api_keys[owner] = secrets.Secret(
+                self,
+                f"ApiKey{owner.title()}",
+                secret_name=f"{prefix}-{owner}-api-key",
+                description=f"{prefix} service API key for {owner}'s own services",
+                generate_secret_string=secrets.SecretStringGenerator(
+                    exclude_punctuation=True, password_length=40
+                ),
+                removal_policy=RemovalPolicy.DESTROY,
+            )
+
+        # ----- runtime execution roles (devguide runtime-permissions shape), one per owner -----
+        self.guardrail = guardrail
+        kbs = knowledge_bases or {LIVE: knowledge_base_id}
+        runtime_role = self._runtime_role(
+            f"{camel}BedrockAgentCoreRuntime-{stack.region}",
             "RuntimeExecutionRole",
-            role_name=f"{camel}BedrockAgentCoreRuntime-{stack.region}",
-            assumed_by=iam.ServicePrincipal(
-                "bedrock-agentcore.amazonaws.com",
-                conditions={
-                    "StringEquals": {"aws:SourceAccount": stack.account},
-                    "ArnLike": {
-                        "aws:SourceArn": f"arn:aws:bedrock-agentcore:{stack.region}:{stack.account}:*"
-                    },
-                },
-            ),
-            description="AgentCore Runtime execution role for the Northwind runtimes",
-        )
-        runtime_role.add_to_policy(
-            iam.PolicyStatement(
-                sid="ECRImageAccess",
-                actions=["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"],
-                resources=[f"arn:aws:ecr:{stack.region}:{stack.account}:repository/*"],
-            )
-        )
-        runtime_role.add_to_policy(
-            iam.PolicyStatement(
-                sid="ECRTokenAccess", actions=["ecr:GetAuthorizationToken"], resources=["*"]
-            )
-        )
-        runtime_role.add_to_policy(
-            iam.PolicyStatement(
-                actions=["logs:DescribeLogStreams", "logs:CreateLogGroup"],
-                resources=[
-                    f"arn:aws:logs:{stack.region}:{stack.account}:log-group:/aws/bedrock-agentcore/runtimes/*"
-                ],
-            )
-        )
-        runtime_role.add_to_policy(
-            iam.PolicyStatement(
-                actions=["logs:PutResourcePolicy"],
-                resources=[
-                    f"arn:aws:logs:{stack.region}:{stack.account}:log-group:/aws/bedrock-agentcore/runtimes/{prefix}*"
-                ],
-            )
-        )
-        runtime_role.add_to_policy(
-            iam.PolicyStatement(
-                actions=["logs:DescribeLogGroups"],
-                resources=[f"arn:aws:logs:{stack.region}:{stack.account}:log-group:*"],
-            )
-        )
-        runtime_role.add_to_policy(
-            iam.PolicyStatement(
-                actions=["logs:CreateLogStream", "logs:PutLogEvents"],
-                resources=[
-                    f"arn:aws:logs:{stack.region}:{stack.account}:log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*"
-                ],
-            )
-        )
-        runtime_role.add_to_policy(
-            iam.PolicyStatement(
-                actions=[
-                    "xray:PutTraceSegments",
-                    "xray:PutTelemetryRecords",
-                    "xray:GetSamplingRules",
-                    "xray:GetSamplingTargets",
-                ],
-                resources=["*"],
-            )
-        )
-        runtime_role.add_to_policy(
-            iam.PolicyStatement(
-                actions=["cloudwatch:PutMetricData"],
-                resources=["*"],
-                conditions={"StringEquals": {"cloudwatch:namespace": "bedrock-agentcore"}},
-            )
-        )
-        runtime_role.add_to_policy(
-            iam.PolicyStatement(
-                sid="GetAgentAccessToken",
-                actions=[
-                    "bedrock-agentcore:GetWorkloadAccessToken",
-                    "bedrock-agentcore:GetWorkloadAccessTokenForJWT",
-                    "bedrock-agentcore:GetWorkloadAccessTokenForUserId",
-                ],
-                resources=[
-                    f"arn:aws:bedrock-agentcore:{stack.region}:{stack.account}:workload-identity-directory/default",
-                    f"arn:aws:bedrock-agentcore:{stack.region}:{stack.account}:workload-identity-directory/default/workload-identity/{under}*",
-                ],
-            )
+            LIVE,
+            prefix=prefix,
+            under=under,
+            memory_arn=self.memories[LIVE].attr_memory_arn,
+            knowledge_base_id=kbs[LIVE],
+            secrets_read=[api_key, gateway_key],
+            profiles=None,
         )
         runtime_role.add_to_policy(
             iam.PolicyStatement(
@@ -300,46 +289,35 @@ class Agents(Construct):
                 ],
             )
         )
-        runtime_role.add_to_policy(
-            iam.PolicyStatement(
-                sid="Memory",
-                actions=[
-                    "bedrock-agentcore:CreateEvent",
-                    "bedrock-agentcore:GetEvent",
-                    "bedrock-agentcore:ListEvents",
-                    "bedrock-agentcore:ListSessions",
-                    "bedrock-agentcore:RetrieveMemoryRecords",
-                    "bedrock-agentcore:ListMemoryRecords",
-                    "bedrock-agentcore:GetMemoryRecord",
-                ],
-                resources=[m.attr_memory_arn for m in self.memories.values()],
-            )
-        )
-        runtime_role.add_to_policy(bedrock_invoke_policy(self))
-        api_key.grant_read(runtime_role)
-        gateway_key.grant_read(runtime_role)
-        runtime_role.add_to_policy(
-            iam.PolicyStatement(
-                sid="ApplyGuardrail",
-                actions=["bedrock:ApplyGuardrail"],
-                resources=[guardrail.attr_guardrail_arn],
-            )
-        )
-        runtime_role.add_to_policy(
-            iam.PolicyStatement(
-                sid="RetrievePolicies",
-                actions=["bedrock:Retrieve"],
-                resources=[f"arn:aws:bedrock:{stack.region}:{stack.account}:knowledge-base/*"],
-            )
-        )
-        runtime_role.add_to_policy(
-            iam.PolicyStatement(
-                sid="InvokeTenantEndpoints",
-                actions=["sagemaker:InvokeEndpoint"],
-                resources=[f"arn:aws:sagemaker:{stack.region}:{stack.account}:endpoint/{prefix}-*"],
-            )
-        )
         self.runtime_role = runtime_role
+        if ops is not None:
+            ops.grant_ops(runtime_role, LIVE)
+        self.tenant_runtime_roles: dict[str, iam.Role] = {}
+        for owner in tenants:
+            self.tenant_runtime_roles[owner] = self._runtime_role(
+                f"{prefix}-{owner}-agentcore",
+                f"RuntimeRole{owner.title()}",
+                owner,
+                prefix=prefix,
+                under=under,
+                memory_arn=self.memories[owner].attr_memory_arn,
+                knowledge_base_id=kbs.get(owner, knowledge_base_id),
+                secrets_read=[
+                    s
+                    for s in (
+                        (tenant_gateway_keys or {}).get(owner),
+                        self.tenant_api_keys[owner],
+                    )
+                    if s is not None
+                ],
+                profiles=[
+                    p.attr_inference_profile_arn
+                    for (o, _r), p in (profiles or {}).items()
+                    if o == owner
+                ],
+            )
+            if ops is not None:
+                ops.grant_ops(self.tenant_runtime_roles[owner], owner)
 
         # ----- runtimes -----
         agent_image = image(self, "agent", platform=ecr_assets.Platform.LINUX_ARM64)
@@ -358,8 +336,42 @@ class Agents(Construct):
             "NW_GATEWAY_KEY_SECRET_ARN": gateway_key.secret_arn,
             "NW_MEMORY_ID": self.memories[LIVE].attr_memory_id,
             "NW_TRACE_EXPORT": "xray",
+            # The metrics snapshot as EMF (Northwind namespace): the agent's quality alarms read
+            # QualityLevel and JudgeScore from it (areas/serving.py).
+            "NW_METRICS_FORMAT": "emf",
             "NW_STAGE": env_name,
+            # Trajectories, proposals, approvals and the escalation queue in the live prefix of
+            # the ops bucket (nw/agent/opstore.py): a runtime's disk is gone with its session.
+            **({"NW_OPS_STORE": ops.ops_uri} if ops is not None else {}),
+            # Names are redacted in the agent path too (tasks, observations, escalations).
+            "NW_REDACT_DETECTOR": "heuristic",
+            # The image carries its models; nothing at run time reaches the Hugging Face Hub
+            # (and the agents' DNS allow-list would refuse it).
+            "HF_HUB_OFFLINE": "1",
         }
+        if network is not None:
+            network.allow(gateway_url.removeprefix("https://").removeprefix("http://"))
+            net = network.network_configuration()
+        else:
+            net = ac.CfnRuntime.NetworkConfigurationProperty(network_mode="PUBLIC")
+        self.network = network
+        image_param = CfnParameter(
+            self,
+            "AgentImage",
+            type="AWS::SSM::Parameter::Value<String>",
+            default=image_parameter(prefix, "agent"),
+            description="The agent image the delivery pipeline promoted, or `asset` for the image this stack builds",
+        )
+        image_param.override_logical_id("AgentImageParam")
+        use_asset = CfnCondition(
+            self,
+            "AgentUsesAsset",
+            expression=Fn.condition_equals(image_param.value_as_string, "asset"),
+        )
+        use_asset.override_logical_id("AgentUsesAsset")
+        live_image = Fn.condition_if(
+            use_asset.logical_id, agent_image.image_uri, image_param.value_as_string
+        ).to_string()
         self.tools_runtime = ac.CfnRuntime(
             self,
             "ToolsRuntime",
@@ -371,7 +383,7 @@ class Agents(Construct):
                 )
             ),
             protocol_configuration="MCP",
-            network_configuration=ac.CfnRuntime.NetworkConfigurationProperty(network_mode="PUBLIC"),
+            network_configuration=net,
             environment_variables={
                 **common_env,
                 "NW_APP": "mcp",
@@ -388,17 +400,21 @@ class Agents(Construct):
             role_arn=runtime_role.role_arn,
             agent_runtime_artifact=ac.CfnRuntime.AgentRuntimeArtifactProperty(
                 container_configuration=ac.CfnRuntime.ContainerConfigurationProperty(
-                    container_uri=agent_image.image_uri
+                    container_uri=live_image
                 )
             ),
             protocol_configuration="HTTP",
-            network_configuration=ac.CfnRuntime.NetworkConfigurationProperty(network_mode="PUBLIC"),
+            network_configuration=net,
             environment_variables={
                 **common_env,
                 "NW_APP": "nw.agent.agentcore:app",
                 "NW_AGENT_ROLE": "resolver",
                 "NW_SPEND_CAP_USD": "25",
                 "PORT": "8080",
+                # AgentCore authorises InvokeAgentRuntime with IAM (SigV4; no JWT authorizer is
+                # configured) and does not forward a custom header, so /invocations is left to
+                # the platform's check (nw/agent/agentcore.py). The mounted app keeps its key.
+                "NW_RUNTIME_AUTH": "platform",
             },
             description="Northwind resolver agent, the promoted target (HTTP protocol, nw.agent.agentcore)",
         )
@@ -412,7 +428,16 @@ class Agents(Construct):
             name=f"{under}_tools",
             description="Authorises tool calls through the Northwind gateway",
         )
-        for name, statement in cedar_policies(stack.account).items():
+        approvers = approvers_role(env_name)
+        self.approvers_role = iam.Role(
+            self,
+            "ApproversRole",
+            role_name=approvers,
+            assumed_by=iam.AccountPrincipal(stack.account),
+            description="Approvers: the only principals the Cedar policy lets call `escalate`, and the registry's curators",
+            max_session_duration=Duration.hours(1),
+        )
+        for name, statement in cedar_policies(stack.account, approvers).items():
             ac.CfnPolicy(
                 self,
                 f"Policy{name}",
@@ -487,6 +512,13 @@ class Agents(Construct):
             description="Northwind tools behind a Cedar policy",
         )
         self.gateway.node.add_dependency(gateway_role)
+        self.approvers_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="InvokeToolsGateway",
+                actions=["bedrock-agentcore:InvokeGateway"],
+                resources=[self.gateway.attr_gateway_arn],
+            )
+        )
         encoded = Fn.join(
             "%2F",
             Fn.split("/", Fn.join("%3A", Fn.split(":", self.tools_runtime.attr_agent_runtime_arn))),
@@ -560,13 +592,13 @@ class Agents(Construct):
                 ],
             )
         )
+        # The Judge is served through its geo profile (common.system_profile): the role needs
+        # the profile in this region and the model in every region the profile routes to.
         eval_role.add_to_policy(
             iam.PolicyStatement(
                 sid="BedrockInvokeStatement",
                 actions=["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
-                resources=[
-                    f"arn:aws:bedrock:{stack.region}::foundation-model/{MODEL_IDS['judge']}"
-                ],
+                resources=[a for a in model_arns(self, ("judge",)) if "application-" not in a],
             )
         )
         self.evaluator = ac.CfnEvaluator(
@@ -580,7 +612,7 @@ class Agents(Construct):
                     instructions=JUDGE_INSTRUCTIONS,
                     model_config=ac.CfnEvaluator.EvaluatorModelConfigProperty(
                         bedrock_evaluator_model_config=ac.CfnEvaluator.BedrockEvaluatorModelConfigProperty(
-                            model_id=MODEL_IDS["judge"]
+                            model_id=invoke_id("judge", stack.region)
                         )
                     ),
                     rating_scale=ac.CfnEvaluator.RatingScaleProperty(
@@ -723,6 +755,29 @@ class Agents(Construct):
         CfnOutput(self, "OutRuntimeRoleArn", value=runtime_role.role_arn).override_logical_id(
             "RuntimeRoleArn"
         )
+        CfnOutput(
+            self,
+            "OutRuntimeRoleArns",
+            value=",".join(f"{o}={r.role_arn}" for o, r in self.tenant_runtime_roles.items()),
+        ).override_logical_id("RuntimeRoleArns")
+        CfnOutput(
+            self, "OutApproversRoleArn", value=self.approvers_role.role_arn
+        ).override_logical_id("ApproversRoleArn")
+        CfnOutput(
+            self,
+            "OutTenantApiKeys",
+            value=",".join(f"{o}={k.secret_arn}" for o, k in self.tenant_api_keys.items()),
+        ).override_logical_id("TenantApiKeys")
+        CfnOutput(
+            self, "OutAgentNetworkMode", value="VPC" if network is not None else "PUBLIC"
+        ).override_logical_id("AgentNetworkMode")
+        if network is not None:
+            CfnOutput(
+                self, "OutAgentSubnets", value=",".join(network.subnet_ids)
+            ).override_logical_id("AgentSubnets")
+            CfnOutput(
+                self, "OutAgentSecurityGroup", value=network.security_group.security_group_id
+            ).override_logical_id("AgentSecurityGroup")
         CfnOutput(self, "OutGuardrailId", value=guardrail.attr_guardrail_id).override_logical_id(
             "GuardrailId"
         )
@@ -737,4 +792,192 @@ class Agents(Construct):
             "OutMemories",
             value=",".join(f"{o}={m.attr_memory_id}" for o, m in self.memories.items()),
         ).override_logical_id("Memories")
-        self.cedar = json.dumps(cedar_policies(stack.account))
+        self.cedar = json.dumps(cedar_policies(stack.account, approvers))
+        self.approvers_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="CurateRegistry",
+                actions=[
+                    "agent-registry:GetRegistryRecord",
+                    "agent-registry:ListRegistryRecords",
+                    "agent-registry:UpdateRegistryRecordStatus",
+                ],
+                resources=[
+                    self.registry.attr_registry_arn,
+                    f"{self.registry.attr_registry_arn}/record/*",
+                ],
+            )
+        )
+
+    def _runtime_role(
+        self,
+        role_name: str,
+        id: str,
+        owner: str,
+        *,
+        prefix: str,
+        under: str,
+        memory_arn: str,
+        knowledge_base_id: str,
+        secrets_read: list,
+        profiles: list[str] | None,
+    ) -> iam.Role:
+        """The documented runtime execution role, scoped to one owner's resources."""
+        stack = Stack.of(self)
+        runtimes = f"{under}_{owner}_" if owner != LIVE else under
+        role = iam.Role(
+            self,
+            id,
+            role_name=role_name,
+            assumed_by=iam.ServicePrincipal(
+                "bedrock-agentcore.amazonaws.com",
+                conditions={
+                    "StringEquals": {"aws:SourceAccount": stack.account},
+                    "ArnLike": {
+                        "aws:SourceArn": f"arn:aws:bedrock-agentcore:{stack.region}:{stack.account}:*"
+                    },
+                },
+            ),
+            description=f"AgentCore Runtime execution role for {owner}'s runtimes",
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                sid="ECRImageAccess",
+                actions=["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"],
+                resources=[f"arn:aws:ecr:{stack.region}:{stack.account}:repository/*"],
+            )
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                sid="ECRTokenAccess", actions=["ecr:GetAuthorizationToken"], resources=["*"]
+            )
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["logs:DescribeLogStreams", "logs:CreateLogGroup"],
+                resources=[
+                    f"arn:aws:logs:{stack.region}:{stack.account}:log-group:/aws/bedrock-agentcore/runtimes/*"
+                ],
+            )
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["logs:PutResourcePolicy"],
+                resources=[
+                    f"arn:aws:logs:{stack.region}:{stack.account}:log-group:/aws/bedrock-agentcore/runtimes/{runtimes}*"
+                ],
+            )
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["logs:DescribeLogGroups"],
+                resources=[f"arn:aws:logs:{stack.region}:{stack.account}:log-group:*"],
+            )
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["logs:CreateLogStream", "logs:PutLogEvents"],
+                resources=[
+                    f"arn:aws:logs:{stack.region}:{stack.account}:log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*"
+                ],
+            )
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "xray:PutTraceSegments",
+                    "xray:PutTelemetryRecords",
+                    "xray:GetSamplingRules",
+                    "xray:GetSamplingTargets",
+                ],
+                resources=["*"],
+            )
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["cloudwatch:PutMetricData"],
+                resources=["*"],
+                conditions={"StringEquals": {"cloudwatch:namespace": "bedrock-agentcore"}},
+            )
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                sid="GetAgentAccessToken",
+                actions=[
+                    "bedrock-agentcore:GetWorkloadAccessToken",
+                    "bedrock-agentcore:GetWorkloadAccessTokenForJWT",
+                    "bedrock-agentcore:GetWorkloadAccessTokenForUserId",
+                ],
+                resources=[
+                    f"arn:aws:bedrock-agentcore:{stack.region}:{stack.account}:workload-identity-directory/default",
+                    f"arn:aws:bedrock-agentcore:{stack.region}:{stack.account}:workload-identity-directory/default/workload-identity/{runtimes}*",
+                ],
+            )
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                sid="Memory",
+                actions=[
+                    "bedrock-agentcore:CreateEvent",
+                    "bedrock-agentcore:GetEvent",
+                    "bedrock-agentcore:ListEvents",
+                    "bedrock-agentcore:ListSessions",
+                    "bedrock-agentcore:RetrieveMemoryRecords",
+                    "bedrock-agentcore:ListMemoryRecords",
+                    "bedrock-agentcore:GetMemoryRecord",
+                ],
+                resources=[memory_arn],
+            )
+        )
+        if profiles is None:
+            role.add_to_policy(bedrock_invoke_policy(self))
+        else:
+            # A tenant's runtime invokes Bedrock only through its own application profiles.
+            role.add_to_policy(
+                iam.PolicyStatement(
+                    sid="InvokeOwnProfiles",
+                    actions=[
+                        "bedrock:InvokeModel",
+                        "bedrock:InvokeModelWithResponseStream",
+                        "bedrock:Converse",
+                        "bedrock:ConverseStream",
+                    ],
+                    resources=profiles,
+                )
+            )
+            if profiles:
+                role.add_to_policy(
+                    iam.PolicyStatement(
+                        sid="ModelsThroughOwnProfiles",
+                        actions=["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+                        resources=[a for a in model_arns(self) if "application-" not in a],
+                        conditions={"StringEquals": {"bedrock:InferenceProfileArn": profiles}},
+                    )
+                )
+        for secret in secrets_read:
+            secret.grant_read(role)
+        role.add_to_policy(
+            iam.PolicyStatement(
+                sid="ApplyGuardrail",
+                actions=["bedrock:ApplyGuardrail"],
+                resources=[self.guardrail.attr_guardrail_arn],
+            )
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                sid="RetrievePolicies",
+                actions=["bedrock:Retrieve"],
+                resources=[
+                    f"arn:aws:bedrock:{stack.region}:{stack.account}:knowledge-base/{knowledge_base_id}"
+                ],
+            )
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                sid="InvokeOwnEndpoints",
+                actions=["sagemaker:InvokeEndpoint"],
+                resources=[
+                    f"arn:aws:sagemaker:{stack.region}:{stack.account}:endpoint/{prefix}-{owner}-*"
+                ],
+            )
+        )
+        return role

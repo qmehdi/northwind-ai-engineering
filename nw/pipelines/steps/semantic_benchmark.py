@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from nw.pipelines.steps import localize, write_result
+from nw.pipelines.steps import local_path, localize, write_result
 from nw.semantic.artifacts import newest_candidate
 from nw.semantic.benchmark import format_table
 from nw.semantic.benchmark import run as benchmark
@@ -44,10 +44,11 @@ def run(
     config: Any = None,
     tokenizer: Any = None,
 ) -> dict[str, Any]:
-    out = Path(out)
+    out = local_path(out)
     version = version or newest_candidate(out).name
     data = localize(data)
-    if triage is None or not (Path(triage) / "metadata.json").exists():
+    triage = local_path(triage) if triage else None
+    if triage is None or not (triage / "metadata.json").exists():
         triage = reference_triage(data, out / version / "benchmark_triage")
     results = benchmark(
         Path(triage),
@@ -81,11 +82,13 @@ def run(
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--out", type=Path, default=Path("artifacts/semantic"))
-    ap.add_argument("--version", default=None, help="artifact version; default is the newest")
-    ap.add_argument("--data", type=Path, default=Path("data/tickets.jsonl"))
     ap.add_argument(
-        "--triage", type=Path, default=None, help="a Project 1 artifact; default trains one"
+        "--out", default="artifacts/semantic", help="the artifact tree: a path or gs:// URI"
+    )
+    ap.add_argument("--version", default=None, help="artifact version; default is the newest")
+    ap.add_argument("--data", default="data/tickets.jsonl", help="a path, gs:// or s3:// URI")
+    ap.add_argument(
+        "--triage", default=None, help="a Project 1 artifact (path or URI); default trains one"
     )
     ap.add_argument("--n", type=int, default=None)
     ap.add_argument("--latency-n", type=int, default=100)

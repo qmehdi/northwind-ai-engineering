@@ -101,3 +101,11 @@ class Completion(BaseModel):
     model: str
     stop_reason: StopReason = StopReason.END_TURN
     raw_content: list[dict[str, Any]] | None = None
+    # What this completion cost, set by `LLMClient.complete` (the provider leaves it None).
+    # Excluded from dumps: a trajectory or a cache entry stores the answer, not the bill.
+    cost: Any = Field(default=None, exclude=True, repr=False)
+
+    @property
+    def cost_usd(self) -> float:
+        """This call's cost in USD, 0.0 when the client has not priced it."""
+        return float(getattr(self.cost, "cost_usd", 0.0) or 0.0)

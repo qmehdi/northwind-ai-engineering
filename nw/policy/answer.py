@@ -104,7 +104,7 @@ async def answer(
     min_score: float = 0.0,
     role: ModelRole = ModelRole.WORKHORSE,
 ) -> Answer:
-    raise NotImplementedError("Step 5: refuse when weak, answer, validate citations")
+    raise NotImplementedError("Answer: refuse when weak, answer, validate citations")
 
 
 def as_dict(a: Answer) -> dict[str, Any]:

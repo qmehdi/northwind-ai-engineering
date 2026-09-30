@@ -2,7 +2,8 @@
 
 Script it with a list of outcomes, one per call, or a callable that decides
 per call. An outcome is a string (returned as text), an exception (raised),
-or a Completion. The provider records the concurrency high-water mark so
+or a Completion. Every call yields to the event loop at least once, the way a
+network call does. The provider records the concurrency high-water mark so
 tests can prove the client's semaphore works.
 """
 
@@ -64,8 +65,10 @@ class FakeProvider:
         started = time.perf_counter()
         try:
             delay = self._delay(index) if callable(self._delay) else self._delay
-            if delay:
-                await asyncio.sleep(delay)
+            # Always yield, even with no delay: a real provider awaits the network, so other
+            # tasks run while a call is in flight. A fake that never yields hides every race
+            # that depends on that (a budget checked before the call, a slot held too long).
+            await asyncio.sleep(delay or 0)
             outcome = self._outcome(index, messages, kwargs)
         finally:
             self.in_flight -= 1

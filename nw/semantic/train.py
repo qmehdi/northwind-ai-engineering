@@ -31,7 +31,7 @@ import torch
 from sklearn.metrics import f1_score, recall_score
 from torch.utils.data import DataLoader
 
-from nw.semantic.artifacts import is_version_dir, newest_candidate
+from nw.semantic.artifacts import newest_candidate
 from nw.semantic.data import TAGS, load_rows, make_loader, stratified_subset
 from nw.semantic.model import (
     ModelSpec,
@@ -56,7 +56,7 @@ def loss_fn(
     """Multi-label BCE on tags plus weighted cross-entropy on priority. BCE treats each
     tag as its own yes/no question, which is what multi-label means; softmax would
     force the tags to compete."""
-    raise NotImplementedError("Step 4: BCE for tags, weighted CE for priority")
+    raise NotImplementedError("The loss: BCE for tags, weighted CE for priority")
 
 
 @torch.no_grad()
@@ -83,7 +83,7 @@ def predict(
 def tune_tag_thresholds(prob: np.ndarray, y: np.ndarray) -> np.ndarray:
     """One threshold per tag, chosen on validation for F1. A global 0.5 under-predicts
     rare tags; the per-label threshold is the cheapest large win in multi-label work."""
-    return np.full(prob.shape[1], 0.5, dtype=np.float32)  # Step 5: one threshold per tag
+    return np.full(prob.shape[1], 0.5, dtype=np.float32)  # per-tag thresholds
 
 
 def metrics(
@@ -125,7 +125,7 @@ def save_checkpoint(
 ) -> None:
     """Everything needed to resume: adapter and head weights, optimiser moments,
     scheduler position, where we were, and the best score so far."""
-    torch.save({"model": model.state_dict()}, path)  # Step 7: what else does resume need?
+    torch.save({"model": model.state_dict()}, path)  # resume: what else does it need?
 
 
 def load_checkpoint(
@@ -134,7 +134,9 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer | None = None,
     scheduler: Any = None,
 ) -> dict[str, Any]:
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    # weights_only: tensors and plain containers, never arbitrary pickled objects, so a
+    # checkpoint from a shared bucket cannot run code when it is resumed.
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
     missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
     if unexpected:
         raise ValueError(f"checkpoint has unexpected keys: {unexpected[:3]}")
@@ -169,6 +171,17 @@ def evaluate_rows(
             sub["p0_recall"] = None
         by_language[code] = {"n": int(m.sum()), **sub}
     out["by_language"] = by_language
+    # What the model predicts on these rows, the reference the service's drift monitor compares
+    # live predictions with (`predicted_share`, `predicted_tag_share` in the data profile).
+    prio_pred = prio_p.argmax(1)
+    tag_pred = tag_p >= thresholds
+    out["predicted_share"] = {
+        p: float((prio_pred == i).mean()) if len(prio_pred) else 0.0
+        for i, p in enumerate(PRIORITIES)
+    }
+    out["predicted_tag_share"] = {
+        t: float(tag_pred[:, i].mean()) if len(tag_pred) else 0.0 for i, t in enumerate(TAGS)
+    }
     return out
 
 
@@ -177,8 +190,18 @@ def find_checkpoint(path: Path) -> Path:
     which case the newest candidate's checkpoint is meant."""
     if path.is_file():
         return path
-    if is_version_dir(path) and (path / "checkpoint.pt").exists():
+    # A run stopped with Ctrl-C has a checkpoint but no metadata.json yet: a directory holding
+    # a checkpoint is the one to resume, finished or not.
+    if (path / "checkpoint.pt").exists():
         return path / "checkpoint.pt"
+    if path.is_dir():
+        runs = [
+            d
+            for d in path.iterdir()
+            if d.is_dir() and not d.is_symlink() and (d / "checkpoint.pt").exists()
+        ]
+        if runs:
+            return max(runs, key=lambda d: (d / "checkpoint.pt").stat().st_mtime) / "checkpoint.pt"
     return newest_candidate(path) / "checkpoint.pt"
 
 
@@ -294,7 +317,7 @@ def train(
     started = time.perf_counter()
     for epoch in range(start_epoch, epochs):
         model.train()
-        raise NotImplementedError("Step 4: the batch loop")
+        raise NotImplementedError("The training step: the batch loop")
         tag_p, prio_p, tag_y, prio_y = predict(model, val_loader, device)
         thresholds = tune_tag_thresholds(tag_p, tag_y)
         m = metrics(tag_p, prio_p, tag_y, prio_y, thresholds)
@@ -327,6 +350,16 @@ def train(
         )
         for split, split_rows in (("val", rows_val), ("test", rows_test))
     }
+    # The validation predictions become the drift monitor's reference; they stay out of the
+    # metrics so the model card and the gate read the same numbers as before.
+    for split in ("val", "test"):
+        shares = (
+            evaluation[split].pop("predicted_share"),
+            evaluation[split].pop("predicted_tag_share"),
+        )
+        if split == "val":
+            data_profile["predicted_share"], data_profile["predicted_tag_share"] = shares
+            data_profile["predicted_share_source"] = f"validation predictions of {version}"
     print(
         "test: "
         + json.dumps(

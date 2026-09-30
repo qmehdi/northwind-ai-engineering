@@ -1,7 +1,18 @@
-"""The model gateway: LiteLLM on ECS Fargate behind an ALB, after the AWS multi-provider
-generative AI gateway guidance (LiteLLM, RDS for virtual keys, ALB, Secrets Manager for the
-master key; the guidance's Redis cache and CloudFront are left out, they add nothing the course
-measures).
+"""The model gateway: LiteLLM on ECS Fargate behind an ALB and CloudFront, after the AWS
+multi-provider generative AI gateway guidance (LiteLLM, RDS for virtual keys, ALB, CloudFront,
+Secrets Manager for the master key; the guidance's Redis cache is left out).
+
+- HTTPS: learners call `https://<distribution>.cloudfront.net` (CloudFront's default
+  certificate, no domain needed). The ALB accepts traffic only from CloudFront's origin-facing
+  managed prefix list (`com.amazonaws.global.cloudfront.origin-facing`, looked up at deploy) and
+  forwards only requests carrying the secret `X-Origin-Verify` header CloudFront adds; every
+  other request gets 403. The CloudFront to ALB leg is HTTP inside AWS's network; an
+  organisation with a domain adds an ACM certificate to the ALB and sets the origin to HTTPS
+  only (README, "Networking"). Streaming works; the origin read timeout is 60 seconds, the
+  default quota's maximum.
+- The LiteLLM image is pinned by tag and digest, the same pin as the Local compose file.
+- `LITELLM_SALT_KEY` (encrypts the model credentials LiteLLM stores in its database) is a
+  generated secret, as the LiteLLM production checklist asks.
 
 - One application inference profile per tenant and role, copied from the course model, tagged
   `nw:tenant`: Bedrock reports cost and tokens per profile, so the cost line per learner comes
@@ -14,15 +25,21 @@ measures).
 - Virtual keys need Postgres: Aurora Serverless v2 with a 0 ACU floor pauses when idle. LiteLLM
   assembles `DATABASE_URL` from `DATABASE_HOST` (host:port), `DATABASE_USERNAME`,
   `DATABASE_PASSWORD` and `DATABASE_NAME` (litellm `proxy/utils.py`, read 2026-09-29).
-- Per-tenant virtual keys with a budget are created by `deploy/aws/scripts/gateway_keys.sh`
-  after the deploy (`POST /key/generate` with the master key), and stored in Secrets Manager as
-  `northwind-<tenant>-gateway-key`.
+- Per-tenant virtual keys with a budget are minted by `deploy/aws/scripts/gateway_keys.sh`
+  after the deploy (`POST /key/generate` with the master key) and written into the secrets
+  `northwind-<owner>-gateway-key`, which this stack owns, so `cdk destroy` and removing a tenant
+  delete them.
+- The application inference profiles copy from the system cross-region profile where the model
+  card requires one (`stacks/common.py`, `copy_from_arn`), and LiteLLM calls them through the
+  Converse route (`bedrock/converse/<profile arn>`), which is model-agnostic.
 """
 
 from __future__ import annotations
 
 from aws_cdk import CfnOutput, Duration, RemovalPolicy, Stack
 from aws_cdk import aws_bedrock as bedrock
+from aws_cdk import aws_cloudfront as cloudfront
+from aws_cdk import aws_cloudfront_origins as origins
 from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_ecs as ecs
 from aws_cdk import aws_ecs_patterns as ecs_patterns
@@ -34,12 +51,27 @@ from aws_cdk import aws_rds as rds
 from aws_cdk import aws_s3 as s3
 from aws_cdk import aws_s3_deployment as s3deploy
 from aws_cdk import aws_secretsmanager as sm
+from aws_cdk import custom_resources as cr
 from constructs import Construct
 
-from stacks.common import LIVE, MODEL_IDS, bedrock_invoke_policy
+from stacks.common import (
+    EU_MODEL_IDS,
+    EU_REGION,
+    GATEWAY_EU_PREFIX,
+    LIVE,
+    MODEL_IDS,
+    bedrock_invoke_policy,
+    copy_from_arn,
+)
 
-LITELLM_IMAGE = "ghcr.io/berriai/litellm:main-stable"
+# Tag and digest, the same pin as docker-compose.yml's `litellm` service (the Local track).
+LITELLM_IMAGE = (
+    "ghcr.io/berriai/litellm:v1.103.0"
+    "@sha256:bd089afdcd35b894b14a93f9743cdc8b591f82da1a38dd43a010a7b0c9de5fd7"
+)
 CONFIG_KEY = "gateway/litellm.yaml"
+ORIGIN_HEADER = "X-Origin-Verify"
+CLOUDFRONT_PREFIX_LIST = "com.amazonaws.global.cloudfront.origin-facing"
 
 
 class ModelGateway(Construct):
@@ -61,14 +93,14 @@ class ModelGateway(Construct):
         # ----- inference profiles: the cost line per tenant -----
         self.profiles: dict[tuple[str, str], bedrock.CfnApplicationInferenceProfile] = {}
         for owner in [*tenants, LIVE]:
-            for role, model_id in MODEL_IDS.items():
+            for role in MODEL_IDS:
                 self.profiles[(owner, role)] = bedrock.CfnApplicationInferenceProfile(
                     self,
                     f"Profile{owner.title()}{role.title()}",
                     inference_profile_name=f"{prefix}-{owner}-{role}",
                     description=f"{role} model for {owner}",
                     model_source=bedrock.CfnApplicationInferenceProfile.InferenceProfileModelSourceProperty(
-                        copy_from=f"arn:aws:bedrock:{stack.region}::foundation-model/{model_id}"
+                        copy_from=copy_from_arn(role, stack.region, stack.account)
                     ),
                     tags=[
                         {"key": "nw:tenant", "value": owner},
@@ -86,6 +118,34 @@ class ModelGateway(Construct):
             ),
             removal_policy=RemovalPolicy.DESTROY,
         )
+        self.salt_key = sm.Secret(
+            self,
+            "SaltKey",
+            description=f"{prefix} model gateway salt key (LITELLM_SALT_KEY); never rotate once keys exist",
+            generate_secret_string=sm.SecretStringGenerator(
+                exclude_punctuation=True, password_length=48
+            ),
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+        self.origin_secret = sm.Secret(
+            self,
+            "OriginSecret",
+            description=f"{prefix} header value CloudFront adds and the gateway ALB requires",
+            generate_secret_string=sm.SecretStringGenerator(
+                exclude_punctuation=True, password_length=40
+            ),
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+        # The virtual key secrets, one per owner, filled by gateway_keys.sh.
+        self.key_secrets: dict[str, sm.Secret] = {}
+        for owner in tenants:
+            self.key_secrets[owner] = sm.Secret(
+                self,
+                f"GatewayKey{owner.title()}",
+                secret_name=f"{prefix}-{owner}-gateway-key",
+                description=f"{prefix} model gateway virtual key for {owner} (filled by gateway_keys.sh)",
+                removal_policy=RemovalPolicy.DESTROY,
+            )
         self.db = rds.DatabaseCluster(
             self,
             "KeysDb",
@@ -139,6 +199,7 @@ class ModelGateway(Construct):
             memory_limit_mib=1024,
             desired_count=1,
             public_load_balancer=True,
+            open_listener=False,
             assign_public_ip=True,
             task_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC),
             runtime_platform=ecs.RuntimePlatform(
@@ -158,9 +219,11 @@ class ModelGateway(Construct):
                     "AWS_REGION_NAME": stack.region,
                     "LITELLM_LOG": "INFO",
                     "STORE_MODEL_IN_DB": "False",
+                    "LITELLM_LOCAL_MODEL_COST_MAP": "True",
                 },
                 secrets={
                     "LITELLM_MASTER_KEY": ecs.Secret.from_secrets_manager(self.master_key),
+                    "LITELLM_SALT_KEY": ecs.Secret.from_secrets_manager(self.salt_key),
                     "DATABASE_USERNAME": ecs.Secret.from_secrets_manager(db_secret, "username"),
                     "DATABASE_PASSWORD": ecs.Secret.from_secrets_manager(db_secret, "password"),
                 },
@@ -187,12 +250,32 @@ class ModelGateway(Construct):
             lines += [
                 f"  - model_name: {name}",
                 "    litellm_params:",
-                f"      model: bedrock/{profile.attr_inference_profile_arn}",
+                f"      model: bedrock/converse/{profile.attr_inference_profile_arn}",
                 f"      aws_region_name: {stack.region}",
                 "    model_info:",
                 f"      nw_tenant: {owner}",
                 f"      nw_role: {role}",
             ]
+        # The EU residency route (`nw/config.py` EU_MODELS): the same roles, invoked in the EU
+        # region by model or EU geo profile id. Cost per tenant still shows in the gateway's
+        # spend logs; Bedrock's per-profile metrics cover the default route only.
+        for owner in [*tenants, LIVE]:
+            for role, model_id in EU_MODEL_IDS.items():
+                name = (
+                    f"{GATEWAY_EU_PREFIX}{role}"
+                    if owner == LIVE
+                    else f"{GATEWAY_EU_PREFIX}{owner}/{role}"
+                )
+                lines += [
+                    f"  - model_name: {name}",
+                    "    litellm_params:",
+                    f"      model: bedrock/converse/{model_id}",
+                    f"      aws_region_name: {EU_REGION}",
+                    "    model_info:",
+                    f"      nw_tenant: {owner}",
+                    f"      nw_role: {role}",
+                    "      nw_residency: eu",
+                ]
         lines += [
             "litellm_settings:",
             "  drop_params: true",
@@ -210,7 +293,8 @@ class ModelGateway(Construct):
         )
         self.service.service.node.add_dependency(self.config)
 
-        self.url = f"http://{self.service.load_balancer.load_balancer_dns_name}"
+        self._front(prefix, logs_bucket)
+        self.url = f"https://{self.distribution.distribution_domain_name}"
         CfnOutput(self, "OutGatewayUrl", value=self.url).override_logical_id("GatewayUrl")
         CfnOutput(
             self, "OutGatewayMasterKeyArn", value=self.master_key.secret_arn
@@ -223,6 +307,86 @@ class ModelGateway(Construct):
             ),
         ).override_logical_id("InferenceProfiles")
 
+    def _front(self, prefix: str, logs_bucket: s3.IBucket) -> None:
+        """CloudFront in front, the ALB open only to CloudFront and only with the header."""
+        lookup = cr.AwsCustomResource(
+            self,
+            "CloudFrontPrefixList",
+            on_create=cr.AwsSdkCall(
+                service="EC2",
+                action="describeManagedPrefixLists",
+                parameters={
+                    "Filters": [{"Name": "prefix-list-name", "Values": [CLOUDFRONT_PREFIX_LIST]}]
+                },
+                physical_resource_id=cr.PhysicalResourceId.of(f"{prefix}-{CLOUDFRONT_PREFIX_LIST}"),
+                output_paths=["PrefixLists.0.PrefixListId"],
+            ),
+            policy=cr.AwsCustomResourcePolicy.from_statements(
+                [iam.PolicyStatement(actions=["ec2:DescribeManagedPrefixLists"], resources=["*"])]
+            ),
+            install_latest_aws_sdk=False,
+        )
+        prefix_list = lookup.get_response_field("PrefixLists.0.PrefixListId")
+        alb_sg = self.service.load_balancer.connections.security_groups[0]
+        alb_sg.add_ingress_rule(
+            ec2.Peer.prefix_list(prefix_list), ec2.Port.tcp(80), "CloudFront origin-facing only"
+        )
+        header_value = self.origin_secret.secret_value.unsafe_unwrap()  # a dynamic reference
+        listener = self.service.listener
+        listener.add_action(
+            "FromCloudFront",
+            priority=1,
+            conditions=[elbv2.ListenerCondition.http_header(ORIGIN_HEADER, [header_value])],
+            action=elbv2.ListenerAction.forward([self.service.target_group]),
+        )
+        cfn_listener = listener.node.default_child
+        assert isinstance(cfn_listener, elbv2.CfnListener)
+        cfn_listener.add_property_override(
+            "DefaultActions",
+            [
+                {
+                    "Type": "fixed-response",
+                    "FixedResponseConfig": {
+                        "StatusCode": "403",
+                        "ContentType": "text/plain",
+                        "MessageBody": "forbidden",
+                    },
+                }
+            ],
+        )
+        self.distribution = cloudfront.Distribution(
+            self,
+            "Distribution",
+            comment=f"{prefix} model gateway (HTTPS)",
+            default_behavior=cloudfront.BehaviorOptions(
+                origin=origins.LoadBalancerV2Origin(
+                    self.service.load_balancer,
+                    protocol_policy=cloudfront.OriginProtocolPolicy.HTTP_ONLY,
+                    origin_ssl_protocols=[cloudfront.OriginSslPolicy.TLS_V1_2],
+                    http_port=80,
+                    read_timeout=Duration.seconds(60),
+                    keepalive_timeout=Duration.seconds(60),
+                    custom_headers={ORIGIN_HEADER: header_value},
+                ),
+                viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.HTTPS_ONLY,
+                allowed_methods=cloudfront.AllowedMethods.ALLOW_ALL,
+                cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
+                origin_request_policy=cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
+            ),
+            price_class=cloudfront.PriceClass.PRICE_CLASS_100,
+            enable_logging=True,
+            log_bucket=logs_bucket,
+            log_file_prefix="gateway-cloudfront/",
+            http_version=cloudfront.HttpVersion.HTTP2_AND_3,
+        )
+        CfnOutput(
+            self, "OutGatewayOrigin", value=self.service.load_balancer.load_balancer_dns_name
+        ).override_logical_id("GatewayOrigin")
+
+    @property
+    def domain(self) -> str:
+        return self.distribution.distribution_domain_name
+
     @property
     def alb(self) -> elbv2.IApplicationLoadBalancer:
         return self.service.load_balancer
@@ -230,3 +394,6 @@ class ModelGateway(Construct):
     def grant_use(self, grantee: iam.IGrantable) -> None:
         """Read the master key: the key bootstrap script and the delivery deployer."""
         self.master_key.grant_read(grantee)
+
+    def key_secret(self, owner: str) -> sm.ISecret:
+        return self.key_secrets[owner]

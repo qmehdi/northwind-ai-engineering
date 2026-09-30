@@ -61,7 +61,7 @@ def test_train_step_is_the_course_training_run(trained_step):
 
 def test_evaluate_passes_a_first_model_and_records_the_decision(trained_step, tmp_path):
     out, _, train = trained_step
-    result = triage_evaluate.run(out, train["version"], production_summary=tmp_path / "none.json")
+    result = triage_evaluate.run(out, train["version"], production_summary="none")
     assert result["passed"] and result["passed_int"] == 1 and result["production"] is None
     assert result["reason"] == "all bars cleared"
     assert read_result(out, "triage_evaluate")["candidate"] == train["version"]
@@ -95,14 +95,14 @@ def test_evaluate_blocks_on_a_moved_test_split_and_on_the_bars(trained_step, tmp
     strict = triage_evaluate.run(
         out,
         train["version"],
-        production_summary=tmp_path / "none.json",
+        production_summary="none",
         policy=GatePolicy(min_p0_recall=1.01),
     )
     assert not strict["passed"] and "P0 recall" in strict["reason"]
     forced = triage_evaluate.run(
         out,
         train["version"],
-        production_summary=tmp_path / "none.json",
+        production_summary="none",
         policy=GatePolicy(min_p0_recall=1.01),
         force=True,
     )
@@ -146,14 +146,14 @@ def test_register_uses_the_registry_only_after_a_passed_gate(
     triage_evaluate.run(
         out,
         train["version"],
-        production_summary=tmp_path / "none.json",
+        production_summary="none",
         policy=GatePolicy(min_p0_recall=1.01),
     )
     with pytest.raises(SystemExit, match="gate failed"):
         register_step.run(out, None, pipeline="triage", registry=registry, tenant=tenant)
     assert registry.versions(tenant, "triage") == []
 
-    triage_evaluate.run(out, train["version"], production_summary=tmp_path / "none.json")
+    triage_evaluate.run(out, train["version"], production_summary="none")
     result = register_step.run(out, None, pipeline="triage", registry=registry, tenant=tenant)
     assert result["version"] == train["version"] and result["tenant"] == "northwind-alice"
     versions = registry.versions(tenant, "triage")
@@ -170,7 +170,7 @@ def test_register_uses_the_registry_only_after_a_passed_gate(
 
 def test_register_cli_takes_the_registry_from_the_environment(trained_step, tmp_path, monkeypatch):
     out, _, train = trained_step
-    triage_evaluate.run(out, train["version"], production_summary=tmp_path / "none.json")
+    triage_evaluate.run(out, train["version"], production_summary="none")
     monkeypatch.setenv("NW_PIPELINE_REGISTRY", "tests.pipelines.fake_registry:build")
     monkeypatch.setenv("NW_FAKE_REGISTRY_DIR", str(tmp_path / "registry"))
     args = ["--pipeline", "triage", "--out", str(out), "--tenant", "bob", "--environment", "dev"]
@@ -178,3 +178,92 @@ def test_register_cli_takes_the_registry_from_the_environment(trained_step, tmp_
     records = json.loads((tmp_path / "registry" / "dev-bob-triage.json").read_text())
     assert "schedule" in json.dumps(records), "a scheduled run is told apart on the version"
     assert read_result(out, "register")["tenant"] == "dev-bob"
+
+
+# ----- URIs as strings, explicit summaries, the registry's champion, lineage tags ------------
+
+
+def test_a_named_production_summary_that_is_missing_fails_the_gate(trained_step, tmp_path):
+    out, _, train = trained_step
+    with pytest.raises(SystemExit, match="not found"):
+        triage_evaluate.run(out, train["version"], production_summary=tmp_path / "gone.json")
+    first = triage_evaluate.run(out, train["version"], production_summary="none")
+    assert first["production"] is None and first["champion_source"] == "none"
+
+
+def test_gs_uris_survive_the_step_command_line(trained_step):
+    """`type=Path` turned `gs://b/k` into `gs:/b/k`, which never mapped to the /gcs mount and
+    turned the regression bars off; the CLI keeps the string and maps it to /gcs/b/k."""
+    from nw.pipelines.steps import local_path, localize
+
+    out, _, train = trained_step
+    args = ["--out", str(out), "--version", train["version"]]
+    uri = "gs://nw-artifacts/baselines/triage_production.json"
+    with pytest.raises(SystemExit, match="/gcs/nw-artifacts/baselines/triage_production.json"):
+        triage_evaluate.main([*args, "--production-summary", uri])
+    assert local_path("gs://b/runs/x") == Path("/gcs/b/runs/x")
+    assert localize("gs://b/tickets.jsonl") == Path("/gcs/b/tickets.jsonl")
+    with pytest.raises(SystemExit, match="mangled"):
+        local_path("gs:/b/k")
+
+
+def _as_live(registry, tenant, out, version, tmp_path, data_sha="000000000000"):
+    import shutil
+
+    art = tmp_path / "live-artifact"
+    shutil.copytree(out / version, art)
+    meta = json.loads((art / "metadata.json").read_text())
+    meta["version"], meta["data_sha256_12"] = "older-live", data_sha
+    (art / "metadata.json").write_text(json.dumps(meta))
+    v = registry.register(tenant, "triage", art, {}, {"source": "pipeline"})
+    registry.set_stage(tenant, "triage", v.version, Stage.LIVE, "served")
+    return v
+
+
+def test_the_champion_is_the_registrys_live_version(trained_step, tmp_path, registry, tenant):
+    out, _, train = trained_step
+    nothing = triage_evaluate.run(
+        out,
+        train["version"],
+        production_summary="none",
+        champion="registry",
+        registry=registry,
+        tenant=tenant,
+    )
+    assert nothing["passed"] and "nothing live" in nothing["champion_source"]
+    live = _as_live(registry, tenant, out, train["version"], tmp_path)
+    moved = triage_evaluate.run(
+        out,
+        train["version"],
+        production_summary="none",
+        champion="registry",
+        registry=registry,
+        tenant=tenant,
+    )
+    assert moved["champion_source"] == f"registry:{live.version}"
+    assert moved["production"] == "older-live" and "test split changed" in moved["reason"]
+
+
+def test_register_tags_the_pipeline_source_and_the_lineage(
+    trained_step, tmp_path, registry, tenant, monkeypatch
+):
+    out, _, train = trained_step
+    meta_path = out / train["version"] / "metadata.json"
+    meta = json.loads(meta_path.read_text())
+    original = dict(meta)
+    meta["git_sha"] = "nogit"  # what a container without .git wrote
+    meta_path.write_text(json.dumps(meta))
+    monkeypatch.setenv("NW_GIT_SHA", "abc123def456")
+    monkeypatch.setenv("NW_IMAGE_DIGEST", "sha256:feedface")
+    monkeypatch.setenv("NW_SOURCE_SHA256_12", "0123456789ab")
+    try:
+        triage_evaluate.run(out, train["version"], production_summary="none")
+        register_step.run(out, None, pipeline="triage", registry=registry, tenant=tenant)
+    finally:
+        meta_path.write_text(json.dumps(original))
+    tags = registry.versions(tenant, "triage")[-1].tags
+    assert tags["source"] == "pipeline" and tags["git_sha"] == "abc123def456"
+    assert tags["image_digest"] == "sha256:feedface"
+    assert tags["source_sha256_12"] == "0123456789ab"
+    assert len(tags["uv_lock_sha256_12"]) == 12
+    assert tags["champion"] == "none"

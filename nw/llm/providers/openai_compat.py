@@ -24,13 +24,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
 
-from nw.llm.errors import ContentFilteredError, RequestTimeout, RetryableError, TerminalError
+from nw.llm.errors import (
+    RETRYABLE_STATUS,
+    ContentFilteredError,
+    RequestTimeout,
+    RetryableError,
+    TerminalError,
+)
 from nw.llm.types import Completion, Message, StopReason, ToolCall, ToolSpec, Usage
 
 TokenSource = Callable[[], Awaitable[str | None]]
@@ -42,8 +49,6 @@ _STOP = {
     "length": StopReason.MAX_TOKENS,
     "content_filter": StopReason.REFUSAL,
 }
-
-_RETRYABLE_STATUS = {408, 409, 425, 429}
 
 
 def to_vendor_messages(messages: list[Message], *, system: str | None) -> list[dict[str, Any]]:
@@ -197,11 +202,11 @@ def classify_response(response: httpx.Response) -> RetryableError | TerminalErro
     status = response.status_code
     request_id = response.headers.get("x-request-id")
     message = f"HTTP {status}: {_error_message(response)}"
-    if status in _RETRYABLE_STATUS or status >= 500:
+    if status in RETRYABLE_STATUS or status >= 500:
         return RetryableError(
             message, request_id=request_id, retry_after_s=_retry_after(response), status=status
         )
-    return TerminalError(message, request_id=request_id, status=status)
+    return TerminalError(message, request_id=request_id, status=status, code=_error_code(response))
 
 
 def classify_transport(exc: Exception, *, timeout_s: float) -> RetryableError | TerminalError:
@@ -223,6 +228,32 @@ def _error_message(response: httpx.Response) -> str:
     if error:
         return str(error)
     return response.text[:200]
+
+
+def _error_code(response: httpx.Response) -> str | None:
+    """The vendor's error code from the body: OpenAI and LiteLLM send `error.code`
+    (`model_not_found`), Azure `error.code` (`DeploymentNotFound`), Google a list whose first
+    item carries `error.status` (`NOT_FOUND`)."""
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    if isinstance(payload, list) and payload:
+        payload = payload[0]
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, dict):
+        return None
+    # LiteLLM answers a model name it has no route for with 400, code "400" and type
+    # `invalid_request_error`; only the message says so. That is a missing model, what a
+    # fallback is for, not a malformed request.
+    message = str(error.get("message") or "")
+    if "Invalid model name" in message or "no healthy deployments" in message.lower():
+        return "model_not_found"
+    for field in ("code", "status", "type"):
+        value = error.get(field)
+        if isinstance(value, str) and value:
+            return value
+    return None
 
 
 def _retry_after(response: httpx.Response) -> float | None:
@@ -370,16 +401,20 @@ class GoogleTokenSource:
 
     def __init__(self) -> None:
         self._credentials: Any | None = None
+        # Calls run in worker threads; without the lock eight concurrent calls at expiry
+        # would refresh eight times against the metadata server.
+        self._lock = threading.Lock()
 
     def _token(self) -> str:
         import google.auth
         from google.auth.transport.requests import Request
 
-        if self._credentials is None:
-            self._credentials, _ = google.auth.default(scopes=list(self._SCOPES))
-        if not self._credentials.valid:
-            self._credentials.refresh(Request())
-        return self._credentials.token
+        with self._lock:
+            if self._credentials is None:
+                self._credentials, _ = google.auth.default(scopes=list(self._SCOPES))
+            if not self._credentials.valid:
+                self._credentials.refresh(Request())
+            return self._credentials.token
 
     async def __call__(self) -> str:
         return await asyncio.to_thread(self._token)

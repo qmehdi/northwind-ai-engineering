@@ -1,4 +1,6 @@
-"""One real model call on the configured track. Session 1, Step 8. Spends a fraction of a cent."""
+"""One real model call on the configured track (the first part, step 8).
+
+Spends a fraction of a cent."""
 
 import asyncio
 

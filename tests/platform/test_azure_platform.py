@@ -48,27 +48,54 @@ class Poller:
 # ----- fakes: blob --------------------------------------------------------------------------
 
 
+class ResourceModifiedError(Exception):
+    """Named like azure.core's: an etag precondition failed."""
+
+
+class ResourceExistsError(Exception):
+    """Named like azure.core's: `overwrite=False` on a blob that exists."""
+
+
 class FakeBlob:
-    def __init__(self, store: dict[str, str], name: str) -> None:
-        self.store, self.name = store, name
+    """A blob with an etag per write, honouring `match_condition` and `overwrite=False` the
+    way Blob Storage does, so the read-modify-write documents are tested for lost updates."""
+
+    def __init__(self, store: dict[str, str], etags: dict[str, int], name: str) -> None:
+        self.store, self.etags, self.name = store, etags, name
 
     def exists(self) -> bool:
         return self.name in self.store
 
     def download_blob(self) -> Any:
-        return SimpleNamespace(readall=lambda: self.store[self.name].encode("utf-8"))
+        text, etag = self.store[self.name], str(self.etags.get(self.name, 0))
+        return SimpleNamespace(
+            readall=lambda: text.encode("utf-8"), properties=SimpleNamespace(etag=etag)
+        )
 
-    def upload_blob(self, data: bytes, overwrite: bool = False, **kw: Any) -> None:
-        assert overwrite
-        self.store[self.name] = data.decode("utf-8")
+    def upload_blob(
+        self, data: bytes, overwrite: bool = False, etag: str | None = None, **kw: Any
+    ) -> None:
+        if not overwrite and self.name in self.store:
+            raise ResourceExistsError(self.name)
+        if etag is not None and kw.get("match_condition") is not None:
+            if str(self.etags.get(self.name, 0)) != etag:
+                raise ResourceModifiedError(self.name)
+        try:
+            self.store[self.name] = data.decode("utf-8")
+        except UnicodeDecodeError:  # a binary blob (the source bundle) is kept as bytes
+            self.store[self.name] = data  # type: ignore[assignment]
+        self.etags[self.name] = self.etags.get(self.name, 0) + 1
 
 
 class FakeBlobService:
     def __init__(self) -> None:
         self.containers: dict[str, dict[str, str]] = {}
+        self.etags: dict[str, dict[str, int]] = {}
 
     def get_blob_client(self, container: str, blob: str) -> FakeBlob:
-        return FakeBlob(self.containers.setdefault(container, {}), blob)
+        return FakeBlob(
+            self.containers.setdefault(container, {}), self.etags.setdefault(container, {}), blob
+        )
 
 
 # ----- fakes: Azure ML ----------------------------------------------------------------------
@@ -325,7 +352,15 @@ OUTPUTS = {
     "NW_AZURE_CONTAINERAPPS_ENV": "northwind-cae",
     "NW_AZURE_RAI_POLICY": "northwind-guardrail",
     "NW_AZURE_PIPELINE_IDENTITY_CLIENT_ID": "11111111-2222-3333-4444-555555555555",
+    "NW_AZURE_SIGNING_KEY": "northwind-image-signing",
 }
+
+VERIFIED: list[tuple[str, str]] = []
+
+
+def fake_verifier(image: str, key: str) -> None:
+    """Stands in for `cosign verify`: records what would be checked."""
+    VERIFIED.append((image, key))
 
 
 def _settings() -> Settings:
@@ -374,7 +409,9 @@ def platform(cfg, clients) -> azure.AzurePlatform:
     from unittest.mock import patch
 
     with patch.object(azure.AzureConfig, "from_settings", return_value=cfg):
-        return azure.build(_settings(), clients)
+        built = azure.build(_settings(), clients)
+    built.endpoints.verifier = fake_verifier
+    return built
 
 
 def _artifact(tmp_path: Path) -> Path:
@@ -592,6 +629,84 @@ def test_live_rollback_removes_the_canary(platform, fakes, cfg):
     assert fakes.ml.online_deployments.deleted == [(name, "green")]
 
 
+def test_promote_after_a_full_cutover_keeps_the_new_colour(platform, fakes, cfg):
+    """100/0: the new colour already holds everything. Guessing by traffic would call the old
+    colour the canary, move traffic back to it and delete the new one (audit 01 H9)."""
+    live = Tenant("live", "northwind")
+    name = f"nw-live-triage-{cfg.scope}"
+    platform.endpoints.deploy(live, _version("1"), live=True)
+    platform.endpoints.deploy(live, _version("2"), live=True, canary_percent=10)
+    platform.endpoints.set_traffic(live, "triage", {"green": 100, "blue": 0})
+    assert platform.endpoints.promote(live, "triage") == "green"
+    endpoint = fakes.ml.online_endpoints.store[name]
+    assert endpoint.traffic == {"green": 100, "blue": 0}
+    assert fakes.ml.online_deployments.deleted == [(name, "blue")]
+    assert endpoint.tags[azure.STABLE_TAG] == "green" and endpoint.tags[azure.CANARY_TAG] == ""
+    with pytest.raises(KeyError, match="no canary"):
+        platform.endpoints.promote(live, "triage")
+    # the next canary goes on the colour that is not stable: blue again
+    platform.endpoints.deploy(live, _version("3"), live=True, canary_percent=10)
+    assert fakes.ml.online_endpoints.store[name].traffic == {"blue": 10, "green": 90}
+
+
+@pytest.mark.parametrize("action", ["promote", "rollback"])
+def test_promote_and_rollback_at_fifty_fifty_know_the_colours(platform, fakes, cfg, action):
+    """50/50: min and max traffic are the same colour; the tags decide, and the endpoint never
+    ends at 0 percent everywhere."""
+    live = Tenant("live", "northwind")
+    name = f"nw-live-triage-{cfg.scope}"
+    platform.endpoints.deploy(live, _version("1"), live=True)
+    platform.endpoints.deploy(live, _version("2"), live=True, canary_percent=50)
+    assert fakes.ml.online_endpoints.store[name].traffic == {"green": 50, "blue": 50}
+    kept = getattr(platform.endpoints, action)(live, "triage")
+    expected, removed = ("green", "blue") if action == "promote" else ("blue", "green")
+    assert kept == expected
+    traffic = fakes.ml.online_endpoints.store[name].traffic
+    assert traffic[expected] == 100 and sum(traffic.values()) == 100
+    assert fakes.ml.online_deployments.deleted == [(name, removed)]
+
+
+def test_a_full_deploy_replaces_the_old_colour(platform, fakes, cfg):
+    live = Tenant("live", "northwind")
+    name = f"nw-live-triage-{cfg.scope}"
+    platform.endpoints.deploy(live, _version("1"), live=True)
+    platform.endpoints.deploy(live, _version("2"), live=True)
+    assert fakes.ml.online_endpoints.store[name].traffic == {"green": 100, "blue": 0}
+    assert fakes.ml.online_deployments.deleted == [(name, "blue")]
+
+
+def test_shared_documents_do_not_lose_concurrent_updates(platform, fakes, tenant):
+    """Two writers read the agent registry, both write: the etag makes the second retry on
+    the fresh document instead of overwriting the first (audit 01, lost updates)."""
+    docs = azure.Documents(platform.agents.clients, "artifacts")
+    docs.write("agents/agents.json", {"agents": []})
+    real = docs.update_text
+    raced = {"done": False}
+
+    def racing(path, mutate, content_type):
+        def interleaved(text):
+            if not raced["done"]:
+                raced["done"] = True
+                # another tenant lands between our read and our write
+                other = azure.Documents(platform.agents.clients, "artifacts")
+                other.update("agents/agents.json", lambda d: {**d, "agents": ["bob"]}, {})
+            return mutate(text)
+
+        return real(path, interleaved, content_type)
+
+    docs.update_text = racing  # type: ignore[method-assign]
+    docs.update("agents/agents.json", lambda d: {**d, "agents": [*d["agents"], "alice"]}, {})
+    final = json.loads(fakes.blob.containers["artifacts"]["agents/agents.json"])
+    assert final["agents"] == ["bob", "alice"]
+
+
+def test_logs_never_block_on_a_running_job(platform, fakes, tenant):
+    fakes.ml.jobs.states = ["Running"]
+    run = platform.pipelines.submit(tenant, "triage", {})
+    lines = list(platform.pipelines.logs(tenant, run))
+    assert "running" in lines[0] and lines[1].startswith("https://")
+
+
 def test_live_deployments_collect_inputs_and_outputs_for_monitoring(platform, fakes, tenant, cfg):
     from azure.ai.ml.entities import DataCollector
 
@@ -620,7 +735,7 @@ def test_tenant_data_collection_is_opt_in(fakes, clients, tenant):
         outputs=OUTPUTS,
     )
     assert opted.tenant_data_collection and opted.data_sampling_rate == 0.25
-    endpoints = azure.AzureMLEndpointClient(opted, clients)
+    endpoints = azure.AzureMLEndpointClient(opted, clients, verifier=fake_verifier)
     endpoints.deploy(tenant, _version())
     d = fakes.ml.online_deployments.store[(f"nw-alice-triage-{opted.scope}", "blue")]
     assert set(d.data_collector.collections) >= {"model_inputs", "model_outputs"}
@@ -733,7 +848,10 @@ def test_search_is_hybrid_and_uses_integrated_vectorization(platform, fakes, ten
     q = fakes.search.queries[-1]
     assert q["search_text"] == "refund window" and q["top"] == 3
     assert isinstance(q["vector_queries"][0], VectorizableTextQuery)
-    assert hits[0].id == "a" and hits[0].metadata == {"k": 1} and hits[0].score == 0.03
+    assert hits[0].id == "a" and hits[0].metadata["k"] == 1
+    # the fused RRF score (0.016 to 0.033) is put on the contract's 0 to 1 scale
+    assert hits[0].metadata["raw_score"] == 0.03 and hits[0].metadata["score_kind"] == "rrf"
+    assert hits[0].score == pytest.approx(0.03 / azure.RRF_MAX) and 0.9 < hits[0].score <= 1.0
     platform.vectors.search(tenant, "policies", "q", vector=[0.3, 0.4])
     assert isinstance(fakes.search.queries[-1]["vector_queries"][0], VectorizedQuery)
     assert platform.vectors.count(tenant, "policies") == 1
@@ -829,3 +947,72 @@ def test_deploy_gives_the_agent_the_apim_route_not_a_litellm_url(platform, fakes
     assert env["NW_AZURE_APIM_GATEWAY_URL"] == "https://northwind-apim.azure-api.net"
     assert env["NW_AZURE_FOUNDRY_ENDPOINT"] == "https://northwind-foundry.services.ai.azure.com"
     assert env["NW_GATEWAY_KEY"] == "sub" and "NW_GATEWAY_URL" not in env
+
+
+def test_submit_ships_the_learners_code_with_the_job(platform, fakes, tenant, tmp_path):
+    """The steps run the checkout's nw/, not the image's (audit 04 C1)."""
+    from nw.pipelines.source import build_bundle
+
+    bundle = build_bundle(Path(__file__).resolve().parents[2], tmp_path)
+    platform.pipelines.bundler = lambda: bundle
+    platform.pipelines.submit(tenant, "triage", {})
+    job, _ = fakes.ml.jobs.created[-1]
+    d = job._to_dict()
+    assert d["inputs"]["source_uri"]["path"].endswith(bundle.name)
+    train = d["jobs"]["train"]
+    assert train["inputs"]["source"]["path"] == "${{parent.inputs.source_uri}}"
+    assert "nw.pipelines.source run" in train["component"]["command"]
+    # the weekly retrain schedule runs the last submitted code: <prefix>/source/latest.tar.gz
+    latest = fakes.blob.containers["artifacts"][f"{tenant.prefix}/source/latest.tar.gz"]
+    assert latest == bundle.path.read_bytes()
+    # building the job alone (the pipeline-definition CLI) ships nothing
+    assert "source_uri" not in platform.pipelines.job(tenant, "triage", {})._to_dict()["inputs"]
+
+
+def test_every_deployment_verifies_the_image_signature_first(platform, fakes, tenant, cfg):
+    VERIFIED.clear()
+    platform.endpoints.deploy(tenant, _version())
+    assert VERIFIED == [
+        (
+            "nwnorthwindacrx7k2q9.azurecr.io/nw-triage:latest",
+            "azurekms://nwnorthwindkvx7k2q9.vault.azure.net/northwind-image-signing",
+        )
+    ]
+
+    def reject(image: str, key: str) -> None:
+        raise RuntimeError(f"{image} failed signature verification")
+
+    platform.endpoints.verifier = reject
+    before = dict(fakes.ml.online_deployments.store)
+    with pytest.raises(RuntimeError, match="signature"):
+        platform.endpoints.deploy(tenant, _version("4"))
+    assert fakes.ml.online_deployments.store == before, "nothing deployed"
+
+
+def test_unsigned_is_refused_without_a_key_and_skipped_only_on_request(
+    fakes, clients, tenant, monkeypatch
+):
+    bare = azure.AzureConfig.from_settings(
+        _settings(), env={}, outputs={**OUTPUTS, "NW_AZURE_SIGNING_KEY": ""}
+    )
+    endpoints = azure.AzureMLEndpointClient(bare, clients, verifier=fake_verifier)
+    monkeypatch.delenv("NW_ALLOW_UNSIGNED", raising=False)
+    with pytest.raises(ValueError, match="NW_ALLOW_UNSIGNED"):
+        endpoints.deploy(tenant, _version())
+    monkeypatch.setenv("NW_ALLOW_UNSIGNED", "1")
+    assert endpoints.deploy(tenant, _version()).endswith("/score")
+
+
+def test_a_tenant_promoting_the_live_endpoint_is_told_who_may(platform, fakes, cfg):
+    class Forbidden(Exception):
+        status_code = 403
+
+    def denied(*a, **k):
+        raise Forbidden("AuthorizationFailed: does not have authorization")
+
+    fakes.ml.online_endpoints.get = denied
+    alice = Tenant("alice", "northwind")
+    with pytest.raises(PermissionError, match="live identity or the instructor"):
+        platform.endpoints.promote(alice, "triage")
+    with pytest.raises(PermissionError, match="alice deploys to its own endpoint"):
+        platform.endpoints.deploy(alice, _version(), live=True)

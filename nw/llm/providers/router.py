@@ -61,6 +61,21 @@ class RoleRouter:
             temperature=temperature,
         )
 
+    async def aclose(self) -> None:
+        await close_all(self.providers)
+
+
+async def close_all(providers: list[LLMProvider]) -> None:
+    """`aclose()` on every provider that has one, each once."""
+    seen: list[int] = []
+    for p in providers:
+        if id(p) in seen:
+            continue
+        seen.append(id(p))
+        close = getattr(p, "aclose", None)
+        if close is not None:
+            await close()
+
 
 def describe(provider: LLMProvider) -> str:
     endpoint = getattr(provider, "endpoint", None)

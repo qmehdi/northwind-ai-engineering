@@ -55,9 +55,10 @@ agents-aws = [
     "strands-agents>=1.0",
     "strands-agents-tools>=0.2",
     "boto3>=1.35",
-    # 0.19+ pins opentelemetry-sdk 1.44, which google-adk 2.x caps at 1.42.1; 0.18 is the
-    # newest ADOT release the two tracks can share in one lock. Revisit when ADK moves.
-    "aws-opentelemetry-distro>=0.18,<0.19",
+    # 0.17 (opentelemetry-sdk 1.40) is the ADOT release the AWS, Google Cloud and Azure tracks
+    # can share in one lock: 0.19+ pins SDK 1.44 past google-adk 2.x's cap (1.42.1), and 0.18's
+    # SDK 1.42.1 matches no Azure Monitor exporter build. Revisit when ADK moves.
+    "aws-opentelemetry-distro>=0.17.1,<0.18",
     "opentelemetry-sdk-extension-aws>=2.1",
     "opentelemetry-propagator-aws-xray>=1.0",
 ]
@@ -98,17 +99,15 @@ dev = [
 # nw/platform/azure.py and nw/pipelines/azureml (ADR 0013): the Azure ML registry, pipelines and
 # online endpoints, Foundry hosted agents (azure-ai-projects: HostedAgentDefinition, RaiConfig),
 # AI Search, Blob Storage, Entra ID. Claude on Foundry needs nothing new: `anthropic` ships
-# AsyncAnthropicFoundry. The Azure Monitor trace exporter (nw/telemetry.py) resolves to 1.0.0b45,
-# which fails to import against opentelemetry-sdk 1.42.1 (it imports `LogData`, no longer there):
-# b46 and later pin the SDK to one minor (1.39, 1.40, 1.43, 1.44), never the 1.42.1 that
-# aws-opentelemetry-distro 0.18 and google-adk 2.10 both need. Until ADK lifts its cap,
-# telemetry logs a warning and traces without an exporter on Azure. ADOT 0.17 (SDK 1.40.0) with
-# exporter b53 resolves, checked 2026-09-29, and is the way out if Azure traces must ship first.
+# AsyncAnthropicFoundry. The Azure Monitor trace exporter (nw/telemetry.py): builds from b46 on
+# pin opentelemetry-sdk to one minor (1.39, 1.40, 1.43, 1.44), so the lock takes ADOT 0.17 and
+# SDK 1.40.0, which b53 and google-adk 2.10 both accept (relocked 2026-09-30; b45 failed to
+# import against SDK 1.42.1). Azure traces go to Application Insights.
 platform-azure = [
     "azure-ai-ml>=1.35",
     "azure-ai-projects>=2.7",
     "azure-identity>=1.25",
-    "azure-monitor-opentelemetry-exporter>=1.0.0b45",
+    "azure-monitor-opentelemetry-exporter>=1.0.0b53",
     "azure-search-documents>=12.0",
     "azure-storage-blob>=12.26",
 ]
@@ -136,12 +135,12 @@ select = ["E", "F", "I", "B", "UP", "ASYNC"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
-    "session01: Session 1, the shared service layer",
-    "session02: Session 2, Project 1 ticket triage",
-    "session03: Session 3, Project 2 semantic understanding",
-    "session04: Session 4, Project 3 policy-grounded responses",
-    "session05: Session 5, Project 4 multi-agent resolution",
-    "session06: Session 6, Capstone and deployment",
+    "session01: Foundations and the AI service layer",
+    "session02: Machine learning in production, Project 1 ticket triage",
+    "session03: Deep learning and representation, Project 2 semantic understanding",
+    "session04: Generative AI: retrieval and evaluation, Project 3 policy-grounded responses",
+    "session05: Agentic AI systems, Project 4 multi-agent resolution",
+    "session06: Deployment, observability and capstone",
     "live: needs cloud credentials and spends money, or the local compose stack running",
     "pipelines: the training pipelines, shared steps and both SDK definitions",
     "slow: takes more than a minute; excluded from the default run with -m 'not slow'",

@@ -14,7 +14,7 @@ from nw.llm.providers.fake import FakeProvider
 from nw.policy import service
 from nw.policy.answer import ANSWER_PROMPT, answer, safe_question
 from nw.policy.chunking import chunk_corpus
-from nw.policy.evaluate import comparability, golden_sha
+from nw.policy.evaluate import comparability, golden_sha, provenance_problems
 from nw.policy.retrieval import HashEmbeddings, OverlapReranker, PolicyIndex
 
 pytestmark = pytest.mark.session04
@@ -127,12 +127,16 @@ def test_golden_set_hash_is_a_comparability_finding(tmp_path):
     golden.write_text('{"id": "a", "question": "q"}\n{"id": "b", "question": "r"}\n')
     after = golden_sha(golden)
     assert len(before) == 12 and before != after
-    notes = comparability(
-        {"golden_sha256_12": after, "corpus_sha256_12": "c"},
-        {"golden_sha256_12": before, "corpus_sha256_12": "c"},
+    prov = {"mode": "retrieval_only", "corpus_sha256_12": "c", "prompt_versions": {"p": "1"}}
+    prov["models"] = {"workhorse": None}
+    fails, _ = provenance_problems(
+        {**prov, "golden_sha256_12": after}, {**prov, "golden_sha256_12": before}
     )
-    assert len(notes) == 1 and "golden set" in notes[0] and before in notes[0]
-    assert comparability({"golden_sha256_12": after}, {}) == [], "an old baseline is silent"
+    assert len(fails) == 1 and "golden_sha256_12 differs" in fails[0] and before in fails[0]
+    # A baseline without provenance is no longer compared silently: it fails with a reason.
+    fails, _ = provenance_problems({"golden_sha256_12": after}, {})
+    assert fails and "has no mode" in fails[0]
+    assert comparability({"golden_sha256_12": after}, {}) == []
 
 
 def test_a_float_fraction_is_not_a_card_number():

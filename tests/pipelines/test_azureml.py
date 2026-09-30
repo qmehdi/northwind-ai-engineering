@@ -94,9 +94,10 @@ def test_optional_flags_only_when_set(config):
 @pytest.mark.parametrize("pipeline", ["triage", "semantic"])
 def test_pipeline_inputs_are_the_shared_parameters(config, pipeline):
     d = as_dict(definition(pipeline, config))
-    assert set(d["inputs"]) == {p.name for p in BY_PIPELINE[pipeline]}
+    # the bundle is an optional file input: absent until the platform client sets it
+    assert set(d["inputs"]) == {p.name for p in BY_PIPELINE[pipeline]} - {"source_uri"}
     for name, value in defaults(pipeline).items():
-        if name in ("data_uri", "production_summary", "output_root", "tenant"):
+        if name in ("data_uri", "production_summary", "output_root", "tenant", "source_uri"):
             continue
         got = d["inputs"][name]
         assert got == value or float(got) == float(value), name
@@ -145,6 +146,24 @@ def test_register_step_uses_the_azure_registry_and_honours_register_model(triage
     evaluate = triage["jobs"]["evaluate"]["component"]["command"]
     for flag in ("--min-p0-recall", "--max-ece", "--force", "--production-summary"):
         assert flag in evaluate
+
+
+def test_every_step_runs_the_launcher_on_the_submitted_bundle(config, tmp_path):
+    bundle = tmp_path / "nw-source-abc.tar.gz"
+    bundle.write_bytes(b"x")
+    d = as_dict(definition("triage", config, {"source_uri": str(bundle)}))
+    assert d["inputs"]["source_uri"]["type"] == "uri_file"
+    assert d["inputs"]["source_uri"]["path"].endswith(str(bundle)), "uploaded with the job"
+    for name, job in d["jobs"].items():
+        command = job["component"]["command"]
+        assert "python -m nw.pipelines.source run $[[--source ${{inputs.source}}]] --" in command
+        assert job["inputs"]["source"]["path"] == "${{parent.inputs.source_uri}}", name
+    evaluate = d["jobs"]["evaluate"]
+    assert "--champion ${{inputs.champion}}" in evaluate["component"]["command"]
+    assert "--tenant alice" in evaluate["component"]["command"]
+    assert evaluate["environment_variables"]["NW_PIPELINE_REGISTRY"] == REGISTRY_FACTORY
+    without = as_dict(definition("triage", config))
+    assert "source" not in without["jobs"]["train"]["inputs"]
 
 
 def test_aliases_build_the_same_graph(config):

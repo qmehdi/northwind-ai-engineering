@@ -247,3 +247,23 @@ def test_google_endpoint_forms():
     p = oc.for_google_maas("proj", "us-central1", token_source=lambda: None)
     assert p.name == "google-maas" and p.endpoint.endswith("/endpoints/openapi")
     assert oc.for_ollama("http://localhost:11434/v1/").endpoint == "http://localhost:11434/v1"
+
+
+def test_litellm_unknown_model_is_a_missing_model_so_the_fallback_runs():
+    """LiteLLM says an unknown model name only in the message (400, code "400"); the client's
+    fallback must still see a missing model, not a malformed request."""
+    body = {
+        "error": {
+            "message": "Invalid model name passed in model=nope. Call `/v1/models` to view "
+            "available models for your key.",
+            "type": "invalid_request_error",
+            "param": "model",
+            "code": "400",
+        }
+    }
+    err = oc.classify_response(httpx.Response(400, json=body))
+    assert isinstance(err, TerminalError) and err.model_unavailable
+    plain = oc.classify_response(
+        httpx.Response(400, json={"error": {"message": "bad temperature", "code": "400"}})
+    )
+    assert not plain.model_unavailable

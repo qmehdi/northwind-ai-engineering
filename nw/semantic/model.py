@@ -73,7 +73,7 @@ def build_encoder(
 def apply_lora(model: TicketEncoder, spec: ModelSpec) -> TicketEncoder:
     """Freeze the encoder and inject LoRA adapters into the attention projections.
     The heads stay trainable. Returns the same module, modified in place."""
-    raise NotImplementedError("Session 3, Step 3: freeze the encoder, inject LoRA")
+    raise NotImplementedError("Freeze the encoder, inject LoRA")
 
 
 def merge_lora(model: TicketEncoder) -> TicketEncoder:

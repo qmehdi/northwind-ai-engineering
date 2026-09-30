@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from pathlib import Path
 
 import pytest
 import yaml
@@ -59,6 +60,11 @@ def test_compile_writes_both_pipelines_with_the_image_and_steps(compiled):
             assert executor["container"]["image"] == IMAGE
             command = " ".join(executor["container"]["command"])
             assert "nw.pipelines.steps." in command, "every component runs a step module"
+            assert "nw.pipelines.source" in command, "through the launcher, on the bundle"
+    for spec in compiled.values():
+        for name, comp in spec["components"].items():
+            params = comp["inputDefinitions"]["parameters"]
+            assert {"source_uri", "platform_env"} <= set(params), name
 
 
 def test_pipeline_parameters_match_the_declared_schema(compiled):
@@ -103,13 +109,17 @@ def test_local_subprocess_runner_runs_triage_end_to_end(tmp_path, small_ticket_f
         pipeline_root=str(tmp_path / "pipeline_root"),
         raise_on_error=True,
     )
+    from nw.pipelines.source import build_bundle
+
+    bundle = build_bundle(Path(__file__).resolve().parents[2], tmp_path / "bundle")
     with kfp_interpreter():
         run = triage_pipeline(IMAGE)(
             data_uri=str(small_ticket_file),
             output_root=str(tmp_path / "out"),
             tenant="alice",
             environment="northwind",
-            production_summary=str(tmp_path / "no_production.json"),
+            production_summary="none",
+            source_uri=str(bundle.path),
         )
     assert run.outputs["Output"].startswith("northwind-alice-triage version 1 from ")
     out = tmp_path / "out" / "triage"
@@ -117,6 +127,8 @@ def test_local_subprocess_runner_runs_triage_end_to_end(tmp_path, small_ticket_f
     assert gate["passed"] and gate["metrics"]["p0_recall"] >= 0.85
     registered = json.loads((tmp_path / "registry" / "northwind-alice-triage.json").read_text())
     assert registered[0]["tags"]["artifact_version"] == gate["candidate"]
+    assert registered[0]["tags"]["source_sha256_12"] == bundle.sha256_12, "ran the bundle"
+    assert registered[0]["tags"]["source"] == "pipeline"
     assert (out / gate["candidate"] / "MODEL_CARD.md").exists()
     assert not (out / "latest").exists()
 
@@ -139,9 +151,10 @@ def test_local_runner_fails_the_run_when_the_gate_fails(tmp_path, small_ticket_f
         triage_pipeline(IMAGE)(
             data_uri=str(small_ticket_file),
             output_root=str(tmp_path / "out"),
-            production_summary=str(tmp_path / "no_production.json"),
+            production_summary="none",
             min_p0_recall=1.01,
         )
     gate = json.loads((tmp_path / "out" / "triage" / "steps" / "triage_evaluate.json").read_text())
     assert not gate["passed"] and "P0 recall" in gate["reason"]
-    assert not (tmp_path / "registry").exists()
+    assert "nothing live" in gate["champion_source"], "the gate asked the registry first"
+    assert not list((tmp_path / "registry").glob("*.json")), "nothing was registered"

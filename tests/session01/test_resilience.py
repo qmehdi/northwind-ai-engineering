@@ -90,14 +90,21 @@ async def test_exhausted_429s_fall_back_and_count_the_attempts(
     assert client.meter.retry_count == 3
 
 
-async def test_400_model_not_available_falls_back_but_a_refusal_does_not(
+async def test_model_unavailable_code_falls_back_but_a_refusal_does_not(
     make_client, fallback_settings
 ):
-    provider = FakeProvider(
-        _primary_fails(TerminalError("the requested model is not available", status=400))
-    )
+    unavailable = TerminalError("not deployed", status=400, code="DeploymentNotFound")
+    provider = FakeProvider(_primary_fails(unavailable))
     client = make_client(provider, settings=fallback_settings)
     assert (await client.complete("hello")).text == f"{BACKUP} answered"
+
+    # The vendor code decides, not the wording: our own 400 that mentions a model stays ours.
+    ours = TerminalError("the model rejected the parameter temperature", status=400)
+    provider = FakeProvider(_primary_fails(ours))
+    client = make_client(provider, settings=fallback_settings)
+    with pytest.raises(TerminalError):
+        await client.complete("hello")
+    assert _calls_to(provider, BACKUP) == 0
 
     provider = FakeProvider(_primary_fails(ContentFilteredError("refused")))
     client = make_client(provider, settings=fallback_settings)

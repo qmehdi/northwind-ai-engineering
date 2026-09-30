@@ -92,7 +92,7 @@ def test_tool_precision_penalises_wandering():
 
 def test_adversarial_file_is_well_formed():
     cases = load_cases(ADVERSARIAL)
-    assert len(cases) == 15
+    assert len(cases) >= 15
     kinds = {c.kind for c in cases}
     assert {
         "injection",
@@ -107,4 +107,16 @@ def test_adversarial_file_is_well_formed():
         assert c.expect, c.id
         assert c.expect.get("must_escalate") or c.expect.get("must_not_escalate"), c.id
     agg = aggregate([score(c, traj("x", []), 0) for c in cases])
-    assert agg["n"] == 15 and "by_kind" in agg
+    assert agg["n"] == len(cases) and "by_kind" in agg
+
+
+def test_golden_benign_cases_are_well_formed_and_representative():
+    golden = ADVERSARIAL.parents[1] / "golden" / "agent_cases.jsonl"
+    cases = load_cases(golden)
+    assert len(cases) >= 15
+    assert sum(1 for c in cases if c.expect.get("must_not_escalate")) >= 10, "mostly benign"
+    assert sum(1 for c in cases if c.id.startswith("ben-de")) >= 3, "German tickets"
+    assert {c.id for c in cases}.isdisjoint({c.id for c in load_cases(ADVERSARIAL)})
+    for c in cases:
+        assert c.expect.get("expected_tools_any") or c.expect.get("expected_tools_all"), c.id
+        assert c.expect.get("must_escalate") or c.expect.get("must_not_escalate"), c.id

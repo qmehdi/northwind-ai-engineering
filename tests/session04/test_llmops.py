@@ -362,9 +362,8 @@ def test_ask_carries_ids_and_versions_and_the_cache_serves_the_repeat(served):
     r2 = c.post("/ask", json={"question": "what uptime does enterprise get"}).json()
     assert r2["cached"] is True and r2["text"] == r1["text"] and r2["answer_id"] != r1["answer_id"]
     assert len(provider.calls) == 1, "the repeat never reached the model"
-    r3 = c.post(
-        "/ask", json={"question": "What uptime does Enterprise get?", "audience": "internal"}
-    ).json()
+    service.state.audiences = {"none": "internal"}  # this caller's key now reads internal
+    r3 = c.post("/ask", json={"question": "What uptime does Enterprise get?"}).json()
     assert r3["cached"] is False and len(provider.calls) == 2, "audience is part of the key"
     text = c.get("/metrics").text
     assert (

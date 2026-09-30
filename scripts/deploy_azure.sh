@@ -9,7 +9,9 @@
 # `make images-azure` pushed it), NW_ALERT_EMAIL, NW_BUDGET_USD, NW_GATEWAY_KIND=apim|litellm,
 # NW_APIM_SKU, NW_SEARCH_SKU, NW_TENANT_USERS=alice=<Entra object id>,..., NW_GITHUB_REPOSITORY,
 # NW_ADO_ISSUER, NW_ADO_SUBJECT, NW_RETRAIN_ENABLED, NW_DEFENDER, NW_PURVIEW,
-# NW_TENANT_BUDGET_USD (LiteLLM keys), NW_CANARY_PERCENT (default 10), REASON (approve).
+# NW_TENANT_BUDGET_USD (LiteLLM keys), NW_TENANT_TOKENS_PER_MONTH (APIM quota), NW_EGRESS_CONTROL
+# (default true), NW_AZURE_EU (default true: the EU Foundry resource), NW_AZURE_EU_LOCATION
+# (default swedencentral), NW_ADO_BUILDER_SUBJECT, NW_CANARY_PERCENT (default 10), REASON (approve).
 #
 # `what-if` and everything after `build` call Azure; `build` does not.
 set -euo pipefail
@@ -135,9 +137,22 @@ write_params() { # file
   export NW_ENDPOINT_SCOPE; NW_ENDPOINT_SCOPE="$("${PARAMS_PY[@]}" scope "$sub" "$RG" "$ENVIRONMENT")"
   export NW_API_KEY_VALUE; NW_API_KEY_VALUE="$(kept_secret "$ENVIRONMENT-api-key")"
   export NW_ADMIN_OBJECT_ID="${NW_ADMIN_OBJECT_ID:-$(az ad signed-in-user show --query id -o tsv 2>/dev/null || true)}"
+  # One x-api-key per owner, kept across deploys: the Key Vault secret holds the owner's key
+  # map ({"<owner>": "<key>"}), which is what the apps read.
+  local api_keys="{}"
+  for o in $(owners); do
+    api_keys="$(python3 -c '
+import json,sys
+d=json.loads(sys.argv[1]); owner=sys.argv[2]; kept=sys.argv[3]
+try: value=json.loads(kept).get(owner) or kept
+except ValueError: value=kept
+d[owner]=value; print(json.dumps(d))' "$api_keys" "$o" "$(kept_secret "$ENVIRONMENT-$o-api-key")")"
+  done
+  export NW_API_KEYS="$api_keys"
   if [ "${NW_GATEWAY_KIND:-apim}" = "litellm" ]; then
     export NW_LITELLM_MASTER_KEY NW_POSTGRES_PASSWORD NW_GATEWAY_KEYS
     NW_LITELLM_MASTER_KEY="sk-$(kept_secret "$ENVIRONMENT-gateway-master-key" | sed 's/^sk-//')"
+    export NW_LITELLM_SALT_KEY; NW_LITELLM_SALT_KEY="$(kept_secret "$ENVIRONMENT-gateway-salt-key")"
     NW_POSTGRES_PASSWORD="${NW_POSTGRES_PASSWORD:-$(random_key)Aa1}"
     local keys="{}"
     for o in $(owners); do
@@ -178,8 +193,9 @@ upload_data() {
 
 # Azure AI Search indexes are data plane: one per owner from search/policies-index.json (the
 # definition nw/platform/azure.py would create), and the owner's identity gets the two search
-# roles on that index alone. When the service refuses an index scope the role falls back to the
-# service, which the output says.
+# roles on that index alone. When the service refuses an index-scoped assignment the script
+# stops: granting the role on the service instead would let every tenant read and write every
+# index, which is exactly what the index scope is for (fails closed; nothing is widened).
 create_indexes() {
   local search search_id foundry embedding dims sub body
   search="$(out NW_AZURE_SEARCH_ENDPOINT)"; foundry="$(out NW_AZURE_FOUNDRY_ENDPOINT)"
@@ -197,15 +213,29 @@ create_indexes() {
     principal="$(az identity show -n "$ENVIRONMENT-$o-id" -g "$RG" --query principalId -o tsv)"
     for role in "Search Index Data Contributor" "Search Service Contributor"; do
       if ! az role assignment create --assignee-object-id "$principal" --assignee-principal-type ServicePrincipal \
-           --role "$role" --scope "$search_id/indexes/$index" -o none 2>/dev/null; then
-        echo "  $role on $index refused at index scope; granted on the service instead"
-        az role assignment create --assignee-object-id "$principal" --assignee-principal-type ServicePrincipal \
-          --role "$role" --scope "$search_id" -o none
+           --role "$role" --scope "$search_id/indexes/$index" -o none; then
+        rm -f "$body"
+        echo "  $role on $index was refused at index scope; stopping rather than granting it on the whole service" >&2
+        echo "  (every tenant would then read every index). Check the role and rerun: scripts/deploy_azure.sh indexes" >&2
+        return 1
       fi
     done
     echo "  $index"
   done
   rm -f "$body"
+}
+
+# Every role assignment of one principal, at every scope (the resource group, and the child
+# scopes the template and this script use: blob containers, secrets, endpoints, the registry,
+# the search index, the Foundry project). `az role assignment delete -g` alone leaves the
+# child-scope ones behind, orphaned once the identity is gone.
+remove_assignments() { # principal-object-id
+  [ -n "$1" ] || return 0
+  local ids
+  ids="$(az role assignment list --assignee "$1" --all --query "[].id" -o tsv 2>/dev/null || true)"
+  [ -z "$ids" ] && return 0
+  # shellcheck disable=SC2086
+  az role assignment delete --ids $ids -o none && echo "  removed $(printf '%s\n' "$ids" | wc -l | tr -d ' ') role assignments of $1"
 }
 
 # LiteLLM mode: register every owner's key (kept in Key Vault) with the proxy, with a budget.
@@ -229,6 +259,18 @@ register_keys() {
 }
 
 live_apps() { echo "$ENVIRONMENT-live-policy $ENVIRONMENT-live-agent"; }
+
+# A release runs only signed images: cosign verifies the digest against the platform's Key Vault
+# key (scripts/images_azure.sh signs). A missing cosign, a missing or a bad signature stops the
+# release; NW_ALLOW_UNSIGNED=1 overrides, and says so.
+verify_image() { # registry/repo@digest
+  if [ "${NW_ALLOW_UNSIGNED:-0}" = "1" ]; then echo "  NW_ALLOW_UNSIGNED=1: not verifying $1" >&2; return 0; fi
+  command -v cosign >/dev/null 2>&1 || { echo "cosign is not installed; cannot verify $1, not releasing" >&2; return 1; }
+  AZURE_AUTH_METHOD=cli cosign verify --insecure-ignore-tlog=true \
+    --key "azurekms://$(out NW_AZURE_KEY_VAULT).vault.azure.net/$(out NW_AZURE_SIGNING_KEY)" "$1" >/dev/null \
+    || { echo "signature check failed for $1, not releasing" >&2; return 1; }
+  echo "  verified signature of $1"
+}
 
 case "$ACTION" in
   setup)
@@ -296,10 +338,14 @@ case "$ACTION" in
         if [ -n "$(out NW_AZURE_APIM_NAME)" ]; then
           az rest --method delete --url "https://management.azure.com/subscriptions/$(out NW_AZURE_SUBSCRIPTION_ID)/resourceGroups/$RG/providers/Microsoft.ApiManagement/service/$(out NW_AZURE_APIM_NAME)/subscriptions/$ENVIRONMENT-$TENANT?api-version=2024-05-01" -o none 2>/dev/null || true
         fi
-        az keyvault secret delete --vault-name "$VAULT" -n "$ENVIRONMENT-$TENANT-gateway-key" -o none 2>/dev/null || true
+        for secret in gateway-key api-key; do
+          az keyvault secret delete --vault-name "$VAULT" -n "$ENVIRONMENT-$TENANT-$secret" -o none 2>/dev/null || true
+        done
         az rest --method delete --url "$(out NW_AZURE_SEARCH_ENDPOINT)/indexes/$ENVIRONMENT-$TENANT-policies?api-version=2024-07-01" --resource https://search.azure.com -o none 2>/dev/null || true
         PRINCIPAL="$(az identity show -n "$ENVIRONMENT-$TENANT-id" -g "$RG" --query principalId -o tsv 2>/dev/null || true)"
-        [ -z "$PRINCIPAL" ] || az role assignment delete --assignee "$PRINCIPAL" -g "$RG" -o none 2>/dev/null || true
+        remove_assignments "$PRINCIPAL"
+        # The learner's own assignments too, when NW_TENANT_USERS named them.
+        remove_assignments "$(python3 -c 'import sys; print(dict(p.split("=",1) for p in sys.argv[1].split(",") if "=" in p).get(sys.argv[2], ""))' "${NW_TENANT_USERS:-}" "$TENANT")"
         az identity delete -n "$ENVIRONMENT-$TENANT-id" -g "$RG" -o none 2>/dev/null || true
         export NW_TENANTS; NW_TENANTS="$(python3 -c 'import sys; print(",".join(t for t in sys.argv[1].split(",") if t and t != sys.argv[2]))' "${NW_TENANTS:-}" "$TENANT")"
         echo "removed $TENANT; redeploying with tenants=$NW_TENANTS"
@@ -334,15 +380,25 @@ case "$ACTION" in
     echo "Endpoints are empty after stop: approving a model version (or the promotion drill) deploys it again." ;;
   destroy)
     SUB="$(az account show --query id -o tsv)"
-    KV=""; FOUNDRY=""; APIM=""
-    if have_outputs; then KV="$(out NW_AZURE_KEY_VAULT)"; FOUNDRY="$(out NW_AZURE_FOUNDRY_ENDPOINT | sed -e 's|https://||' -e 's|\..*||')"; APIM="$(out NW_AZURE_APIM_NAME)"; fi
+    KV=""; FOUNDRY=""; APIM=""; WS=""
+    if have_outputs; then KV="$(out NW_AZURE_KEY_VAULT)"; FOUNDRY="$(out NW_AZURE_FOUNDRY_ENDPOINT | sed -e 's|https://||' -e 's|\..*||')"; APIM="$(out NW_AZURE_APIM_NAME)"; WS="$(out NW_AZURE_ML_WORKSPACE)"; fi
+    # Deleting the group only soft-deletes the Azure ML workspace (14 days, name held); delete it
+    # permanently first. Its associated resources go with the group.
+    if [ -n "$WS" ] && az ml workspace delete -n "$WS" -g "$RG" --permanently-delete --yes -o none 2>/dev/null; then
+      echo "deleted workspace $WS permanently"; fi
     echo "Deleting resource group $RG and everything in it."
     az group delete -n "$RG" --yes
     # Soft delete keeps these names (and, for Key Vault and Foundry, the resource) for days;
     # purge them so a redeploy can reuse the names and nothing lingers.
     if [ -n "$KV" ] && az keyvault purge -n "$KV" -l "$LOCATION" -o none 2>/dev/null; then echo "purged Key Vault $KV"; fi
     if [ -n "$FOUNDRY" ] && az cognitiveservices account purge -g "$RG" -n "$FOUNDRY" -l "$LOCATION" -o none 2>/dev/null; then echo "purged Foundry $FOUNDRY"; fi
+    FOUNDRY_EU=""; if have_outputs; then FOUNDRY_EU="$(out NW_AZURE_FOUNDRY_EU_ENDPOINT | sed -e 's|https://||' -e 's|\..*||')"; fi
+    if [ -n "$FOUNDRY_EU" ] && az cognitiveservices account purge -g "$RG" -n "$FOUNDRY_EU" -l "${NW_AZURE_EU_LOCATION:-swedencentral}" -o none 2>/dev/null; then echo "purged Foundry $FOUNDRY_EU"; fi
     if [ -n "$APIM" ] && az apim deletedservice purge --service-name "$APIM" -l "$LOCATION" -o none 2>/dev/null; then echo "purged API Management $APIM"; fi
+    # The allowed-sizes policy definition lives at subscription scope (its assignment went with
+    # the group).
+    for id in $(az policy definition list --query "[?policyType=='Custom' && contains(displayName, '($RG)')].name" -o tsv 2>/dev/null); do
+      az policy definition delete --name "$id" -o none && echo "deleted policy definition $id"; done
     # Custom role definitions outlive the group they are scoped to.
     for id in $(az role definition list --custom-role-only true --query "[?contains(roleName, '($RG)')].name" -o tsv); do
       az role definition delete --name "$id" --scope "/subscriptions/$SUB/resourceGroups/$RG" -o none 2>/dev/null || \
@@ -351,12 +407,14 @@ case "$ACTION" in
     rm -f "$OUTPUTS"
     echo "Residual: nothing billed in the resource group; deleted blobs are gone with the account." ;;
   release)
-    # A release of the live policy and agent apps: the images tagged $TAG are resolved to digests
-    # and each app gets a new revision at $CANARY percent; `approve` moves it to 100.
+    # A release of the live policy and agent apps: the images tagged $TAG are resolved to digests,
+    # each digest's signature is verified, and each app gets a new revision at $CANARY percent;
+    # `approve` moves it to 100.
     ACR="$(out NW_AZURE_ACR)"; LOGIN="$(out NW_AZURE_ACR_LOGIN_SERVER)"
     for kind in policy agent; do
       APP="$ENVIRONMENT-live-$kind"
       DIGEST="$(az acr repository show -n "$ACR" --image "nw-$kind:$TAG" --query digest -o tsv)"
+      verify_image "$LOGIN/nw-$kind@$DIGEST"
       STABLE="$(az containerapp ingress traffic show -n "$APP" -g "$RG" -o json | python3 -c '
 import json,sys
 rows=[r for r in json.load(sys.stdin) if r.get("weight",0)>0]
@@ -364,7 +422,9 @@ print(max(rows,key=lambda r:r["weight"]).get("revisionName",""))')"
       if [ -z "$STABLE" ]; then STABLE="$(az containerapp show -n "$APP" -g "$RG" --query properties.latestReadyRevisionName -o tsv)"; fi
       # Pin the serving revision first, so the new one starts at 0 percent.
       az containerapp ingress traffic set -n "$APP" -g "$RG" --revision-weight "$STABLE=100" -o none
-      az containerapp update -n "$APP" -g "$RG" --image "$LOGIN/nw-$kind@$DIGEST" --revision-suffix "r$(date +%m%d%H%M%S)" -o none
+      # NW_IMAGE_DIGEST: the digest the new revision serves, which /version reports.
+      az containerapp update -n "$APP" -g "$RG" --image "$LOGIN/nw-$kind@$DIGEST" \
+        --set-env-vars "NW_IMAGE_DIGEST=$DIGEST" --revision-suffix "r$(date +%m%d%H%M%S)" -o none
       NEW="$(az containerapp show -n "$APP" -g "$RG" --query properties.latestRevisionName -o tsv)"
       az containerapp ingress traffic set -n "$APP" -g "$RG" --revision-weight "$STABLE=$((100 - CANARY))" "$NEW=$CANARY" -o none
       az containerapp revision label add -n "$APP" -g "$RG" --label canary --revision "$NEW" --yes -o none 2>/dev/null || true

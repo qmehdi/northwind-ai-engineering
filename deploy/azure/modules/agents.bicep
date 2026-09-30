@@ -14,6 +14,12 @@
 // with runtime `container-apps`. The Foundry Agent Service is in its basic setup (no capability
 // host, platform-managed storage).
 //
+// Keys and secrets: each owner's apps accept only that owner's API key map
+// (`<environment>-<owner>-api-key`, key id = owner, nw/auth.py), so one tenant's key does not
+// open a neighbour's apps; the gateway key and the Application Insights connection string are
+// Key Vault references too, never plain environment values. The environment sits in the
+// platform's virtual network with outbound limited to Azure (network.bicep).
+//
 // The live policy and agent apps run in multiple-revision mode: `scripts/deploy_azure.sh
 // release` adds a revision at 10 percent and `approve` moves it to 100 (the traffic split).
 // `liveApps` carries what the drill set, so a redeploy of this template does not undo it.
@@ -35,6 +41,8 @@ param identityClientIds array
 param litellmUrl string
 param platformSettings object
 param liveApps object
+@description('NW_OPS_STORE: the lake\'s artifacts container, where the policy and agent apps keep trajectories and feedback under their owner\'s prefix (nw/agent/opstore.py)')
+param opsStore string
 param enableTelemetry bool
 
 var placeholderImage = 'mcr.microsoft.com/k8se/quickstart:latest'
@@ -43,18 +51,22 @@ var services = [
   { kind: 'agent', port: 8000, external: true, cpu: '1.0', memory: '2Gi', image: 'nw-agent' }
   { kind: 'mcp', port: 8020, external: false, cpu: '0.5', memory: '1Gi', image: 'nw-mcp' }
 ]
-var apps = flatten(map(range(0, length(owners)), i => map(services, s => {
-  owner: owners[i]
-  index: i
-  kind: s.kind
-  name: '${environment}-${owners[i]}-${s.kind}'
-  port: s.port
-  external: s.external
-  cpu: s.cpu
-  memory: s.memory
-  image: empty(imageTag) ? placeholderImage : '${acrLoginServer}/${s.image}:${imageTag}'
-  live: owners[i] == 'live' && s.kind != 'mcp'
-})))
+var apps = flatten(map(
+  range(0, length(owners)),
+  i =>
+    map(services, s => {
+      owner: owners[i]
+      index: i
+      kind: s.kind
+      name: '${environment}-${owners[i]}-${s.kind}'
+      port: s.port
+      external: s.external
+      cpu: s.cpu
+      memory: s.memory
+      image: empty(imageTag) ? placeholderImage : '${acrLoginServer}/${s.image}:${imageTag}'
+      live: owners[i] == 'live' && s.kind != 'mcp'
+    })
+))
 
 module containerApps 'app.bicep' = [
   for a in apps: {
@@ -85,7 +97,12 @@ module containerApps 'app.bicep' = [
       secrets: [
         {
           name: 'api-key'
-          keyVaultUrl: '${keyVaultUri}secrets/${environment}-api-key'
+          keyVaultUrl: '${keyVaultUri}secrets/${environment}-${a.owner}-api-key'
+          identity: identityIds[a.index]
+        }
+        {
+          name: 'appinsights'
+          keyVaultUrl: '${keyVaultUri}secrets/${environment}-appinsights'
           identity: identityIds[a.index]
         }
         {
@@ -100,11 +117,20 @@ module containerApps 'app.bicep' = [
           { name: 'NW_TENANT', value: a.owner }
           { name: 'OTEL_SERVICE_NAME', value: a.name }
           { name: 'NW_API_KEY', secretRef: 'api-key' }
+          { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', secretRef: 'appinsights' }
+          { name: 'NW_AZURE_APPINSIGHTS_CONNECTION_STRING', secretRef: 'appinsights' }
           { name: 'NW_GATEWAY_KEY', secretRef: 'gateway-key' }
           { name: 'NW_POLICY_URL', value: 'http://${environment}-${a.owner}-policy' }
           { name: 'NW_MCP_URL', value: 'http://${environment}-${a.owner}-mcp/mcp' }
         ],
         empty(litellmUrl) ? [] : [{ name: 'NW_GATEWAY_URL', value: litellmUrl }],
+        // Names are redacted on the agent path and in policy questions before anything is kept.
+        [{ name: 'NW_REDACT_DETECTOR', value: 'heuristic' }],
+        // Durable ops state under <environment>-<owner>/ in the lake (the owner identity may
+        // write trajectories/ and feedback/ there, never approvals/: tenant.bicep). The MCP
+        // server writes nothing: escalate through MCP is only ever a proposal. No
+        // NW_RUNTIME_AUTH: the ingress is public, so the apps keep checking x-api-key.
+        a.kind == 'mcp' ? [] : [{ name: 'NW_OPS_STORE', value: opsStore }],
         a.kind == 'mcp'
           ? [
               { name: 'NW_MCP_HOST', value: '0.0.0.0' }

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import threading
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -76,17 +77,21 @@ class EntraTokenSource:
         self.scope = scope
         self._credential = credential
         self._token: Any | None = None
+        # Shared by the chat and Claude providers and called from worker threads: one refresh
+        # at expiry, not one per concurrent call.
+        self._lock = threading.Lock()
 
     def _get(self) -> str:
         import time
 
-        if self._credential is None:
-            from azure.identity import DefaultAzureCredential
+        with self._lock:
+            if self._credential is None:
+                from azure.identity import DefaultAzureCredential
 
-            self._credential = DefaultAzureCredential()
-        if self._token is None or self._token.expires_on - 300 <= time.time():
-            self._token = self._credential.get_token(self.scope)
-        return self._token.token
+                self._credential = DefaultAzureCredential()
+            if self._token is None or self._token.expires_on - 300 <= time.time():
+                self._token = self._credential.get_token(self.scope)
+            return self._token.token
 
     def sync(self) -> str:
         return self._get()

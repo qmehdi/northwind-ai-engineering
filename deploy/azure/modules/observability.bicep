@@ -144,6 +144,109 @@ module driftAlert 'br/public:avm/res/insights/scheduled-query-rule:0.6.0' = {
   }
 }
 
+// Quality canary signals (nw/metrics_export.py, nw/quality.py, bars in deploy/SLO.md). Every
+// service writes a `metrics_snapshot` JSON line a minute with the current value of each quality
+// gauge, and a `quality_alert` line while a signal is past its bar. `quality_level` at 2 is the
+// monitor's own verdict (minimum samples and interval included) and the one a canary waits on
+// (`make approve-azure` reads the fired alerts); the others name the signal that moved.
+// `p0_share` and `refusal_rate` are reported, not alarmed: the bars are on their ratios.
+var appLines = 'union isfuzzy=true (ContainerAppConsoleLogs_CL | project TimeGenerated, Line = tostring(Log_s)), (AppTraces | project TimeGenerated, Line = Message)'
+// `live-quality-level` is the live owner's level alone: its name starts with
+// `<environment>-live`, so the approval step's fired-alert check (deploy_azure.sh approve)
+// refuses to move a canary while it fires.
+var qualityBars = [
+  { name: 'live-quality-level', field: 'quality_level', services: 'triage,semantic,policy,agent', op: '>=', threshold: '2', tenant: 'live' }
+  { name: 'quality-level', field: 'quality_level', services: 'triage,semantic,policy,agent', op: '>=', threshold: '2', tenant: '' }
+  { name: 'quality-shadow', field: 'shadow_agreement', services: 'triage,semantic', op: '<', threshold: '0.9', tenant: '' }
+  { name: 'quality-p0-high', field: 'p0_share_ratio', services: 'triage,semantic', op: '>=', threshold: '2', tenant: '' }
+  { name: 'quality-p0-low', field: 'p0_share_ratio', services: 'triage,semantic', op: '<=', threshold: '0.5', tenant: '' }
+  { name: 'quality-refusal', field: 'refusal_ratio', services: 'policy', op: '>=', threshold: '2', tenant: '' }
+  { name: 'quality-judge', field: 'judge_score', services: 'agent', op: '<', threshold: '3.5', tenant: '' }
+]
+
+module qualityAlerts 'br/public:avm/res/insights/scheduled-query-rule:0.6.0' = [
+  for q in qualityBars: {
+    name: '${environment}-${q.name}'
+    params: {
+      name: '${environment}-${q.name}'
+      alertDisplayName: '${environment}: ${q.field} ${q.op} ${q.threshold}'
+      alertDescription: 'A quality canary signal (${q.field}, deploy/SLO.md) is past its bar on the service and tenant the dimensions name. During a canary do not approve; roll back instead.'
+      location: location
+      tags: tags
+      kind: 'LogAlert'
+      severity: 2
+      evaluationFrequency: 'PT5M'
+      windowSize: 'PT10M'
+      scopes: [logs.outputs.resourceId]
+      skipQueryValidation: true
+      autoMitigate: true
+      criterias: {
+        allOf: [
+          {
+            query: '${appLines} | where Line has "metrics_snapshot" | extend m = parse_json(Line) | extend service = tostring(m.service), tenant = tostring(m.tenant), value = todouble(m.${q.field}) | where service in (split("${q.services}", ",")) and ("${q.tenant}" == "" or tenant == "${q.tenant}") and isnotnull(value) and value ${q.op} ${q.threshold}'
+            timeAggregation: 'Count'
+            dimensions: [
+              { name: 'service', operator: 'Include', values: ['*'] }
+              { name: 'tenant', operator: 'Include', values: ['*'] }
+            ]
+            operator: 'GreaterThan'
+            threshold: 0
+            failingPeriods: {
+              numberOfEvaluationPeriods: 1
+              minFailingPeriodsToAlert: 1
+            }
+          }
+        ]
+      }
+      actions: {
+        actionGroupResourceIds: [actionGroup.outputs.resourceId]
+      }
+      enableTelemetry: enableTelemetry
+    }
+  }
+]
+
+// The `quality_alert` lines themselves, by signal (shadow_agreement, p0_share, refusal_rate,
+// judge_score): the same contract as the Google Cloud log metric and the CloudWatch filter.
+module qualityAlertLines 'br/public:avm/res/insights/scheduled-query-rule:0.6.0' = {
+  name: '${environment}-quality-alert'
+  params: {
+    name: '${environment}-quality-alert'
+    alertDisplayName: '${environment}: quality_alert logged by a service'
+    alertDescription: 'A monitor logged quality_alert: the signal dimension names the signal past its bar (nw/quality.py).'
+    location: location
+    tags: tags
+    kind: 'LogAlert'
+    severity: 2
+    evaluationFrequency: 'PT5M'
+    windowSize: 'PT5M'
+    scopes: [logs.outputs.resourceId]
+    skipQueryValidation: true
+    autoMitigate: true
+    criterias: {
+      allOf: [
+        {
+          query: '${appLines} | where Line has "quality_alert" | extend m = parse_json(Line) | extend signal = tostring(m.signal)'
+          timeAggregation: 'Count'
+          dimensions: [
+            { name: 'signal', operator: 'Include', values: ['*'] }
+          ]
+          operator: 'GreaterThan'
+          threshold: 0
+          failingPeriods: {
+            numberOfEvaluationPeriods: 1
+            minFailingPeriodsToAlert: 1
+          }
+        }
+      ]
+    }
+    actions: {
+      actionGroupResourceIds: [actionGroup.outputs.resourceId]
+    }
+    enableTelemetry: enableTelemetry
+  }
+}
+
 // The platform workbook: requests and failures per service, tokens per tenant from the model
 // gateway's metric, the live endpoint, pipeline runs and drift lines. Workbooks have no
 // Azure Verified Module; the name must be a GUID.

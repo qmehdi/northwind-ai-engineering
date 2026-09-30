@@ -7,6 +7,8 @@ import pytest
 # The suite never reaches a network: every role resolves to the fake provider and the
 # `fake-*` model ids unless a test sets `provider` itself.
 os.environ.setdefault("NW_PROVIDER", "fake")
+# A learner's `.env` (gateway key, model overrides) is not read by the suite.
+os.environ["NW_ENV_FILE"] = ""
 # A checkout that has run `make deploy-azure` has deploy/azure/outputs.json; Settings would
 # read the APIM gateway from it. The suite reads no deployment.
 os.environ["NW_AZURE_OUTPUTS"] = ""

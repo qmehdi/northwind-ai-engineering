@@ -12,8 +12,12 @@
 //                     `userObjectId` is given): read `data` and `baselines`, write only under
 //                     `<environment>-<owner>/` in `artifacts` and `pipelines` (ABAC on the blob
 //                     path), the tenant role on the workspace, the endpoint role on its own
-//                     endpoint (and on the live one, where the drill runs), AcrPull, Key Vault
-//                     Secrets User on its two secrets only, Foundry User on the project.
+//                     endpoints only (never the live ones: the live identity, the platform
+//                     owner and the deployer hold it there), AcrPull, Key Vault Secrets User
+//                     on its three secrets only (its API key map, its gateway key, the
+//                     Application Insights connection string), and the tenant project role
+//                     on the Foundry project (agents and evaluations, no model inference: models
+//                     are reached through the gateway).
 //
 // The search index `<environment>-<owner>-policies` and its role are created by
 // scripts/deploy_azure.sh: indexes are data plane.
@@ -36,7 +40,7 @@ param acrName string
 param workspaceName string
 param tenantWorkspaceRoleId string
 param tenantEndpointRoleId string
-param liveEndpointNames array
+param tenantProjectRoleId string
 param foundryAccountName string
 param foundryProjectName string
 param clusterId string
@@ -48,6 +52,7 @@ param jobEnv object
 
 var isLive = owner == 'live'
 var prefix = '${environment}-${owner}'
+var sourceUri = 'azureml://datastores/${replace(environment, '-', '_')}_artifacts/paths/${prefix}/source/latest.tar.gz'
 var principals = concat(
   [{ id: principalId, type: 'ServicePrincipal' }],
   empty(userObjectId) ? [] : [{ id: userObjectId, type: 'User' }]
@@ -57,7 +62,6 @@ var roles = {
   blobContributor: 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
   secretsUser: '4633458b-17de-408a-b874-0445c86b69e6'
   acrPull: '7f951dda-4ed3-4680-a7ca-43fe172d538d'
-  foundryUser: '53ca6127-db72-4b80-b1b0-d745d6d5456d'
 }
 
 // Read, write, delete, move and superuser access to blobs pass only under the owner's prefix
@@ -65,6 +69,15 @@ var roles = {
 // prefixes (storage-auth-abac-examples, 2026-09-29).
 var blobs = 'Microsoft.Storage/storageAccounts/blobServices/containers/blobs'
 var prefixCondition = '((!(ActionMatches{\'${blobs}/read\'} AND NOT SubOperationMatches{\'Blob.List\'}) AND !(ActionMatches{\'${blobs}/write\'}) AND !(ActionMatches{\'${blobs}/add/action\'}) AND !(ActionMatches{\'${blobs}/delete\'}) AND !(ActionMatches{\'${blobs}/move/action\'}) AND !(ActionMatches{\'${blobs}/runAsSuperUser/action\'})) OR (@Resource[${blobs}:path] StringStartsWith \'${prefix}/\') OR (@Resource[${blobs}:path] StringStartsWith \'agents/\')) AND ((!(ActionMatches{\'${blobs}/read\'} AND SubOperationMatches{\'Blob.List\'})) OR (@Request[${blobs}:prefix] StringStartsWith \'${prefix}/\') OR (@Request[${blobs}:prefix] StringStartsWith \'agents/\'))'
+
+// The owner's identity runs the apps and jobs (the policy service, the agent, the MCP server,
+// the pipelines): the same prefix, except `<prefix>/approvals/`. That is where the ops store
+// (nw/agent/opstore.py, NW_OPS_STORE) keeps claim markers, approval records and the escalation
+// queue, and only the owner's approver writes it: the learner for a tenant, the platform owner
+// (admin.bicep) for `live`. The runtimes write `trajectories/` (with the proposals) and
+// `feedback/`; they never read `approvals/`, because the escalate tool's body runs only in the
+// approver's process (nw/agent/approve.py). The data-plane half of ADR 0005.
+var runtimeCondition = '((!(ActionMatches{\'${blobs}/read\'} AND NOT SubOperationMatches{\'Blob.List\'}) AND !(ActionMatches{\'${blobs}/write\'}) AND !(ActionMatches{\'${blobs}/add/action\'}) AND !(ActionMatches{\'${blobs}/delete\'}) AND !(ActionMatches{\'${blobs}/move/action\'}) AND !(ActionMatches{\'${blobs}/runAsSuperUser/action\'})) OR ((@Resource[${blobs}:path] StringStartsWith \'${prefix}/\') AND (@Resource[${blobs}:path] StringNotStartsWith \'${prefix}/approvals/\')) OR (@Resource[${blobs}:path] StringStartsWith \'agents/\')) AND ((!(ActionMatches{\'${blobs}/read\'} AND SubOperationMatches{\'Blob.List\'})) OR (@Request[${blobs}:prefix] StringStartsWith \'${prefix}/\') OR (@Request[${blobs}:prefix] StringStartsWith \'agents/\'))'
 
 resource lake 'Microsoft.Storage/storageAccounts@2026-04-01' existing = {
   name: lakeName
@@ -97,9 +110,15 @@ resource vault 'Microsoft.KeyVault/vaults@2026-02-01' existing = {
   name: keyVaultName
 }
 
+// The owner's own x-api-key map: another owner's apps do not accept it.
 resource apiKeySecret 'Microsoft.KeyVault/vaults/secrets@2026-02-01' existing = {
   parent: vault
-  name: '${environment}-api-key'
+  name: '${prefix}-api-key'
+}
+
+resource appInsightsSecret 'Microsoft.KeyVault/vaults/secrets@2026-02-01' existing = {
+  parent: vault
+  name: '${environment}-appinsights'
 }
 
 resource gatewayKeySecret 'Microsoft.KeyVault/vaults/secrets@2026-02-01' existing = {
@@ -156,13 +175,6 @@ resource endpoints 'Microsoft.MachineLearningServices/workspaces/onlineEndpoints
   }
 ]
 
-resource liveEndpoints 'Microsoft.MachineLearningServices/workspaces/onlineEndpoints@2026-05-01' existing = [
-  for name in liveEndpointNames: {
-    parent: ml
-    name: name
-  }
-]
-
 // ----- the weekly retraining schedule ----------------------------------------------------------
 
 // The job runs `nw.pipelines.retrain` in the pipelines image as the tenant's identity; it
@@ -189,7 +201,10 @@ resource retrain 'Microsoft.MachineLearningServices/workspaces/schedules@2026-05
         jobType: 'Command'
         displayName: '${prefix}-retrain-triage'
         experimentName: '${prefix}-triage'
-        command: 'python -m nw.pipelines.retrain --pipeline triage --tenant ${owner} --trigger schedule'
+        // The tenant's code, not the image's: the bundle of its last submission
+        // (nw/pipelines/source.py), kept at <prefix>/source/latest.tar.gz in the artifacts
+        // container and read through the lake's datastore.
+        command: 'python -m nw.pipelines.retrain --pipeline triage --tenant ${owner} --trigger schedule --source-uri ${sourceUri}'
         environmentId: pipelinesEnvironmentId
         computeId: clusterId
         environmentVariables: union(jobEnv, {
@@ -229,8 +244,8 @@ resource writesOwnPrefix 'Microsoft.Authorization/roleAssignments@2022-04-01' = 
       roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roles.blobContributor)
       principalId: pair.p.id
       principalType: pair.p.type
-      description: 'Only under ${prefix}/'
-      condition: prefixCondition
+      description: pair.p.type == 'User' ? 'Only under ${prefix}/' : 'Only under ${prefix}/, not ${prefix}/approvals/'
+      condition: pair.p.type == 'User' ? prefixCondition : runtimeCondition
       conditionVersion: '2.0'
     }
   }
@@ -253,6 +268,18 @@ resource readsApiKey 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
   for p in principals: {
     name: guid(apiKeySecret.id, p.id, roles.secretsUser)
     scope: apiKeySecret
+    properties: {
+      roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roles.secretsUser)
+      principalId: p.id
+      principalType: p.type
+    }
+  }
+]
+
+resource readsAppInsights 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
+  for p in principals: {
+    name: guid(appInsightsSecret.id, p.id, roles.secretsUser)
+    scope: appInsightsSecret
     properties: {
       roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roles.secretsUser)
       principalId: p.id
@@ -309,25 +336,13 @@ resource operatesEndpoint 'Microsoft.Authorization/roleAssignments@2022-04-01' =
   }
 ]
 
-// The promotion drill runs on the shared live endpoint; the instructor calls turns in a cohort.
-resource operatesLiveEndpoint 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
-  for pair in flatten(map(range(0, length(liveEndpointNames)), e => map(principals, p => { e: e, p: p }))): if (!isLive) {
-    name: guid(liveEndpoints[pair.e].id, pair.p.id, tenantEndpointRoleId)
-    scope: liveEndpoints[pair.e]
-    properties: {
-      roleDefinitionId: tenantEndpointRoleId
-      principalId: pair.p.id
-      principalType: pair.p.type
-    }
-  }
-]
-
+// Agents and evaluations in the shared project, no inference data actions (foundry.bicep).
 resource usesProject 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
   for p in principals: {
-    name: guid(project.id, p.id, roles.foundryUser)
+    name: guid(project.id, p.id, tenantProjectRoleId)
     scope: project
     properties: {
-      roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roles.foundryUser)
+      roleDefinitionId: tenantProjectRoleId
       principalId: p.id
       principalType: p.type
     }

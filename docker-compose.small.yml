@@ -1,0 +1,27 @@
+# The smaller-model fallback of the Local track, for a 16 GB Mac (deploy/local/README.md, "What
+# the machine needs"): qwen3:4b (2.5 GB, tool calling) takes the Workhorse and Economy roles
+# instead of gpt-oss:20b (13.8 GB). Add the same NW_MODEL_WORKHORSE and NW_MODEL_ECONOMY lines to
+# .env so the laptop's clients ask for it too.
+#   make local-up SMALL=1
+#   docker compose -f docker-compose.yml -f docker-compose.small.yml --profile platform up -d
+x-small: &small
+  NW_MODEL_WORKHORSE: ${NW_SMALL_MODEL:-qwen3:4b}
+  NW_MODEL_ECONOMY: ${NW_SMALL_MODEL:-qwen3:4b}
+
+services:
+  triage: { environment: *small }
+  semantic: { environment: *small }
+  policy: { environment: *small }
+  resolver: { environment: *small }
+  agent: { environment: *small }
+  agent-triage: { environment: *small }
+  agent-policy: { environment: *small }
+  agent-resolution: { environment: *small }
+  mcp: { environment: *small }
+  ollama-pull:
+    environment:
+      NW_OLLAMA_PULL: ${NW_OLLAMA_PULL-llama-guard3:1b ${NW_SMALL_MODEL:-qwen3:4b}}
+  litellm:
+    environment:
+      NW_GATEWAY_WORKHORSE: ollama_chat/${NW_SMALL_MODEL:-qwen3:4b}
+      NW_GATEWAY_LOCAL_MODEL: ollama_chat/${NW_SMALL_MODEL:-qwen3:4b}

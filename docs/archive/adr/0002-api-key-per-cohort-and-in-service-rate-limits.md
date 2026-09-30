@@ -1,6 +1,6 @@
 # 0002. One API key per cohort, with key ids and in-service rate limiting, instead of an API gateway
 
-Date: 2026-09-15. Status: accepted.
+Date: 2026-09-15. Status: superseded on 2026-09-29 by the workspace ADRs 0008 and 0009 (the managed platform with a model gateway, cohort and solo modes with a key and a budget per tenant). The key middleware and the per-key-id limiter it introduced remain; `docs/SECURITY.md` describes them as they are now, including the audience bound to the key id.
 
 ## Context
 

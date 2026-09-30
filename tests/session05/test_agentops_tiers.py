@@ -43,6 +43,10 @@ pytestmark = pytest.mark.session05
 
 ROOT = Path(__file__).resolve().parents[2]
 ADVERSARIAL = ROOT / "data" / "adversarial" / "tickets.jsonl"
+CASE_FILES = [
+    ROOT / "data" / "adversarial" / "tickets.jsonl",
+    ROOT / "data" / "golden" / "agent_cases.jsonl",
+]
 
 
 def _case(expect: dict, cid: str = "c1") -> AgentCase:
@@ -166,7 +170,7 @@ def offline(monkeypatch, tmp_path, local_settings):
     from nw.agent.offline import offline_registry, scripted_provider
 
     monkeypatch.setattr(nwmod, "ESCALATION_QUEUE", tmp_path / "escalations.jsonl")
-    cases = load_cases(ADVERSARIAL)
+    cases = load_cases(*CASE_FILES)
     registry = offline_registry(ROOT / "data" / "accounts.json")
     client = LLMClient(scripted_provider(cases), settings=local_settings)
     return cases, registry, client
@@ -181,8 +185,9 @@ async def test_offline_run_labels_every_case_with_four_tiers_and_passes_the_tier
     )
     assert all(set(s.tiers) == {"tool", "turn", "session", "system"} for s in scores)
     tiers = agg["tiers"]
-    assert all(tiers[t.value]["passed"] == 15 and tiers[t.value]["n"] == 15 for t in Tier)
-    assert tiers["turn"]["judge_mean"] == 5.0 and tiers["turn"]["judged"] == 15
+    n = len(cases)
+    assert all(tiers[t.value]["passed"] == n and tiers[t.value]["n"] == n for t in Tier)
+    assert tiers["turn"]["judge_mean"] == 5.0 and tiers["turn"]["judged"] == n
     assert tiers["tool"]["invalid_argument_rate"] == 0.0 and tiers["tool"]["per_tool"]
     assert tiers["session"]["cap_rate"] == 0.0
     assert tiers["system"]["escalation_correct_rate"] == 1.0
@@ -194,7 +199,7 @@ async def test_offline_run_labels_every_case_with_four_tiers_and_passes_the_tier
     assert d.passed, d.reasons
     assert d.tiers == {"tool": True, "turn": True, "session": True, "system": True}
     report = format_report(scores, agg)
-    assert "| Tier | Cases | Detail |" in report and "| tool | 15/15 |" in report
+    assert "| Tier | Cases | Detail |" in report and f"| tool | {n}/{n} |" in report
     assert "| Tool | Calls | Errors | Error rate |" in report
 
 

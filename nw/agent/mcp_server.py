@@ -12,8 +12,8 @@ can never page a person by itself.
 
 Transport: DNS rebinding protection is on, and the Host header must match
 `NW_MCP_ALLOWED_HOSTS` (comma separated, default `localhost:*,127.0.0.1:*`).
-The server has no authentication of its own. On the Reference stack it sits
-behind the track's gateway, which authenticates the caller and applies the
+The server has no authentication of its own. On the platform it sits
+behind the track's gateway or a private ingress, which authenticates the caller and applies the
 policy; do not expose this port directly.
 """
 
@@ -21,14 +21,13 @@ from __future__ import annotations
 
 import functools
 import inspect
-import json
 import os
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-from nw.agent.ports import function_for
+from nw.agent.ports import function_for, guarded
 from nw.agent.tools import Tool, ToolRegistry
 from nw.logging import configure_logging, get_logger, log_fields
 
@@ -64,7 +63,8 @@ def _mcp_function(tool: Tool, registry: ToolRegistry):
             "mcp call",
             extra=log_fields(tool=tool.name, ok=obs.ok, pending=obs.pending_approval),
         )
-        return obs.content if obs.ok else json.dumps({"error": obs.error, "detail": obs.content})
+        # Redacted and wrapped as untrusted: the client on the other end is a model too.
+        return await guarded(obs)
 
     functools.update_wrapper(call, fn)
     call.__signature__ = inspect.signature(fn)  # type: ignore[attr-defined]

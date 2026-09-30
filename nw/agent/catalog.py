@@ -24,7 +24,19 @@ agent cannot reach beyond its scope.
 
 `--check` reads the agents from code (`agents_in_code`): the resolver's registry, the three
 specialists' subsets, the orchestrator's specialist tools and the capstone router. It fails
-when an agent has no entry, its entry is not approved, or its tools exceed the allowed list.
+when an agent has no entry, its entry is not approved, its tools exceed the allowed list, or
+the data it can reach exceeds the data classes it declares. Reach is derived, not declared:
+the ticket text every agent reads, plus each tool's declared outputs (`TOOL_OUTPUTS`, or an
+`output_classes` attribute on the tool), plus everything a delegate agent can reach. An
+orchestrator that asks a specialist reaches what the specialist reaches.
+
+Governance fields ride on every entry (docs/governance/): the EU AI Act class
+(`eu_ai_act_class`: prohibited, high_risk with its Annex III item, transparency under
+Article 50, or minimal), the Article 50 disclosure text, a DPIA reference that must resolve
+to a section of `docs/governance/dpia.md`, and a privacy approver who is not the business
+approver. A prohibited use case can never be approved; a high-risk one needs the high risk
+class and its co-approver. The classification is the course's reading of Regulation (EU)
+2024/1689, recorded so a reviewer can disagree with it, not legal advice.
 The catalog is the source of intent; `nw.agent.registry` is the source of what is deployed.
 
 The roles are the lifecycle personas the AgentOps blog names (product owner, domain expert,
@@ -85,16 +97,63 @@ OVERSIGHT: dict[RiskClass, dict[str, str]] = {
     },
 }
 
-DATA_CLASSES: frozenset[str] = frozenset(
-    {
-        "ticket_text",
-        "customer_account",
-        "entitlements",
-        "policy_corpus",
-        "past_tickets",
-        "escalation_queue",
-    }
-)
+
+class EuAiActClass(StrEnum):
+    """Regulation (EU) 2024/1689: Article 5 practices, Article 6 with Annex III, Article 50
+    transparency obligations, and everything else."""
+
+    PROHIBITED = "prohibited"
+    HIGH_RISK = "high_risk"
+    TRANSPARENCY = "transparency"
+    MINIMAL = "minimal"
+
+
+# What each class of data is and whether it can hold personal data (GDPR Article 4(1)).
+# The DPIA (docs/governance/dpia.md) and the datasheets use the same names.
+DATA_CLASS_INFO: dict[str, dict[str, Any]] = {
+    "ticket_text": {
+        "personal": True,
+        "what": "the ticket the run is about: subject and body as the customer wrote them",
+    },
+    "customer_account": {
+        "personal": False,
+        "what": "the business account: company, tier, region, seats, SLA, features",
+    },
+    "entitlements": {"personal": False, "what": "whether the account's plan includes a feature"},
+    "policy_corpus": {
+        "personal": False,
+        "what": "Northwind policy passages (customer and internal audience)",
+    },
+    "past_tickets": {
+        "personal": True,
+        "what": "other tickets and their answers, possibly from other customers",
+    },
+    "escalation_queue": {
+        "personal": True,
+        "what": "escalation records: ticket id, tier, justification, earlier escalations",
+    },
+}
+DATA_CLASSES: frozenset[str] = frozenset(DATA_CLASS_INFO)
+
+# What every agent reads without a tool: the task.
+INPUT_CLASSES: frozenset[str] = frozenset({"ticket_text"})
+
+# The data classes each tool's output can carry, across every backend (local, http, platform).
+# A tool may override this with an `output_classes` attribute; a tool with neither fails the
+# check, so a new tool cannot widen an agent's reach unnoticed. classify_semantic reaches
+# past tickets because the semantic service's HTTP response lists similar tickets.
+TOOL_OUTPUTS: dict[str, frozenset[str]] = {
+    "lookup_customer": frozenset({"customer_account"}),
+    "check_entitlement": frozenset({"entitlements", "customer_account"}),
+    "search_policies": frozenset({"policy_corpus"}),
+    "classify_urgency": frozenset(),
+    "classify_semantic": frozenset({"past_tickets"}),
+    "find_similar_tickets": frozenset({"past_tickets"}),
+    "escalate": frozenset({"escalation_queue"}),
+}
+
+DPIA = Path("docs/governance/dpia.md")
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 STAGES: tuple[str, ...] = ("plan", "develop", "build", "test_and_release", "deploy", "maintain")
 STAGE_TITLES: dict[str, str] = {
@@ -195,11 +254,26 @@ class UseCase(BaseModel):
     approval: Approval = Approval.DRAFT
     approver: str | None = None
     co_approver: str | None = None
+    eu_ai_act_class: EuAiActClass | None = None
+    annex_iii_item: str | None = None  # for high_risk: the Annex III point, e.g. "4(b)"
+    article_50_disclosure: str | None = None  # the words a person is shown, or None
+    dpia_ref: str | None = None  # docs/governance/dpia.md#<section>
+    privacy_approver: str | None = None
 
     @model_validator(mode="after")
     def _consistent(self) -> UseCase:
         if self.owner not in ROLES:
             raise ValueError(f"{self.id}: owner {self.owner!r} is not a lifecycle role")
+        c = self.eu_ai_act_class
+        if c is EuAiActClass.HIGH_RISK:
+            if not self.annex_iii_item:
+                raise ValueError(f"{self.id}: high_risk needs the annex_iii_item it falls under")
+            if self.risk_class is not RiskClass.HIGH:
+                raise ValueError(f"{self.id}: an Annex III high-risk use case is risk_class high")
+        elif self.annex_iii_item:
+            raise ValueError(f"{self.id}: annex_iii_item is only for high_risk use cases")
+        if c is EuAiActClass.TRANSPARENCY and not self.article_50_disclosure:
+            raise ValueError(f"{self.id}: an Article 50 use case needs its article_50_disclosure")
         unknown = sorted(set(self.data_classes) - DATA_CLASSES)
         if unknown:
             raise ValueError(f"{self.id}: unknown data classes {unknown}")
@@ -208,6 +282,18 @@ class UseCase(BaseModel):
         if self.approval is Approval.APPROVED:
             if not self.approver:
                 raise ValueError(f"{self.id}: approved without an approver")
+            if c is None:
+                raise ValueError(f"{self.id}: approved without an eu_ai_act_class")
+            if c is EuAiActClass.PROHIBITED:
+                raise ValueError(f"{self.id}: a prohibited practice (Article 5) is never approved")
+            if not self.dpia_ref:
+                raise ValueError(f"{self.id}: approved without a dpia_ref")
+            if not self.privacy_approver:
+                raise ValueError(f"{self.id}: approved without a privacy_approver")
+            if self.privacy_approver in {self.approver, self.co_approver}:
+                raise ValueError(
+                    f"{self.id}: the privacy_approver must not be the business approver"
+                )
             if self.risk_class is RiskClass.HIGH and not self.co_approver:
                 raise ValueError(
                     f"{self.id}: high risk needs a co_approver "
@@ -260,10 +346,39 @@ class AgentDefinition:
     roles: tuple[str, ...]  # model roles the agent calls, in nw.config.ModelRole values
     endpoints: list[str]
     requires_approval: frozenset[str] = frozenset()
+    # tool name -> the agent it delegates to (the orchestrator's ask_<role> tools)
+    delegates: dict[str, str] = field(default_factory=dict)
+    # tool name -> output classes declared on the tool itself; TOOL_OUTPUTS otherwise
+    outputs: dict[str, frozenset[str]] = field(default_factory=dict)
 
     @property
     def tools(self) -> list[str]:
         return sorted(s.name for s in self.specs)
+
+
+def reachable_classes(
+    name: str, agents: dict[str, AgentDefinition], _seen: frozenset[str] = frozenset()
+) -> tuple[frozenset[str], list[str]]:
+    """The data classes an agent can reach, and the tools whose outputs nobody declared."""
+    a = agents[name]
+    reach = set(INPUT_CLASSES)
+    undeclared: list[str] = []
+    for tool in a.tools:
+        if tool in a.delegates:
+            target = a.delegates[tool]
+            if target in _seen or target not in agents:
+                undeclared.append(tool)
+                continue
+            sub, missing = reachable_classes(target, agents, _seen | {name})
+            reach |= sub
+            undeclared += missing
+        elif tool in a.outputs:
+            reach |= a.outputs[tool]
+        elif tool in TOOL_OUTPUTS:
+            reach |= TOOL_OUTPUTS[tool]
+        else:
+            undeclared.append(tool)
+    return frozenset(reach), undeclared
 
 
 def agents_in_code(accounts_path: Path = Path("data/accounts.json")) -> dict[str, AgentDefinition]:
@@ -282,10 +397,22 @@ def agents_in_code(accounts_path: Path = Path("data/accounts.json")) -> dict[str
 
     full = build_registry("local", accounts_path=accounts_path)
     approval = frozenset(n for n, t in full.tools.items() if t.requires_approval)
+    outputs = {
+        n: frozenset(t.output_classes)  # type: ignore[attr-defined]
+        for n, t in full.tools.items()
+        if getattr(t, "output_classes", None) is not None
+    }
     service = ["POST /run", "GET /version", "GET /drift", "GET /metrics"]
     out: dict[str, AgentDefinition] = {
         "resolver": AgentDefinition(
-            "resolver", "resolver", SYSTEM_RULES, full.specs(), ("workhorse",), service, approval
+            "resolver",
+            "resolver",
+            SYSTEM_RULES,
+            full.specs(),
+            ("workhorse",),
+            service,
+            approval,
+            outputs=outputs,
         )
     }
     for role, spec in SPECIALISTS.items():
@@ -297,11 +424,18 @@ def agents_in_code(accounts_path: Path = Path("data/accounts.json")) -> dict[str
             ("workhorse",),
             service,
             approval,
+            outputs=outputs,
         )
     urls = {role: f"http://{role}" for role in SPECIALISTS}
     orch = orchestrator_registry(urls, http=httpx.AsyncClient())
     out["orchestrator"] = AgentDefinition(
-        "orchestrator", "orchestrator", ORCHESTRATOR_SYSTEM, orch.specs(), ("workhorse",), service
+        "orchestrator",
+        "orchestrator",
+        ORCHESTRATOR_SYSTEM,
+        orch.specs(),
+        ("workhorse",),
+        service,
+        delegates={f"ask_{role}": role for role in SPECIALISTS},
     )
     out["router"] = AgentDefinition(
         "router",
@@ -316,6 +450,7 @@ def agents_in_code(accounts_path: Path = Path("data/accounts.json")) -> dict[str
             *service,
         ],
         approval,
+        outputs=outputs,
     )
     return out
 
@@ -333,11 +468,28 @@ class CheckResult:
         return not self.problems
 
 
-def check(catalog: Catalog, agents: dict[str, AgentDefinition]) -> CheckResult:
-    """An agent in code needs an approved entry whose allowed tools cover what it can see.
+def dpia_problem(ref: str, root: Path = REPO_ROOT) -> str | None:
+    """None when `path#section` names a file under the repo that carries the section id."""
+    path, _, section = ref.partition("#")
+    f = root / path
+    if not f.is_file():
+        return f"dpia_ref {ref!r}: no file {path}"
+    if section and section not in f.read_text(encoding="utf-8"):
+        return f"dpia_ref {ref!r}: {path} has no section {section!r}"
+    return None
+
+
+def check(
+    catalog: Catalog, agents: dict[str, AgentDefinition], root: Path = REPO_ROOT
+) -> CheckResult:
+    """An agent in code needs an approved entry whose allowed tools cover what it can see
+    and whose data classes cover what it can reach, with a DPIA section that exists.
     An entry with no agent in code is a use case registered before it is built: a note."""
     r = CheckResult()
     entries = catalog.by_agent()
+    for uc in catalog.use_cases:
+        if uc.dpia_ref and (problem := dpia_problem(uc.dpia_ref, root)):
+            r.problems.append(f"{uc.agent}: {problem}")
     for name, a in sorted(agents.items()):
         uc = entries.get(name)
         if uc is None:
@@ -355,6 +507,20 @@ def check(catalog: Catalog, agents: dict[str, AgentDefinition]) -> CheckResult:
             r.notes.append(
                 f"{name}: {uc.id} allows tools the agent does not have: {', '.join(stale)}"
             )
+        reach, undeclared = reachable_classes(name, agents)
+        if undeclared:
+            r.problems.append(
+                f"{name}: tools with no declared output data classes: {', '.join(undeclared)} "
+                "(add them to TOOL_OUTPUTS in nw/agent/catalog.py or set output_classes)"
+            )
+        beyond = sorted(reach - set(uc.data_classes))
+        if beyond:
+            r.problems.append(
+                f"{name}: reaches data classes {uc.id} does not declare: {', '.join(beyond)}"
+            )
+        unused = sorted(set(uc.data_classes) - reach)
+        if unused:
+            r.notes.append(f"{name}: {uc.id} declares data it cannot reach: {', '.join(unused)}")
         irreversible = sorted(set(a.tools) & a.requires_approval)
         if uc.risk_class is RiskClass.LOW and irreversible:
             r.problems.append(
@@ -374,15 +540,20 @@ def check(catalog: Catalog, agents: dict[str, AgentDefinition]) -> CheckResult:
 
 def format_table(catalog: Catalog, agents: dict[str, AgentDefinition] | None = None) -> str:
     lines = [
-        "| Use case | Agent | Owner | Risk | Oversight | Tools | Approval |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
+        "| Use case | Agent | Owner | Risk | EU AI Act | Oversight | Tools | Approval |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for u in catalog.use_cases:
         built = "" if agents is None else ("" if u.agent in agents else " (not built)")
         approval = u.approval.value + (f" by {u.approver}" if u.approver else "")
+        if u.privacy_approver:
+            approval += f", privacy {u.privacy_approver}"
+        act = u.eu_ai_act_class.value if u.eu_ai_act_class else "unclassified"
+        if u.annex_iii_item:
+            act += f" (Annex III {u.annex_iii_item})"
         lines.append(
             f"| {u.id} | {u.agent}{built} | {ROLES[u.owner].title} | {u.risk_class.value} "
-            f"| {u.oversight['human']} | {', '.join(u.allowed_tools)} | {approval} |"
+            f"| {act} | {u.oversight['human']} | {', '.join(u.allowed_tools)} | {approval} |"
         )
     return "\n".join(lines)
 

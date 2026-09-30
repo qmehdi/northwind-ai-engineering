@@ -66,7 +66,9 @@ def corpus_id(kind: str, env: Mapping[str, str] | None = None) -> str | None:
 
 def chunk_from_hit(hit: Hit, known: Mapping[str, Chunk] | None = None) -> Chunk:
     """The chunk a hit refers to: the local one when the id is known, else built from the
-    hit's text and metadata (what `VectorStore.upsert` stored)."""
+    hit's text and metadata (what `VectorStore.upsert` stored). A hit with no `audience` fails
+    closed: it reads as internal, so a store that lost the metadata never shows an internal
+    document to a customer."""
     if known and hit.id in known:
         return known[hit.id]
     m = dict(hit.metadata or {})
@@ -80,7 +82,7 @@ def chunk_from_hit(hit: Hit, known: Mapping[str, Chunk] | None = None) -> Chunk:
         section=str(m.get("section") or ""),
         text=hit.text,
         effective=str(m.get("effective") or ""),
-        audience=str(m.get("audience") or "customer"),
+        audience=str(m.get("audience") or "internal"),
         superseded_by=str(superseded) if superseded else None,
         order=int(m.get("order") or 0),
         tokens=int(m.get("tokens") or 0),

@@ -24,6 +24,19 @@ corpus id from `NW_KNOWLEDGE_BASE_ID`, `NW_RAG_CORPUS` or `NW_QDRANT_COLLECTION`
 corpus or knowledge base id beside the manifest. The gateway key comes from
 `NW_GATEWAY_KEY_SECRET_ARN` or `NW_GATEWAY_KEY_SECRET_NAME` when `NW_GATEWAY_KEY` is unset.
 
+Who sees internal documents: the caller's API key id decides, never the request body.
+`NW_POLICY_AUDIENCES` maps key ids to an audience, `{"ops": "internal"}`; every other key
+(and a laptop with no key, id `none`) is `customer`. A body that asks for `internal`
+without an internal key gets 403; asking for `customer` narrows an internal caller's view.
+
+Durable feedback: `/feedback` records the submitter's key id, accepts at most
+NW_POLICY_FEEDBACK_PER_ANSWER verdicts per answer (default 3, then 429), and writes through
+the ops store (`nw.agent.opstore`): the JSONL file on a laptop, the tenant's `feedback/`
+prefix in the platform's object storage when `NW_OPS_STORE` is set.
+
+Every answer reports what it cost (`cost_usd`), measured on this request's own model calls,
+not on the process meter, which concurrent requests share.
+
 Input screening: with NW_GUARDRAIL_ID (Bedrock Guardrails) or NW_MODEL_ARMOR_TEMPLATE (Model
 Armor) set, `/ask` screens the question before retrieval and refuses with reason `screened`
 when it is blocked. The question is redacted before it is cached, logged or sent to the
@@ -32,6 +45,7 @@ model; the original text is kept nowhere.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -45,11 +59,13 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel, Field
 
+from nw.agent.opstore import LocalStore, OpsStore, store_for
 from nw.agent.screen import Screener, from_env
 from nw.api import install_version_headers, mount_versioned, version_fields
 from nw.auth import install_api_key
 from nw.config import ModelRole, settings
 from nw.llm import LLMClient, prompts
+from nw.llm.errors import RetryableError, SpendCapExceeded, TerminalError
 from nw.llm.providers import make_provider
 from nw.logging import bind_correlation_id, configure_logging, get_logger, log_fields
 from nw.metrics_export import start_metrics_export
@@ -72,6 +88,8 @@ log = get_logger("nw.policy.service")
 REQUESTS = Counter("nw_policy_requests_total", "Requests", ["outcome"])
 LATENCY = Histogram("nw_policy_latency_seconds", "Latency", buckets=(0.1, 0.25, 0.5, 1, 2, 4, 8))
 SPEND = Gauge("nw_policy_spend_usd_total", "Model spend since start")
+COST = Counter("nw_policy_cost_usd_total", "Model spend, summed per request", ["audience"])
+FORBIDDEN = Counter("nw_policy_forbidden_total", "Requests refused for their audience")
 TOKENS = Counter("nw_policy_tokens_total", "Tokens", ["kind"])
 READY = Gauge("nw_policy_ready", "1 when the index is loaded")
 INDEX_STALE = Gauge("nw_policy_index_stale", "1 when the corpus no longer matches the index")
@@ -83,21 +101,41 @@ REFUSAL_RATE = Gauge("nw_policy_refusal_rate_window", "Refusal share over the dr
 DRIFT_LEVEL = Gauge("nw_policy_drift_level", "0 ok, 1 watch, 2 alert, -1 warming up")
 
 ANSWER_MEMORY = 5000  # recent answers kept for /feedback, by answer_id
+AUDIENCES = ("customer", "internal")
+NO_KEY_ID = "none"
+FEEDBACK_PER_ANSWER_DEFAULT = 3
+
+
+def parse_audiences(raw: str) -> dict[str, str]:
+    """`NW_POLICY_AUDIENCES`: a JSON object of key id to audience. Anything malformed stops
+    the service from starting open: a typo must not hand internal documents to everyone."""
+    raw = (raw or "").strip()
+    if not raw:
+        return {}
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict) or not all(
+        isinstance(k, str) and v in AUDIENCES for k, v in parsed.items()
+    ):
+        raise ValueError('NW_POLICY_AUDIENCES must map key ids to "customer" or "internal"')
+    return dict(parsed)
 
 
 class Ask(BaseModel):
     question: str = Field(min_length=3, max_length=2000)
+    # Optional narrowing only: the audience is the caller's, from its key id. A body may ask
+    # for `customer`; asking for `internal` without an internal key is refused with 403.
     audience: str = Field(default="customer", pattern=r"^(customer|internal)$")
     k: int = Field(default=8, ge=1, le=20)
 
 
 class AskResponse(Answer):
     """An Answer plus what the service adds: an id to give feedback on, the model that
-    answered, and whether it came from the cache."""
+    answered, whether it came from the cache, and what this request's model calls cost."""
 
     answer_id: str
     model_id: str
     cached: bool = False
+    cost_usd: float = 0.0
 
 
 class State:
@@ -118,6 +156,11 @@ class State:
     seen: int = 0
     answers: OrderedDict[str, dict[str, Any]] = OrderedDict()
     screener: Screener | None = None  # None screens nothing; the lifespan sets it from env
+    audiences: dict[str, str] = {}  # key id to audience, from NW_POLICY_AUDIENCES
+    feedback_store: OpsStore | None = None
+    feedback_key: str = "feedback.jsonl"
+    feedback_per_answer: int = FEEDBACK_PER_ANSWER_DEFAULT
+    feedback_counts: dict[str, int] = {}
 
 
 state = State()
@@ -173,6 +216,8 @@ async def lifespan(app: FastAPI):
     _configure_llmops()
     yield
     state.ready = False
+    if state.client is not None:
+        await state.client.aclose()
 
 
 def _configure_llmops() -> None:
@@ -202,12 +247,25 @@ def _configure_llmops() -> None:
     state.cache = ResponseCache.from_env()
     feedback = os.environ.get("NW_POLICY_FEEDBACK", str(FEEDBACK_DEFAULT))
     state.feedback_path = Path(feedback) if feedback else None
+    state.feedback_store, state.feedback_key = feedback_store(state.feedback_path)
+    state.feedback_per_answer = int(
+        os.environ.get("NW_POLICY_FEEDBACK_PER_ANSWER", str(FEEDBACK_PER_ANSWER_DEFAULT))
+    )
+    state.feedback_counts = {}
+    state.audiences = parse_audiences(os.environ.get("NW_POLICY_AUDIENCES", ""))
+    if state.audiences:
+        log.info(
+            "audiences by key id",
+            extra=log_fields(
+                internal=sorted(k for k, v in state.audiences.items() if v == "internal")
+            ),
+        )
     capture = os.environ.get("NW_POLICY_CAPTURE")
     state.capture = Path(capture) if capture else None
     state.monitor = PolicyDriftMonitor(
         (manifest or {}).get("baseline"),
         window=int(os.environ.get("NW_POLICY_DRIFT_WINDOW", "500")),
-        min_window=int(os.environ.get("NW_POLICY_DRIFT_MIN", "50")),
+        min_window=int(os.environ.get("NW_POLICY_DRIFT_MIN", "200")),
     )
     state.drift_every = int(os.environ.get("NW_POLICY_DRIFT_EVERY", "50"))
     state.seen = 0
@@ -219,10 +277,29 @@ def _configure_llmops() -> None:
         log.info("drift monitoring off: no baseline in the index manifest")
 
 
+def feedback_store(path: Path | None) -> tuple[OpsStore | None, str]:
+    """Where verdicts go: the tenant's `feedback/verdicts` records with `NW_OPS_STORE`, else
+    the JSONL file at `path` (None: nowhere)."""
+    if os.environ.get("NW_OPS_STORE"):
+        return store_for("feedback", local=FEEDBACK_DEFAULT.parent), "verdicts"
+    if path is None:
+        return None, ""
+    return LocalStore(path.parent), path.name
+
+
+def key_id_of(request: Request) -> str:
+    return getattr(request.state, "api_key_id", None) or NO_KEY_ID
+
+
+def audience_of(request: Request) -> str:
+    """The caller's audience, from its key id. Unknown ids are customers: fail closed."""
+    return "internal" if state.audiences.get(key_id_of(request)) == "internal" else "customer"
+
+
 app = FastAPI(title="Northwind policy service", version="1.1", lifespan=lifespan)
 # Starlette runs the last-added middleware first: the key check runs before the limiter
 # (which buckets by key id) and the version headers land on their 401 and 429 too.
-install_rate_limit(app)
+RATE_LIMIT = install_rate_limit(app)
 install_api_key(app)
 install_version_headers(app)
 configure_tracing("northwind-policy")
@@ -344,7 +421,8 @@ def _remember(resp: AskResponse, req: Ask, top_confidence: float) -> None:
         "cached": resp.cached,
     }
     while len(state.answers) > ANSWER_MEMORY:
-        state.answers.popitem(last=False)
+        evicted, _ = state.answers.popitem(last=False)
+        state.feedback_counts.pop(evicted, None)
 
 
 def _capture(resp: AskResponse, req: Ask, top_confidence: float, latency_ms: float) -> None:
@@ -372,17 +450,28 @@ def _capture(resp: AskResponse, req: Ask, top_confidence: float, latency_ms: flo
 
 
 @app.post("/ask", response_model=AskResponse)
-async def ask(req: Ask) -> AskResponse:
+async def ask(req: Ask, request: Request) -> AskResponse:
     if not state.ready or state.index is None or state.client is None:
         REQUESTS.labels(outcome="not_ready").inc()
         raise HTTPException(503, "index not loaded")
+    # The audience is the caller's. The body may narrow it, never widen it.
+    allowed = audience_of(request)
+    asked = req.audience if "audience" in req.model_fields_set else allowed
+    if asked == "internal" and allowed != "internal":
+        FORBIDDEN.inc()
+        log.warning(
+            "audience refused",
+            extra=log_fields(api_key_id=key_id_of(request), asked=asked, allowed=allowed),
+        )
+        raise HTTPException(403, "this key may not read internal policies")
     t0 = time.perf_counter()
     model_id = _model_id()
     # From here on only the redacted question exists: it is what the cache key, the model,
     # the feedback record and the capture line see. The original is not kept.
-    req = req.model_copy(update={"question": safe_question(req.question)})
+    req = req.model_copy(update={"question": safe_question(req.question), "audience": asked})
     if state.screener is not None:
-        verdict = state.screener.screen(req.question)
+        # A guardrail is blocking HTTP: off the event loop, so one slow call stalls nobody.
+        verdict = await asyncio.to_thread(state.screener.screen, req.question)
         if not verdict.allowed:
             REQUESTS.labels(outcome=SCREENED).inc()
             resp = AskResponse(
@@ -417,18 +506,45 @@ async def ask(req: Ask) -> AskResponse:
         return resp
     if state.cache.enabled:
         CACHE.labels(result="miss").inc()
-    before_usage = state.client.usage
-    retrieved = state.index.retrieve(req.question, k=req.k, audience=req.audience)
+    # Retrieval embeds, calls a vector store or reranks on the CPU: a worker thread.
+    retrieved = await asyncio.to_thread(
+        state.index.retrieve, req.question, k=req.k, audience=req.audience
+    )
     top_confidence = retrieved[0].confidence if retrieved else 0.0
-    result = await answer(state.client, req.question, retrieved, min_score=state.min_score)
+    try:
+        with state.client.cost_scope() as run:  # this request's model calls, not the process meter
+            result = await answer(state.client, req.question, retrieved, min_score=state.min_score)
+    except RetryableError as exc:
+        # Retries, the fallback and the deadline are spent (or the breaker is open): the model
+        # is down, not the caller wrong. 503 with the provider's Retry-After when it sent one.
+        REQUESTS.labels(outcome="model_unavailable").inc()
+        wait = getattr(exc, "retry_after_s", None)
+        raise HTTPException(
+            503,
+            "model provider unavailable, try again shortly",
+            headers={"Retry-After": str(int(wait))} if wait else None,
+        ) from exc
+    except SpendCapExceeded as exc:
+        REQUESTS.labels(outcome="spend_cap").inc()
+        raise HTTPException(503, "the service's spend cap is reached") from exc
+    except TerminalError as exc:
+        if not exc.model_unavailable:
+            raise
+        REQUESTS.labels(outcome="model_unavailable").inc()
+        raise HTTPException(503, "the configured model is not available") from exc
     latency_ms = (time.perf_counter() - t0) * 1000
     LATENCY.observe(latency_ms / 1000)
     REQUESTS.labels(outcome="refused" if result.refused else "answered").inc()
-    after = state.client.usage
-    TOKENS.labels(kind="input").inc(after.input_tokens - before_usage.input_tokens)
-    TOKENS.labels(kind="output").inc(after.output_tokens - before_usage.output_tokens)
+    TOKENS.labels(kind="input").inc(run.usage.input_tokens)
+    TOKENS.labels(kind="output").inc(run.usage.output_tokens)
+    COST.labels(audience=req.audience).inc(run.total_usd)
     SPEND.set(state.client.spend_usd)
-    resp = AskResponse(**result.model_dump(), answer_id=uuid.uuid4().hex, model_id=model_id)
+    resp = AskResponse(
+        **result.model_dump(),
+        answer_id=uuid.uuid4().hex,
+        model_id=model_id,
+        cost_usd=round(run.total_usd, 6),
+    )
     state.cache.put(key, (result, top_confidence))
     _observe(top_confidence, result)
     _remember(resp, req, top_confidence)
@@ -443,27 +559,44 @@ async def ask(req: Ask) -> AskResponse:
             top_confidence=round(top_confidence, 3),
             prompt_version=result.prompt_version,
             cached=False,
+            cost_usd=round(run.total_usd, 6),
+            api_key_id=key_id_of(request),
         ),
     )
     return resp
 
 
 @app.post("/feedback")
-def feedback(fb: FeedbackIn) -> dict[str, Any]:
-    """Record a verdict on an answer. Wrong and unsafe verdicts are golden-set candidates:
-    `python -m nw.policy.feedback --to-golden` prints them."""
+def feedback(fb: FeedbackIn, request: Request) -> dict[str, Any]:
+    """Record a verdict on an answer, with who gave it. Wrong and unsafe verdicts are
+    golden-set candidates: `python -m nw.policy.feedback --to-golden` prints them. One
+    answer takes a few verdicts, not a flood: past the limit, 429."""
     known = state.answers.get(fb.answer_id)
     if known is None:
         raise HTTPException(404, "unknown or expired answer_id")
+    seen = state.feedback_counts.get(fb.answer_id, 0)
+    if seen >= state.feedback_per_answer:
+        raise HTTPException(
+            429, f"this answer already has {seen} verdicts (NW_POLICY_FEEDBACK_PER_ANSWER)"
+        )
+    state.feedback_counts[fb.answer_id] = seen + 1
     FEEDBACK.labels(verdict=fb.verdict).inc()
     record = redact_fields(
-        {"answer_id": fb.answer_id, "verdict": fb.verdict, "note": fb.note, **known},
+        {
+            "answer_id": fb.answer_id,
+            "verdict": fb.verdict,
+            "note": fb.note,
+            "submitted_by": key_id_of(request),
+            **known,
+        },
         "note",
         "question",
         "text",
     )
-    if state.feedback_path is not None:
-        append_feedback(state.feedback_path, record)
+    if state.feedback_store is None and state.feedback_path is not None:
+        state.feedback_store, state.feedback_key = feedback_store(state.feedback_path)
+    if state.feedback_store is not None:
+        append_feedback(state.feedback_store, record, key=state.feedback_key)
     log.info(
         "feedback",
         extra=log_fields(
@@ -474,8 +607,12 @@ def feedback(fb: FeedbackIn) -> dict[str, Any]:
         ),
     )
     return {
-        "recorded": state.feedback_path is not None,
-        "path": str(state.feedback_path) if state.feedback_path else None,
+        "recorded": state.feedback_store is not None,
+        "path": (
+            f"{state.feedback_store.location}/{state.feedback_key}"
+            if state.feedback_store
+            else None
+        ),
         "golden_candidate": fb.verdict != "helpful",
     }
 

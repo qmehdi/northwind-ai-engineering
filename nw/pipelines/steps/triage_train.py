@@ -14,15 +14,15 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from nw.pipelines.steps import localize, package, write_result
+from nw.pipelines.steps import local_path, localize, package, write_result
 from nw.triage.train import format_report, train
 
 STEP = "triage_train"
 
 
 def run(
-    data: Path,
-    out: Path,
+    data: Path | str,
+    out: Path | str,
     *,
     target_recall: float = 0.90,
     min_precision: float = 0.25,
@@ -31,6 +31,7 @@ def run(
     seed: int = 0,
     package_dir: Path | None = None,
 ) -> dict[str, Any]:
+    out = local_path(out)
     model, report = train(
         localize(data),
         Path(out),
@@ -67,15 +68,17 @@ def run(
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--data", type=Path, default=Path("data/tickets.jsonl"))
-    ap.add_argument("--out", type=Path, default=Path("artifacts/triage"))
+    ap.add_argument("--data", default="data/tickets.jsonl", help="a path, gs:// or s3:// URI")
+    ap.add_argument(
+        "--out", default="artifacts/triage", help="the artifact tree: a path or gs:// URI"
+    )
     ap.add_argument("--target-recall", type=float, default=0.90)
     ap.add_argument("--min-precision", type=float, default=0.25)
     ap.add_argument("--no-class-weight", action="store_true")
     ap.add_argument("--no-calibration", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument(
-        "--package-dir", type=Path, default=None, help="also write model.tar.gz into this directory"
+        "--package-dir", default=None, help="also write model.tar.gz into this directory"
     )
     args = ap.parse_args(argv)
     run(

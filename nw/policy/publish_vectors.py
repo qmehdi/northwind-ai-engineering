@@ -1,10 +1,11 @@
-"""Publish the policy chunks to the AWS Reference stack's managed retriever, S3 Vectors.
+"""Publish the policy chunks to the AWS platform's managed retriever, S3 Vectors.
 
-The Session path ships the vectors inside the image (`artifacts/policy/vectors.npy`). The
-Reference stack keeps them in an S3 Vectors index instead, so the index has to be filled
-once after the stack exists. `scripts/deploy_aws.sh` runs this after a reference deploy;
-it embeds the chunks with the same model the index was sized for and upserts them by id,
-so running it twice is harmless.
+The in-process retriever ships the vectors inside the image (`artifacts/policy/vectors.npy`).
+An S3 Vectors index of your own keeps them outside the image instead, so the index has to be
+filled once after it exists. The AWS platform's knowledge base ingests the corpus itself
+(`NW_RETRIEVER=knowledge-base`); this module is the direct path, run by hand. It embeds
+the chunks with the same model the index was sized for and upserts them by id, so running it
+twice is harmless.
 
     uv run python -m nw.policy.publish_vectors --bucket northwind-policy-<account>-<region>
 """

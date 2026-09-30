@@ -209,6 +209,11 @@ async def check_round_trips(settings, provider) -> list[Check]:
     spend = 0.0
     for role in ModelRole:
         model = settings.model_for(role)
+        # Running without a Judge is a supported path on Local: report it, do not fail on it.
+        why = settings.judge_unavailable() if role is ModelRole.JUDGE else None
+        if why:
+            checks.append(Check(f"model {role.value}", True, f"{model}: {why}", required=False))
+            continue
         try:
             c = await provider.complete(
                 [Message.user("Reply with the single word: ready")],

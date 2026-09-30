@@ -133,7 +133,7 @@ class ToolRegistry:
         self, name: str, arguments: dict[str, Any]
     ) -> tuple[Tool, BaseModel | None, str | None]:
         """Look the tool up and validate its arguments. Returns (tool, args, error)."""
-        return self.tools[name], self.tools[name].args_model(**arguments), None  # Step 2
+        return self.tools[name], self.tools[name].args_model(**arguments), None  # registry
 
     async def execute(
         self, name: str, arguments: dict[str, Any], *, approved: bool = False

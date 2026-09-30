@@ -18,6 +18,7 @@
     "properties": {
      "account_id": {
       "default": "NW-00000",
+      "pattern": "^NW-\\d{5,}$",
       "title": "Account Id",
       "type": "string"
      },
@@ -59,6 +60,7 @@
      },
      "ticket_id": {
       "default": "T-000000",
+      "pattern": "^T-\\d{6}$",
       "title": "Ticket Id",
       "type": "string"
      }
@@ -71,6 +73,19 @@
    },
    "SpecialistRequest": {
     "properties": {
+     "account_id": {
+      "anyOf": [
+       {
+        "pattern": "^NW-\\d{5,}$",
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "description": "The ticket's account; the run's customer tools read this account only",
+      "title": "Account Id"
+     },
      "budget_usd": {
       "default": 0.1,
       "exclusiveMinimum": 0.0,
@@ -295,7 +310,7 @@
   "/route": {
    "post": {
     "deprecated": true,
-    "description": "Deprecated alias of `/v1/route`, kept for one release. Call `/v1/route`.\n\nCapstone endpoint: Project 1 first, then the cheapest loop that will do.",
+    "description": "Deprecated alias of `/v1/route`, kept for one release. Call `/v1/route`.\n\nCapstone endpoint: Project 1 first, then the cheapest loop that will do. The caps the\nrequest sets (`max_steps`, `budget_usd`, `max_total_tokens`) lower the router's own;\nfields left out keep the router's policy.",
     "operationId": "route_ticket_route_post",
     "requestBody": {
      "content": {
@@ -401,7 +416,7 @@
   },
   "/v1/route": {
    "post": {
-    "description": "Capstone endpoint: Project 1 first, then the cheapest loop that will do.",
+    "description": "Capstone endpoint: Project 1 first, then the cheapest loop that will do. The caps the\nrequest sets (`max_steps`, `budget_usd`, `max_total_tokens`) lower the router's own;\nfields left out keep the router's policy.",
     "operationId": "route_ticket_v1_route_post",
     "requestBody": {
      "content": {

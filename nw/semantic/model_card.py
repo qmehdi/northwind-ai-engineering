@@ -15,6 +15,8 @@ from typing import Any
 
 import numpy as np
 
+from nw.evalstats import fmt_rate
+
 
 def _load(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
@@ -26,6 +28,7 @@ def render(
     thresholds: np.ndarray | None = None,
     export: dict[str, Any] | None = None,
     benchmark: list[dict[str, Any]] | None = None,
+    promotion: dict[str, Any] | None = None,
 ) -> str:
     m = metadata["metrics"]
     v, t = m["val"], m["test"]
@@ -112,8 +115,9 @@ def render(
             f"MB (ratio {export['size_ratio']})",
             f"- Parity against PyTorch on held-out tickets, max absolute logit difference: fp32 "
             f"{export['max_abs_diff_fp32']:.2e}, int8 {export['max_abs_diff_int8']:.2f}",
-            "- The service runs the int8 graph on ONNX Runtime by default (`NW_QUANTIZED=1`); "
-            "the tokenizer ships in the artifact so the image never reaches the Hub",
+            "- The served graph is the one the promotion gate chose (`serving.json`): int8 when "
+            "it clears every served bar, else fp32. `NW_QUANTIZED` overrides it; the tokenizer "
+            "ships in the artifact so the image never reaches the Hub",
         ]
     if benchmark:
         lines += [
@@ -129,6 +133,22 @@ def render(
                 f"| {r['model']} | {r['priority_macro_f1']:.3f} | {r['p0_recall']:.3f} | {tag} "
                 f"| {r['p50_ms']:.1f} | {r['p95_ms']:.1f} | {r['bytes'] / 1e6:.1f} |"
             )
+    if promotion:
+        served = promotion.get("served_format")
+        lines += ["", "## Promotion decision", ""]
+        lines.append(
+            f"- {'Passed' if promotion.get('passed') else 'Failed'}"
+            + (" (forced)" if promotion.get("forced") else "")
+            + (f", serving the {served} graph" if served else "")
+            + (f", decided by {promotion['decided_by']}" if promotion.get("decided_by") else "")
+        )
+        for fmt, ev in ((promotion.get("evidence") or {}).get("served") or {}).items():
+            lines.append(f"- {fmt} P0 recall on test {fmt_rate(ev['p0_recall'])}")
+        lines += [f"- {r}" for r in promotion.get("reasons") or []]
+        lines += [f"- Note: {n}" for n in promotion.get("notes") or []]
+        lines += [
+            f"- Insufficient evidence: {x}" for x in promotion.get("insufficient_evidence") or []
+        ]
     if profile:
         top = sorted(profile.get("tag_share", {}).items(), key=lambda x: -x[1])[:10]
         lines += [
@@ -162,11 +182,14 @@ def render(
         "by design, so this model is not the one that decides an SLA.",
         "- The base model is English; the languages with few training rows are reported above "
         "and are expected to be worse.",
-        "- Dynamic int8 quantisation costs the rare class first; the gate bounds the loss "
-        "against fp32 and the benchmark shows it.",
+        "- Dynamic int8 quantisation costs the rare class first; the gate counts the P0 tickets "
+        "int8 misses against fp32 and serves fp32 when int8 falls below a served bar.",
+        "- A language with fewer than ten P0 tickets in the test split has its P0 recall "
+        "reported, not gated; the decision above names it.",
         "- The service measures drift against this training profile (`/drift`): text length, "
-        "predicted priority and the tag rate, and logs `drift_alert` past a PSI of 0.2; "
-        "the deployment alarms on it.",
+        "predicted priority and the tag rate, from 200 requests, and logs `drift_alert` past "
+        "a PSI of 0.2 or the chance level of the window, whichever is higher; the deployment "
+        "alarms on it, and on `nw_semantic_quality_level` during a canary.",
         "- Promotion goes through the gate in `nw/semantic/promote.py`; the decision log is "
         "`artifacts/semantic/promotions.jsonl`.",
         "",
@@ -190,6 +213,7 @@ def write(artifact_dir: Path) -> Path:
             thresholds,
             _load(artifact_dir / "export_report.json"),
             _load(artifact_dir / "benchmark.json"),
+            _load(artifact_dir / "promotion.json"),
         ),
         encoding="utf-8",
     )

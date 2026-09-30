@@ -8,6 +8,8 @@ FROM ${UV_IMAGE} AS uv
 FROM ${BASE}
 USER root
 COPY --from=uv /uv /bin/uv
+# Slow or flaky networks: each download may take up to five minutes, with retries.
+ENV UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=5
 RUN uv pip install --python /app/.venv/bin/python mlflow==3.16.1 && rm /bin/uv
 COPY serve.sh /usr/local/bin/serve.sh
 RUN chmod +x /usr/local/bin/serve.sh && chown -R nw:nw /app

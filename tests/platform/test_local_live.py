@@ -28,8 +28,49 @@ pytestmark = [pytest.mark.live, pytest.mark.session06]
 
 QDRANT = os.environ.get("NW_QDRANT_URL", "http://localhost:6333")
 GATEWAY = os.environ.get("NW_GATEWAY_URL", "http://localhost:4000")
-GATEWAY_KEY = os.environ.get("NW_GATEWAY_KEY", "sk-nw-solo-change-me")
-OLLAMA = os.environ.get("NW_OLLAMA_HOST_URL", "http://localhost:11435")
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def stack_setting(name: str) -> str:
+    """A setting the stack was started with: the environment, else the `.env` Compose read."""
+    if os.environ.get(name):
+        return os.environ[name]
+    env = ROOT / ".env"
+    if env.exists():
+        for line in env.read_text().splitlines():
+            if line.startswith(f"{name}="):
+                return line.split("=", 1)[1].strip().strip('"')
+    return ""
+
+
+def ollama_url() -> str:
+    """The Ollama the stack uses, seen from the laptop: `NW_OLLAMA_HOST_URL` when set; the native
+    one on :11434 when the stack points at `host.docker.internal`; else the compose one on :11435."""
+    if os.environ.get("NW_OLLAMA_HOST_URL"):
+        return os.environ["NW_OLLAMA_HOST_URL"]
+    internal = stack_setting("NW_COMPOSE_OLLAMA_INTERNAL_URL")
+    if "host.docker.internal" in internal:
+        return internal.replace("host.docker.internal", "localhost")
+    return "http://localhost:11435"
+
+
+def gateway_key() -> str:
+    """The solo tenant's gateway key: `NW_GATEWAY_KEY` from the environment or `.env`, else the
+    `solo` row of `deploy/local/litellm/tenant-keys.tsv` (`deploy/local/secrets.sh` generates
+    both on the first `make local-up`; no key ships with the repository)."""
+    if stack_setting("NW_GATEWAY_KEY"):
+        return stack_setting("NW_GATEWAY_KEY")
+    keys = ROOT / "deploy" / "local" / "litellm" / "tenant-keys.tsv"
+    if keys.exists():
+        for line in keys.read_text().splitlines():
+            name, _, key = line.partition("\t")
+            if name == "solo" and key.strip():
+                return key.strip()
+    return ""
+
+
+GATEWAY_KEY = gateway_key()
+OLLAMA = ollama_url()
 ENDPOINT = os.environ.get("NW_ENDPOINT_URL", "http://localhost:8005")
 AGENT = os.environ.get("NW_AGENT_RUNTIME_URL", "http://localhost:8014")
 

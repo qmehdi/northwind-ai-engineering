@@ -19,6 +19,13 @@ not ready (the pattern Project 1 taught).
 
 The cloud SDKs and MLflow are imported inside the fetch that needs them, so a service on one
 track never needs the other tracks' packages installed.
+
+The bucket is not trusted with the file system: every object key is resolved under the target
+directory and a key that would land outside it (`../`, an absolute path) fails the fetch, and a
+tarball is unpacked with the `data` filter. The bucket is not trusted with code either: the
+platform can inject `NW_MODEL_SHA256`, the model file's hash from the registry entry, which the
+loader checks before unpickling (`ModelSource.expected_sha256`, passed to `TriageModel.load`),
+so a hash that travels beside the file is not the only check.
 """
 
 from __future__ import annotations
@@ -38,6 +45,7 @@ log = get_logger("nw.serving.download")
 
 URI_VAR = "NW_MODEL_URI"
 VERSION_VAR = "NW_MODEL_VERSION"
+SHA_VAR = "NW_MODEL_SHA256"
 # Set by the Agent Platform on a custom container deployed from a registered model with an
 # artifact URI (custom container requirements, docs.cloud.google.com, fetched 2026-09-29).
 AIP_STORAGE_URI = "AIP_STORAGE_URI"
@@ -55,6 +63,7 @@ class ModelSource:
     version: str | None  # NW_MODEL_VERSION, else the artifact's metadata version
     fetched: bool = False  # True when the files were materialised into a temp directory
     error: str | None = None  # why a fetch failed; the path is then an empty directory
+    expected_sha256: str | None = None  # the model file's hash from the registry, if injected
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -63,6 +72,7 @@ class ModelSource:
             "path": str(self.path),
             "fetched": self.fetched,
             "error": self.error,
+            "expected_sha256": self.expected_sha256,
         }
 
 
@@ -94,26 +104,38 @@ def model_source(
     e = os.environ if env is None else env
     uri = (e.get(uri_var) or e.get(AIP_STORAGE_URI) or "").strip() or None
     pinned = (e.get(version_var) or "").strip() or None
+    sha = (e.get(SHA_VAR) or "").strip().lower() or None
     if uri is None:
         path = Path(fallback)
-        return ModelSource(path=path, uri=None, version=pinned or artifact_version(path))
+        return ModelSource(
+            path=path, uri=None, version=pinned or artifact_version(path), expected_sha256=sha
+        )
     if not is_uri(uri):
         # A plain path in the URI variable: serve it in place, the way the fallback is served.
         path = Path(uri)
-        return ModelSource(path=path, uri=uri, version=pinned or artifact_version(path))
+        return ModelSource(
+            path=path, uri=uri, version=pinned or artifact_version(path), expected_sha256=sha
+        )
     target = Path(into) if into is not None else Path(tempfile.mkdtemp(prefix="nw-model-"))
     target.mkdir(parents=True, exist_ok=True)
     try:
         path = fetch(uri, target)
     except Exception as exc:  # noqa: BLE001  the service reports not ready, never crashes
         log.error("model fetch failed", extra=log_fields(model_uri=uri, error=str(exc)))
-        return ModelSource(path=target, uri=uri, version=pinned, fetched=False, error=str(exc))
+        return ModelSource(
+            path=target,
+            uri=uri,
+            version=pinned,
+            fetched=False,
+            error=str(exc),
+            expected_sha256=sha,
+        )
     version = pinned or artifact_version(path)
     log.info(
         "model fetched",
         extra=log_fields(model_uri=uri, model_version=version, path=str(path)),
     )
-    return ModelSource(path=path, uri=uri, version=version, fetched=True)
+    return ModelSource(path=path, uri=uri, version=version, fetched=True, expected_sha256=sha)
 
 
 def fetch(uri: str, into: Path) -> Path:
@@ -136,6 +158,18 @@ def fetch(uri: str, into: Path) -> Path:
 # ----- the fetches ---------------------------------------------------------------------
 
 
+def contained(into: Path, rel: str) -> Path:
+    """`into / rel`, refusing any key that would resolve outside `into` (path traversal from a
+    bucket key such as `prefix/../../etc/cron.d/x`, or an absolute key)."""
+    root = Path(into).resolve()
+    if not rel or rel.startswith(("/", "\\")) or "\x00" in rel:
+        raise ValueError(f"refusing object key {rel!r}: not a relative path")
+    dest = (root / rel).resolve()
+    if not dest.is_relative_to(root):
+        raise ValueError(f"refusing object key {rel!r}: resolves outside {root}")
+    return dest
+
+
 def _fetch_file(uri: str, into: Path) -> None:
     src = Path(uri.removeprefix("file://"))
     if not src.exists():
@@ -152,7 +186,7 @@ def _fetch_s3(uri: str, into: Path) -> None:
     bucket, _, key = uri.removeprefix("s3://").partition("/")
     client = boto3.client("s3", region_name=os.environ.get("NW_AWS_REGION", "us-east-1"))
     if key.endswith(TARBALL_SUFFIXES) or "." in key.rsplit("/", 1)[-1]:
-        client.download_file(bucket, key, str(into / key.rsplit("/", 1)[-1]))
+        client.download_file(bucket, key, str(contained(into, key.rsplit("/", 1)[-1])))
         return
     prefix = key if key.endswith("/") or not key else key + "/"
     pages = client.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix)
@@ -162,7 +196,7 @@ def _fetch_s3(uri: str, into: Path) -> None:
             rel = obj["Key"][len(prefix) :]
             if not rel or rel.endswith("/"):
                 continue
-            dest = into / rel
+            dest = contained(into, rel)
             dest.parent.mkdir(parents=True, exist_ok=True)
             client.download_file(bucket, obj["Key"], str(dest))
             found += 1
@@ -177,7 +211,7 @@ def _fetch_gcs(uri: str, into: Path) -> None:
     client = storage.Client()
     bucket = client.bucket(bucket_name)
     if key.endswith(TARBALL_SUFFIXES) or "." in key.rsplit("/", 1)[-1]:
-        bucket.blob(key).download_to_filename(str(into / key.rsplit("/", 1)[-1]))
+        bucket.blob(key).download_to_filename(str(contained(into, key.rsplit("/", 1)[-1])))
         return
     prefix = key if key.endswith("/") or not key else key + "/"
     found = 0
@@ -185,7 +219,7 @@ def _fetch_gcs(uri: str, into: Path) -> None:
         rel = blob.name[len(prefix) :]
         if not rel or rel.endswith("/"):
             continue
-        dest = into / rel
+        dest = contained(into, rel)
         dest.parent.mkdir(parents=True, exist_ok=True)
         blob.download_to_filename(str(dest))
         found += 1

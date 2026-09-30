@@ -19,7 +19,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from nw.pipelines.steps import localize, write_json, write_result
+from nw.pipelines.steps import local_path, localize, write_json, write_result
 from nw.semantic.data import TAG_INDEX, load_rows
 from nw.semantic.train import tag_share
 from nw.triage.data_check import Finding, format_profile, profile, validate
@@ -54,7 +54,8 @@ def tag_findings(rows: list[dict[str, Any]]) -> list[Finding]:
     return out
 
 
-def run(data: Path, out: Path) -> dict[str, Any]:
+def run(data: Path | str, out: Path | str) -> dict[str, Any]:
+    out = local_path(out)
     path = localize(data)
     rows = load_rows(path)
     findings = validate(rows) + tag_findings(rows)
@@ -80,8 +81,10 @@ def run(data: Path, out: Path) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--data", type=Path, default=Path("data/tickets.jsonl"))
-    ap.add_argument("--out", type=Path, default=Path("artifacts/semantic"))
+    ap.add_argument("--data", default="data/tickets.jsonl", help="a path, gs:// or s3:// URI")
+    ap.add_argument(
+        "--out", default="artifacts/semantic", help="the artifact tree: a path or gs:// URI"
+    )
     args = ap.parse_args(argv)
     return 0 if run(args.data, args.out)["ok"] else 1
 

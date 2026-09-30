@@ -5,6 +5,7 @@
     cdk synth -c tenants=alice,bob -c alertEmail=you@example.com -c budgetUsd=300
     cdk synth -c tenants=alice -c env=staging                # northwind-staging-* names
     cdk synth -c tenants=alice -c connectionArn=arn:aws:codeconnections:...  # with the pipeline
+    cdk synth -c mode=solo -c agentEgress=public             # agents without the egress VPC
 
 cdk-nag runs on every synth with the AwsSolutions pack; a new finding fails the synth until it
 is fixed or suppressed with a reason in stacks/nag.py.
@@ -22,7 +23,7 @@ app = cdk.App()
 ctx = app.node.try_get_context
 env_name = check_stage(ctx("env") or "")
 mode = ctx("mode") or ("cohort" if ctx("tenants") else "solo")
-tenants = tenant_names(ctx("tenants"), mode)
+tenants = tenant_names(ctx("tenants"), mode, env_name)
 stack = PlatformStack(
     app,
     f"{prefix(env_name)}-platform" if env_name else "northwind-platform",
@@ -36,6 +37,7 @@ stack = PlatformStack(
     github_repo=ctx("githubRepo") or "northwind-ai-engineering",
     github_branch=ctx("githubBranch") or "main",
     lake_formation=str(ctx("lakeFormation") or "false").lower() == "true",
+    agent_egress=str(ctx("agentEgress") or "vpc").lower(),
     env=cdk.Environment(
         account=os.environ.get("CDK_DEFAULT_ACCOUNT"),
         region=os.environ.get("CDK_DEFAULT_REGION", "us-east-1"),

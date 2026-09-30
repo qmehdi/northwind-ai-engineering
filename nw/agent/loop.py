@@ -6,10 +6,23 @@ with either text or tool calls, the registry validates and runs them, and the
 observations go back as the next turn. Everything else is guard rails:
 step cap, spend cap, an approval gate on irreversible tools, and a trace of
 every step.
+
+Privacy and cost, in code rather than in the prompt:
+- the task is redacted before the screener or the model sees it (account and invoice ids
+  stay: the tools are bound to the run's account), and so is every tool observation;
+- with a screener configured, tool output is screened too, because a similar ticket or a
+  policy passage is text from outside the system just like the ticket;
+- the run's cost is its own (`client.cost_scope()`), not the process meter read before and
+  after, so concurrent runs never stop each other on BUDGET or inflate each other's
+  `cost_usd`;
+- the run's model calls stay in the account's residency zone (`nw.llm.residency`): an EU
+  account gets EU models, or a clear refusal where the track has none.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -20,8 +33,10 @@ from nw.agent.trace import Step, Termination, Trajectory
 from nw.agent.version import agent_version
 from nw.config import ModelRole
 from nw.llm import LLMClient
+from nw.llm.residency import bind_residency, residency_for_account
 from nw.llm.types import Completion, StopReason, ToolCall
 from nw.logging import correlation_id, get_logger, log_fields
+from nw.policy.redact import redact, redact_for_agent
 from nw.telemetry import span
 
 log = get_logger("nw.agent.loop")
@@ -60,11 +75,16 @@ async def run_agent(
     max_tokens: int = 1024,
     screener: Screener | None = None,
     max_total_tokens: int | None = None,
+    account_id: str | None = None,
+    requested_by: str | None = None,
 ) -> Trajectory:
     """One span per run so the whole trajectory reads as a tree in the trace viewer.
 
     `max_total_tokens` is the run's token budget, input plus output over every model call;
-    the loop stops with BUDGET before the call that would follow exhausting it."""
+    the loop stops with BUDGET before the call that would follow exhausting it.
+    `account_id`, from the request and never from the ticket text, binds the customer tools
+    to that account for this run (`nw.agent.northwind.bind_account`). `requested_by` is the
+    caller's key id or identity, kept on the trajectory so an approver can be told apart."""
     with span("agent.run", **{"nw.agent": agent_name}) as run_span:
         t = await _run_agent(
             task,
@@ -79,6 +99,8 @@ async def run_agent(
             max_tokens=max_tokens,
             screener=screener,
             max_total_tokens=max_total_tokens,
+            account_id=account_id,
+            requested_by=requested_by,
         )
         run_span.set_attribute("nw.run_id", t.run_id)
         run_span.set_attribute("nw.agent_version", t.agent_version or "")
@@ -104,14 +126,69 @@ async def _run_agent(
     max_tokens: int = 1024,
     screener: Screener | None = None,
     max_total_tokens: int | None = None,
+    account_id: str | None = None,
+    requested_by: str | None = None,
+) -> Trajectory:
+    binding: contextlib.AbstractContextManager[Any] = contextlib.nullcontext()
+    if account_id is not None:
+        from nw.agent.northwind import bind_account
+
+        binding = bind_account(account_id)
+    residency = residency_for_account(account_id) if account_id else None
+    with binding, bind_residency(residency), client.cost_scope() as run:
+        return await _loop(
+            run,
+            task,
+            registry,
+            client,
+            system=system,
+            max_steps=max_steps,
+            budget_usd=budget_usd,
+            role=role,
+            approval=approval,
+            agent_name=agent_name,
+            max_tokens=max_tokens,
+            screener=screener,
+            max_total_tokens=max_total_tokens,
+            account_id=account_id,
+            requested_by=requested_by,
+        )
+
+
+async def _loop(
+    run: Any,
+    task: str,
+    registry: ToolRegistry,
+    client: LLMClient,
+    *,
+    system: str,
+    max_steps: int,
+    budget_usd: float,
+    role: ModelRole,
+    approval: ApprovalPolicy,
+    agent_name: str,
+    max_tokens: int,
+    screener: Screener | None,
+    max_total_tokens: int | None,
+    account_id: str | None,
+    requested_by: str | None,
 ) -> Trajectory:
     run_id = uuid.uuid4().hex[:10]
-    t = Trajectory(run_id=run_id, agent=agent_name, task=task, correlation_id=correlation_id())
+    # Only the redacted task exists from here on: the screener, the model and the trace see it.
+    task = redact_for_agent(task)
+    t = Trajectory(
+        run_id=run_id,
+        agent=agent_name,
+        task=task,
+        correlation_id=correlation_id(),
+        account_id=account_id,
+        requested_by=requested_by,
+    )
     t.model_id = client.model_for(role)
     t.agent_version = agent_version(system, registry.specs(), {role.value: t.model_id})
-    spent_before = client.spend_usd
     if screener is not None:
-        verdict = screener.screen(task)
+        # Guardrail calls are blocking HTTP; off the event loop so other runs keep moving.
+        verdict = await asyncio.to_thread(screener.screen, task)
         t.steps.append(
             Step(
                 index=0,
@@ -129,18 +206,16 @@ async def _run_agent(
             )
             return t
 
-    raise NotImplementedError("Step 3: the loop, the caps, the approval gate, the trace")
+    raise NotImplementedError("The loop: the caps, the approval gate, the trace")
 
     # The final reply is customer-facing. Sensitive values that came in with the ticket must
-    # not go back out, whatever the model did: enforce it in code, the Session 4 way.
+    # not go back out, whatever the model did: enforce it in code, the way the policy service does.
     if t.final:
-        from nw.policy.redact import redact
-
         red = redact(t.final)
         if red.count:
             t.final = red.text
             log.info("redacted final", extra=log_fields(run_id=run_id, count=red.count))
-    t.cost_usd = client.spend_usd - spent_before
+    t.cost_usd = run.total_usd
     log.info(
         "run",
         extra=log_fields(
@@ -166,6 +241,22 @@ async def _decide(policy: ApprovalPolicy, call: ToolCall, registry: ToolRegistry
     if hasattr(verdict, "__await__"):
         verdict = await verdict
     return bool(verdict)
+
+
+async def _guard_observation(content: str, ok: bool, screener: Screener | None, run_id: str) -> str:
+    """Tool output on its way to the model: redacted like the task, and screened when a
+    screener is configured. A blocked observation is replaced, never passed on."""
+    content = redact_for_agent(content)
+    if not ok or screener is None or screener.name == "none":
+        return content
+    verdict = await asyncio.to_thread(screener.screen, content)
+    if verdict.allowed:
+        return content
+    log.warning(
+        "tool output screened",
+        extra=log_fields(run_id=run_id, screener=verdict.screener, reason=verdict.reason),
+    )
+    return f"[tool output withheld: blocked by {verdict.screener}: {verdict.reason}]"
 
 
 def _wrap(content: str, ok: bool) -> str:

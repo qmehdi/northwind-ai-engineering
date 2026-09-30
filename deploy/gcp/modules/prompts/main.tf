@@ -14,6 +14,7 @@ variable "artifacts_bucket" { type = string }
 variable "embedding_model" { type = string }
 variable "rag_backend" { type = string }
 variable "rag_managed_db_tier" { type = string }
+variable "rag_unprovision_on_destroy" { type = bool }
 
 locals {
   embedding_endpoint = "projects/${var.project_number}/locations/${var.region}/publishers/google/models/${var.embedding_model}"
@@ -36,7 +37,10 @@ resource "null_resource" "prompts" {
 }
 
 # Project-wide RagManagedDb tier. Left alone unless asked, because the resource is one per
-# project and a second environment in the same project would fight over it.
+# project and a second environment in the same project would fight over it. The first corpus on
+# RagManagedDb provisions the project's tier (Basic: a Spanner instance of 100 processing units,
+# billed every hour whether or not anything is queried, deploy/COSTS-platform.md), and deleting
+# the corpora does not stop it.
 resource "google_vertex_ai_rag_engine_config" "tier" {
   count   = var.rag_managed_db_tier == "" ? 0 : 1
   project = var.project
@@ -57,11 +61,27 @@ resource "google_vertex_ai_rag_engine_config" "tier" {
   }
 }
 
+# Destroy sets the tier to Unprovisioned, which deletes the RagManagedDb instance and ends the
+# hourly charge (updateRagEngineConfig, v1). The corpora depend on this resource, so they are
+# deleted first. Turn rag_unprovision_on_destroy off when another environment in the same
+# project still uses RAG Engine on RagManagedDb.
+resource "null_resource" "rag_unprovision_on_destroy" {
+  count = !local.vector_search && var.rag_unprovision_on_destroy ? 1 : 0
+  triggers = {
+    project = var.project
+    region  = var.region
+  }
+  provisioner "local-exec" {
+    when    = destroy
+    command = "curl -sf -X PATCH -H \"Authorization: Bearer $(gcloud auth print-access-token)\" -H 'Content-Type: application/json' https://${self.triggers.region}-aiplatform.googleapis.com/v1/projects/${self.triggers.project}/locations/${self.triggers.region}/ragEngineConfig -d '{\"name\": \"projects/${self.triggers.project}/locations/${self.triggers.region}/ragEngineConfig\", \"ragManagedDbConfig\": {\"unprovisioned\": {}}}' && echo 'RagManagedDb set to Unprovisioned'"
+  }
+}
+
 # ----- optional: Vector Search underneath -----------------------------------------------
 # RAG Engine requires STREAM_UPDATE and DOT_PRODUCT or COSINE distance, a public index
 # endpoint, and a deployed index; the dimension matches the embedding model (768 for
 # text-embedding-005). Each deployed index bills per node hour, which is why managed is the
-# default (deploy/COSTS.md).
+# default (deploy/COSTS-platform.md).
 
 resource "google_vertex_ai_index" "policies" {
   for_each            = local.vector_search ? toset(var.tenants) : toset([])
@@ -136,7 +156,7 @@ resource "google_vertex_ai_rag_corpus" "policies" {
       }
     }
   }
-  depends_on = [google_vertex_ai_index_endpoint_deployed_index.policies, google_vertex_ai_rag_engine_config.tier]
+  depends_on = [google_vertex_ai_index_endpoint_deployed_index.policies, google_vertex_ai_rag_engine_config.tier, null_resource.rag_unprovision_on_destroy]
 }
 
 output "corpora" { value = { for k, c in google_vertex_ai_rag_corpus.policies : k => c.name } }

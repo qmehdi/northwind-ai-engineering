@@ -1,6 +1,6 @@
 """The resolver behind the two managed agent runtimes, one module for both contracts.
 
-The Reference stack runs the same `nw-agent` image on the track's managed runtime, and
+The platform runs the same `nw-agent` image on the track's managed runtime, and
 each runtime speaks to its container in its own shape:
 
 - Amazon Bedrock AgentCore Runtime, protocol HTTP (the runtime service contract,
@@ -17,18 +17,26 @@ each runtime speaks to its container in its own shape:
 Every invocation logs one `invocation` line with the session id and, through the bound
 identity, the tenant and environment the runtime injected.
 
-Both call the same code as the Session path's `/route`: Project 1 first, then the
-cheapest loop that will do. The Session path app is mounted underneath, so `/route`,
+Both call the same code as the agent service's `/route`: Project 1 first, then the
+cheapest loop that will do. The service app is mounted underneath, so `/route`,
 `/run`, `/readyz`, `/healthz` and `/metrics` keep working and the runtime's probes and
 the course's own health checks agree. The port comes from `PORT` through the image's
 uvicorn command, so nothing here binds a socket.
 
     NW_AGENT_ROLE=resolver PORT=8080 uv run uvicorn nw.agent.agentcore:app --port 8080
+
+The contract routes take the same `x-api-key` as every other route and the same per-key rate
+limit: on the Local track this port is published by Compose, and a route that spends model
+tokens is never open. A managed runtime authenticates its callers itself (IAM on AgentCore
+and Agent Engine, Entra ID on Foundry) and does not forward a custom key, so its deployment
+sets `NW_RUNTIME_AUTH=platform`, which leaves the contract routes to the platform's check.
+The probes (`/ping`, `/readiness`) stay open, as the platform's health checks carry no key.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -40,7 +48,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from nw.agent import service
 from nw.agent.orchestrator import SpecialistResponse
 from nw.agent.service import RouteRequest, route_ticket
+from nw.auth import install_api_key, protect
 from nw.logging import get_logger, log_fields
+from nw.ratelimit import install_rate_limit
 
 log = get_logger("nw.agent.agentcore")
 
@@ -69,17 +79,42 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="Northwind resolver on a managed runtime", version="1.0", lifespan=lifespan)
 
+CONTRACT_PATHS = frozenset(
+    {"/invocations", "/api/reasoning_engine", "/api/stream_reasoning_engine"}
+)
+
+
+def install_contract_auth(target: FastAPI, *, key: str | None = None) -> None:
+    """The key check and the per-key rate limit on the contract routes only (the mounted app
+    checks its own), failing closed off the local track when no key is configured, unless
+    the platform authenticates (`NW_RUNTIME_AUTH=platform`). `key` overrides the environment
+    (tests)."""
+    if os.environ.get("NW_RUNTIME_AUTH", "").strip().lower() == "platform":
+        log.info("contract routes authenticated by the platform", extra=log_fields())
+        return
+    if key is None:
+        protect(target, CONTRACT_PATHS)
+        return
+    install_rate_limit(target, only=CONTRACT_PATHS)
+    install_api_key(target, key=key, only=CONTRACT_PATHS)
+
+
+install_contract_auth(app)
+
 
 def _request(body: dict[str, Any]) -> RouteRequest:
     task = body.get("task") or body.get("prompt")
     if not isinstance(task, str) or not task.strip():
         raise HTTPException(422, "body needs a non-empty 'task' or 'prompt'")
     fields = {k: body[k] for k in ("ticket_id", "account_id", "subject") if body.get(k)}
-    return RouteRequest(task=task, **fields)
+    try:
+        return RouteRequest(task=task, **fields)
+    except ValueError as exc:
+        raise HTTPException(422, f"invalid request: {exc}") from exc
 
 
-async def _route(body: dict[str, Any]) -> SpecialistResponse:
-    return await route_ticket(_request(body))
+async def _route(body: dict[str, Any], request: Request) -> SpecialistResponse:
+    return await route_ticket(_request(body), request)
 
 
 # ----- Amazon Bedrock AgentCore Runtime, protocol HTTP --------------------------------
@@ -102,7 +137,7 @@ async def invocations(
     header is logged and echoed; a missing one gets a fresh, contract-length id."""
     session = request.headers.get(SESSION_HEADER) or runtime_session_id()
     response.headers[SESSION_HEADER] = session
-    result = await _route(body)
+    result = await _route(body, request)
     log.info(
         "invocation",
         extra=log_fields(
@@ -131,8 +166,8 @@ def _agent_engine_input(body: dict[str, Any]) -> dict[str, Any]:
 
 
 @app.post("/api/reasoning_engine")
-async def reasoning_engine(body: dict[str, Any]) -> dict[str, Any]:
-    resp = await _route(_agent_engine_input(body))
+async def reasoning_engine(body: dict[str, Any], request: Request) -> dict[str, Any]:
+    resp = await _route(_agent_engine_input(body), request)
     log.info(
         "invocation",
         extra=log_fields(runtime="agent-engine", run_id=resp.run_id, terminated=resp.terminated),
@@ -141,10 +176,10 @@ async def reasoning_engine(body: dict[str, Any]) -> dict[str, Any]:
 
 
 @app.post("/api/stream_reasoning_engine")
-async def stream_reasoning_engine(body: dict[str, Any]) -> StreamingResponse:
+async def stream_reasoning_engine(body: dict[str, Any], request: Request) -> StreamingResponse:
     """The router answers in one piece, so the stream is one newline-delimited JSON line.
     Routing runs before the response starts so a 503 or 422 still reaches the caller."""
-    resp = await _route(_agent_engine_input(body))
+    resp = await _route(_agent_engine_input(body), request)
 
     async def lines() -> AsyncIterator[bytes]:
         yield (json.dumps({"output": resp.model_dump()}) + "\n").encode()
@@ -152,5 +187,5 @@ async def stream_reasoning_engine(body: dict[str, Any]) -> StreamingResponse:
     return StreamingResponse(lines(), media_type="application/x-ndjson")
 
 
-# The Session path app underneath: /route, /run, /readyz, /healthz, /metrics, API key included.
+# The agent service app underneath: /route, /run, /readyz, /healthz, /metrics, API key included.
 app.mount("/", service.app)

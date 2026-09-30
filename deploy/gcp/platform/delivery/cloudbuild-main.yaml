@@ -1,5 +1,11 @@
-# Push to main: build every course image once, push by digest, create the Cloud Deploy
-# release. The rollout stops at the canary and waits for approval (`make approve-gcp`).
+# Push to main (or `make release-gcp`, which submits this same build): build every course image
+# once, push it under the immutable git SHA tag, sign each digest with cosign keyless as the
+# builder service account, verify the signatures, and create the Cloud Deploy release by digest.
+# The rollout waits for approval, deploys the canary and waits again to advance to stable
+# (`make approve-gcp` does the next step each time). A second build of the same commit reuses
+# the images already pushed (tags are immutable). Bash variables are written `$$name` so Cloud
+# Build does not read them as substitutions. `_TAG` is set by `make release-gcp` (a manual build
+# has no SHORT_SHA); the trigger leaves it empty and the commit SHA is used.
 steps:
   - id: build
     name: gcr.io/cloud-builders/docker
@@ -8,16 +14,44 @@ steps:
       - -c
       - |
         set -euo pipefail
-        build() { docker build --build-arg "APP=$2" --build-arg "ARTIFACTS=$3" --build-arg "HF_MODELS=$4" -t "${_REGISTRY}/nw-$1:${SHORT_SHA}" . ; }
+        TAG="${_TAG}"; [ -n "$$TAG" ] || TAG="${SHORT_SHA}"
+        echo "$$TAG" > /workspace/tag
+        build() {
+          local ref="${_REGISTRY}/nw-$$1:$$TAG"
+          if docker pull "$$ref" >/dev/null 2>&1; then
+            echo "reusing $$ref"
+          else
+            docker build --build-arg "GIT_SHA=$COMMIT_SHA" --build-arg "APP=$$2" --build-arg "ARTIFACTS=$$3" --build-arg "HF_MODELS=$$4" -t "$$ref" .
+            docker push "$$ref"
+          fi
+          docker inspect --format='{{index .RepoDigests 0}}' "$$ref" | sed "s/^/nw-$$1=/" >> /workspace/images.txt
+        }
         build triage   nw.triage.service:app   "triage" 0
         build semantic nw.semantic.service:app "semantic index" 1
         build policy   nw.policy.service:app   "policy" 1
         build agent    nw.agent.service:app    "triage semantic index policy" 1
-        for s in triage semantic policy agent; do docker push "${_REGISTRY}/nw-$s:${SHORT_SHA}"; done
-        for s in triage semantic policy agent; do
-          docker inspect --format='{{index .RepoDigests 0}}' "${_REGISTRY}/nw-$s:${SHORT_SHA}" | sed "s/^/nw-$s=/" >> /workspace/images.txt
-        done
         cat /workspace/images.txt
+  - id: sign-and-verify
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        curl -sSfL -o /workspace/cosign https://github.com/sigstore/cosign/releases/download/v3.1.3/cosign-linux-amd64
+        echo "4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71  /workspace/cosign" | sha256sum -c -
+        chmod +x /workspace/cosign
+        curl -sSf -H 'Metadata-Flavor: Google' \
+          'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=sigstore' > /workspace/sigstore-token
+        for line in $(cat /workspace/images.txt); do
+          ref="$${line#*=}"
+          /workspace/cosign sign --yes --identity-token=/workspace/sigstore-token "$$ref"
+          /workspace/cosign verify "$$ref" \
+            --certificate-identity="${_BUILDER_SA}" \
+            --certificate-oidc-issuer=https://accounts.google.com >/dev/null
+          echo "signed and verified $$ref"
+        done
+        rm -f /workspace/sigstore-token
   - id: release
     name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
     entrypoint: bash
@@ -28,21 +62,27 @@ steps:
         cd deploy/gcp/platform/delivery
         mkdir -p rendered
         for f in skaffold.yaml run-*.yaml; do
-          sed -e "s/@ENVIRONMENT@/${_ENVIRONMENT}/g" -e "s/@PROJECT@/${PROJECT_ID}/g" -e "s/@REGION@/${_REGION}/g" -e "s/@LIVE_SA@/${_LIVE_SA}/g" "$f" > "rendered/$f"
+          # NW_IMAGE_DIGEST: the digest the service's image resolves to, which /version reports.
+          kind="$${f#run-}"; kind="$${kind%.yaml}"
+          digest="$$(grep "^nw-$$kind=" /workspace/images.txt | sed 's/.*@//' || true)"
+          sed -e "s/@ENVIRONMENT@/${_ENVIRONMENT}/g" -e "s/@PROJECT_NUMBER@/${PROJECT_NUMBER}/g" -e "s/@PROJECT@/${PROJECT_ID}/g" -e "s/@REGION@/${_REGION}/g" -e "s/@LIVE_SA@/${_LIVE_SA}/g" -e "s/@IMAGE_DIGEST@/$$digest/g" "$$f" > "rendered/$$f"
         done
         IMAGES=$(paste -sd, /workspace/images.txt)
-        gcloud deploy releases create "rel-${SHORT_SHA}" \
+        gcloud deploy releases create "rel-$(tr -c 'a-z0-9\n' '-' < /workspace/tag)-$(date +%H%M%S)" \
           --project="${PROJECT_ID}" --region="${_REGION}" \
-          --delivery-pipeline="${_PIPELINE}" --source=rendered \
-          --images="${IMAGES}" --deploy-parameters="environment=${_ENVIRONMENT}"
+          --delivery-pipeline="${_PIPELINE}" --source=rendered --gcs-source-staging-dir="${_STAGING}" \
+          --images="$$IMAGES" --deploy-parameters="environment=${_ENVIRONMENT}"
 options:
   logging: CLOUD_LOGGING_ONLY
   machineType: E2_HIGHCPU_8
 substitutions:
+  _TAG: ""
   _ENVIRONMENT: northwind
   _REGION: us-central1
   _REGISTRY: us-central1-docker.pkg.dev/PROJECT/northwind
   _PIPELINE: northwind-live
   _LIVE_SA: northwind-live@PROJECT.iam.gserviceaccount.com
   _DEPLOYER_SA: northwind-deployer@PROJECT.iam.gserviceaccount.com
+  _BUILDER_SA: northwind-builder@PROJECT.iam.gserviceaccount.com
+  _STAGING: gs://northwind-PROJECT-artifacts/clouddeploy/source
 timeout: 3600s

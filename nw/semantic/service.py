@@ -16,8 +16,10 @@ Endpoints:
 
 `NW_SEMANTIC_ARTIFACT` is a version directory, `latest`, a flat directory holding
 `metadata.json`, or the root `artifacts/semantic`, which means `latest`: the served model
-is the one the promotion gate chose. Environment, all optional: NW_QUANTIZED (1, the int8
-graph), NW_SEMANTIC_SHADOW_ARTIFACT (a second artifact, the same shapes of path, scored on
+is the one the promotion gate chose, and so is the graph: `serving.json` beside the artifact
+says int8 or fp32 (the gate serves fp32 when int8 falls below a served bar). Environment,
+all optional: NW_QUANTIZED (1 the int8 graph, 0 fp32, overriding the gate's choice),
+NW_SEMANTIC_SHADOW_ARTIFACT (a second artifact, the same shapes of path, scored on
 every request with its int8 graph, agreement counted, never served), NW_SEMANTIC_CAPTURE (a
 JSONL file of requests and predictions for backtests), NW_SEMANTIC_DRIFT_WINDOW,
 NW_SEMANTIC_DRIFT_MIN, NW_SEMANTIC_DRIFT_EVERY.
@@ -155,7 +157,7 @@ def _configure_mlops(artifact: Path, quantized: bool) -> None:
     state.monitor = SemanticDriftMonitor(
         profile,
         window=int(os.environ.get("NW_SEMANTIC_DRIFT_WINDOW", "500")),
-        min_window=int(os.environ.get("NW_SEMANTIC_DRIFT_MIN", "50")),
+        min_window=int(os.environ.get("NW_SEMANTIC_DRIFT_MIN", "200")),
     )
     state.drift_every = int(os.environ.get("NW_SEMANTIC_DRIFT_EVERY", "50"))
     state.seen = 0
@@ -189,7 +191,7 @@ async def lifespan(app: FastAPI):
     artifact = state.source.path
     index_dir = Path(os.environ["NW_INDEX"]) if os.environ.get("NW_INDEX") else None
     try:
-        load_all(artifact, index_dir, quantized=os.environ.get("NW_QUANTIZED", "1") == "1")
+        load_all(artifact, index_dir, quantized=_quantized(artifact))
         LOADED.set(1)
         INFO.labels(version=state.version, format=state.fmt).set(1)
         log.info(
@@ -291,6 +293,18 @@ def _observe(ticket: TicketIn, priority: str, tags: list[str]) -> None:
             )
 
 
+def _quantized(artifact: Path) -> bool:
+    """`NW_QUANTIZED` when set; else the graph the promotion gate chose (`serving.json`);
+    else int8."""
+    env = os.environ.get("NW_QUANTIZED")
+    if env is not None and env != "":
+        return env == "1"
+    from nw.semantic.promote import served_quantized
+
+    chosen = served_quantized(artifact)
+    return True if chosen is None else chosen
+
+
 def _shadow(text: str, priority: str) -> str | None:
     """The shadow artifact's priority for the same text: counted against the served one,
     logged when it differs, never returned to the caller."""
@@ -360,7 +374,10 @@ def classify_ticket(ticket: TicketIn) -> Classification:
     )
     PREDICTIONS.labels(priority=result.priority).inc()
     _observe(ticket, result.priority, tags)
-    _capture(ticket, result, _shadow(text, result.priority))
+    shadow = _shadow(text, result.priority)
+    if shadow is not None:
+        state.monitor.observe_shadow(shadow == result.priority)
+    _capture(ticket, result, shadow)
     log.info(
         "classify",
         extra=log_fields(priority=result.priority, n_tags=len(tags), n_similar=len(similar)),

@@ -1,7 +1,8 @@
-# One line per tenant: name, monthly budget in USD, the virtual key. `make local-up` applies it
-# (keys.sh) and re-applies it on every start, so edit here and restart the gateway to change a
-# budget. Keys are the tenant's NW_GATEWAY_KEY; rotate by editing the third column.
+# One line per tenant: name and monthly budget in USD. `make local-up` applies it (keys.sh) and
+# re-applies it on every start, so edit here and restart the gateway to change a budget. The
+# keys are not here: deploy/local/secrets.sh generates one per name into tenant-keys.tsv
+# (untracked) and your own into .env as NW_GATEWAY_KEY. A third column sets a key yourself.
 # Cohort mode: one line per learner. Solo mode: the `solo` line is enough.
-solo	10.00	sk-nw-solo-change-me
-alice	5.00	sk-nw-alice-change-me
-bob	5.00	sk-nw-bob-change-me
+solo	10.00
+alice	5.00
+bob	5.00

@@ -29,43 +29,68 @@ from nw.platform.base import (
 # ----- fakes -----------------------------------------------------------------------------------
 
 
+class PreconditionFailed(Exception):
+    """Named like google.api_core's: `if_generation_match` did not match."""
+
+    code = 412
+
+
 class FakeBlob:
-    def __init__(self, store: dict[str, str], name: str) -> None:
-        self.store, self.name = store, name
+    """A GCS object with a generation per write, honouring `if_generation_match` (0 means the
+    object must not exist) so the read-modify-write documents are tested for lost updates."""
+
+    def __init__(self, store: dict[str, str], gens: dict[str, int], name: str) -> None:
+        self.store, self.gens, self.name = store, gens, name
+        self.generation: int | None = None
 
     def exists(self) -> bool:
         return self.name in self.store
 
-    def download_as_text(self) -> str:
+    def reload(self) -> None:
+        self.generation = self.gens.get(self.name)
+
+    def download_as_text(self, if_generation_match: int | None = None) -> str:
+        if if_generation_match is not None and self.gens.get(self.name) != if_generation_match:
+            raise PreconditionFailed(self.name)
         return self.store[self.name]
 
-    def upload_from_string(self, text: str, content_type: str = "") -> None:
+    def upload_from_string(
+        self, text: str, content_type: str = "", if_generation_match: int | None = None
+    ) -> None:
+        if if_generation_match is not None and self.gens.get(self.name, 0) != if_generation_match:
+            raise PreconditionFailed(self.name)
         self.store[self.name] = text
+        self.gens[self.name] = self.gens.get(self.name, 0) + 1
 
     def upload_from_filename(self, path: str) -> None:
-        self.store[self.name] = Path(path).read_text()
+        self.upload_from_string(Path(path).read_bytes().decode("latin-1"))
 
     def download_to_filename(self, path: str) -> None:
         Path(path).write_text(self.store[self.name])
 
+    def delete(self) -> None:
+        self.store.pop(self.name, None)
+        self.gens.pop(self.name, None)
+
 
 class FakeBucket:
-    def __init__(self, store: dict[str, str]) -> None:
-        self.store = store
+    def __init__(self, store: dict[str, str], gens: dict[str, int]) -> None:
+        self.store, self.gens = store, gens
 
     def blob(self, name: str) -> FakeBlob:
-        return FakeBlob(self.store, name)
+        return FakeBlob(self.store, self.gens, name)
 
     def list_blobs(self, prefix: str = "") -> list[FakeBlob]:
-        return [FakeBlob(self.store, k) for k in sorted(self.store) if k.startswith(prefix)]
+        return [self.blob(k) for k in sorted(self.store) if k.startswith(prefix)]
 
 
 class FakeStorage:
     def __init__(self) -> None:
         self.buckets: dict[str, dict[str, str]] = {}
+        self.gens: dict[str, dict[str, int]] = {}
 
     def bucket(self, name: str) -> FakeBucket:
-        return FakeBucket(self.buckets.setdefault(name, {}))
+        return FakeBucket(self.buckets.setdefault(name, {}), self.gens.setdefault(name, {}))
 
 
 class FakeVersion:
@@ -121,16 +146,48 @@ class FakeModel:
 
     def deploy(self, **kw: Any) -> None:
         self.deployed.append(kw)
+        endpoint = kw["endpoint"]
+        endpoint.add(kw["deployed_model_display_name"], kw["traffic_percentage"])
 
 
 class FakeEndpoint:
+    """A Vertex endpoint: deployed models with ids, a traffic split that sums to 100, and
+    `undeploy` refusing a model that still has traffic (as the SDK does)."""
+
     def __init__(self, resource_name: str) -> None:
         self.resource_name = resource_name
-        self.traffic_split = {"m1": 100}
+        self.models: dict[str, str] = {}  # id -> display name
+        self.traffic_split: dict[str, int] = {}
+        self.undeployed_ids: list[str] = []
         self.undeployed = False
+        self._next = 0
+
+    def add(self, display: str, percent: int) -> None:
+        self._next += 1
+        new = f"m{self._next}"
+        if not self.traffic_split:
+            percent = 100
+        rest = 100 - percent
+        total = sum(self.traffic_split.values()) or 1
+        self.traffic_split = {k: round(v * rest / total) for k, v in self.traffic_split.items()}
+        self.traffic_split[new] = percent
+        self.models[new] = display
 
     def list_models(self) -> list[Any]:
-        return [SimpleNamespace(id="m1", display_name="northwind-live-triage-v1", model="models/1")]
+        return [
+            SimpleNamespace(id=i, display_name=d, model=f"models/{i}")
+            for i, d in self.models.items()
+        ]
+
+    def update(self, traffic_split: dict[str, int]) -> None:
+        assert sum(traffic_split.values()) == 100 and set(traffic_split) <= set(self.models)
+        self.traffic_split = {i: traffic_split.get(i, 0) for i in self.models}
+
+    def undeploy(self, deployed_model_id: str) -> None:
+        assert self.traffic_split.get(deployed_model_id, 0) == 0, "undeploy a serving model"
+        self.models.pop(deployed_model_id)
+        self.traffic_split.pop(deployed_model_id, None)
+        self.undeployed_ids.append(deployed_model_id)
 
     def predict(self, instances: list[Any]) -> Any:
         return SimpleNamespace(
@@ -139,6 +196,8 @@ class FakeEndpoint:
 
     def undeploy_all(self) -> None:
         self.undeployed = True
+        self.models.clear()
+        self.traffic_split.clear()
 
 
 class FakePipelineJob:
@@ -481,7 +540,8 @@ def test_registry_register_stage_live_download(cfg, clients, fakes, alice, tmp_p
     assert live.stage == Stage.LIVE
     assert reg.live(alice, "triage").version == "2"
     assert reg.set_stage(alice, "triage", "1", Stage.LIVE, "rollback").version == "1"
-    assert [v.stage for v in reg.versions(alice, "triage")] == [Stage.LIVE, Stage.CANDIDATE]
+    # the previous live version steps back to retired (the contract's rule), logged with why
+    assert [v.stage for v in reg.versions(alice, "triage")] == [Stage.LIVE, Stage.RETIRED]
     trail = (
         fakes["storage"]
         .buckets["arts"]["northwind-alice/registry/triage/stages.jsonl"]
@@ -491,8 +551,11 @@ def test_registry_register_stage_live_download(cfg, clients, fakes, alice, tmp_p
         "registered",
         "registered",
         "gate passed",
+        "replaced by 1: rollback",
         "rollback",
     ]
+    # each version keeps its own artifact, not the default version's
+    assert [v.uri for v in reg.versions(alice, "triage")][0] == v1.uri
 
     into = reg.download(alice, v1, tmp_path / "dl")
     assert (into / "model.joblib").read_text() == "bytes" and (into / "MODEL_CARD.md").exists()
@@ -504,20 +567,30 @@ def test_pipelines_submit_status_wait_logs(cfg, clients, fakes, alice, tmp_path:
     template = tmp_path / "retrain-triage.yaml"
     template.write_text("pipelineInfo: {}")
     sleeps: list[float] = []
-    runner = gcp.VertexPipelineRunner(cfg, clients, sleep=sleeps.append)
+    bundle = _bundle(tmp_path)
+    runner = gcp.VertexPipelineRunner(cfg, clients, sleep=sleeps.append, bundler=lambda: bundle)
     with pytest.raises(FileNotFoundError):
         runner.submit(alice, "retrain-triage", {})
     run = runner.submit(alice, "retrain-triage", {"template_path": str(template), "epochs": 2})
     job = FakePipelineJob.jobs[run.run_id]
     assert job.kw["display_name"] == "northwind-alice-retrain-triage"
     assert job.kw["pipeline_root"] == "gs://pipes/northwind-alice"
-    assert job.kw["parameter_values"] == {
+    values = dict(job.kw["parameter_values"])
+    platform_env = json.loads(values.pop("platform_env"))
+    assert values == {
         "epochs": 2,
         "tenant": "alice",
         "environment": "northwind",
         "output_root": "gs://arts/northwind-alice/pipelines/runs",
         "production_summary": "gs://arts/baselines/triage_production.json",
+        "source_uri": f"gs://arts/northwind-alice/source/{bundle.name}",
     }
+    # the learner's code rides with the run, and the scheduler's copy follows it
+    arts = fakes["storage"].buckets["arts"]
+    assert f"northwind-alice/source/{bundle.name}" in arts
+    assert "northwind-alice/source/latest.tar.gz" in arts
+    assert platform_env["NW_TRACK"] == "gcp" and platform_env["NW_GCP_PROJECT"] == "p"
+    assert platform_env["NW_TENANT"] == "alice"
     # With the data bucket known, the tickets default to the deployed copy; a value passed wins.
     cfg.data_bucket = "dat"
     run2 = runner.submit(
@@ -547,7 +620,9 @@ def test_pipelines_named_template_is_uploaded_where_the_scheduler_reads_it(
     compiled.mkdir()
     (compiled / "retrain-triage.yaml").write_text("pipelineInfo: {name: northwind-triage}")
     cfg.pipeline_dir = str(compiled)
-    runner = gcp.VertexPipelineRunner(cfg, clients, sleep=lambda s: None)
+    runner = gcp.VertexPipelineRunner(
+        cfg, clients, sleep=lambda s: None, bundler=lambda: _bundle(tmp_path)
+    )
     uri = "gs://arts/northwind-alice/pipelines/retrain-triage.yaml"
     assert runner.template_uri(alice, "retrain-triage") == uri
     run = runner.submit(alice, "retrain-triage", {})
@@ -630,14 +705,13 @@ def test_endpoints_tenant_and_live(cfg, clients, fakes, alice) -> None:
     live = Tenant(name="live")
     name = ep.deploy(alice, version, live=True, canary_percent=10)
     assert name.endswith("/endpoints/100000")
-    assert (
-        model.deployed[0]["traffic_percentage"] == 10
-        and model.deployed[0]["endpoint"].resource_name == name
-    )
+    # nothing was serving: the first live version takes everything
+    assert model.deployed[0]["endpoint"].resource_name == name
     assert ep.invoke(live, "triage", {"instances": [{"a": 1}]})["predictions"] == [
         {"queue": "billing"}
     ]
     assert ep.status(live, "triage")["traffic_split"] == {"m1": 100}
+    assert ep.status(live, "triage")["stable"] == "m1"
     ep.delete(live, "triage")
     assert fakes["aiplatform"].endpoints[name].undeployed is True
     ep.delete(alice, "triage")
@@ -700,37 +774,133 @@ def test_vectors_upsert_search_count_drop(cfg, clients, fakes, alice) -> None:
     n = vs.upsert(
         alice,
         "policies",
-        ["refund-policy", "sla"],
+        ["refund-policy", "sla#2"],
         ["Refunds within 30 days.", "SLA is 99.9."],
         None,
-        [{"vintage": "2025"}, {}],
+        [{"vintage": "2025", "audience": "internal"}, {"audience": "customer"}],
     )
     assert n == 2
     imp = fakes["rag"].imports[0]
+    # only the documents are imported: metadata files never become corpus documents
     assert imp["corpus"].endswith("/7") and imp["paths"] == [
-        "gs://arts/northwind-alice/rag/policies/"
+        "gs://arts/northwind-alice/rag/policies/docs/"
     ]
-    assert (
-        fakes["storage"].buckets["arts"]["northwind-alice/rag/policies/refund-policy.txt"]
-        == "Refunds within 30 days."
-    )
-    assert (
-        json.loads(
-            fakes["storage"].buckets["arts"]["northwind-alice/rag/policies/refund-policy.meta.json"]
-        )["vintage"]
-        == "2025"
-    )
+    arts = fakes["storage"].buckets["arts"]
+    assert arts["northwind-alice/rag/policies/docs/refund-policy.txt"] == "Refunds within 30 days."
+    assert "northwind-alice/rag/policies/docs/sla%232.txt" in arts
+    assert not any(k.endswith(".meta.json") for k in arts)
     hits = vs.search(alice, "policies", "refund?", k=3)
-    assert (
-        hits[0].id == "refund-policy"
-        and hits[0].score == 0.91
-        and fakes["rag"].queries[0]["top_k"] == 3
-    )
+    # the hit carries the audience it was stored with, so the service can filter it
+    assert hits[0].id == "refund-policy" and hits[0].metadata["audience"] == "internal"
+    assert hits[0].metadata["raw_score"] == 0.91 and hits[0].metadata["score_kind"] == "distance"
+    assert hits[0].score == pytest.approx(1 - 0.91) and fakes["rag"].queries[0]["top_k"] == 3
+    assert gcp.RagEngineVectorStore.id_of("gs://b/p/docs/sla%232.txt") == "sla#2"
     assert vs.count(alice, "policies") == 1
     vs.drop(alice, "policies")
     assert vs.count(alice, "policies") == 0
+    # the source objects are gone too, so the next upsert cannot import them back
+    assert not any(k.startswith("northwind-alice/rag/policies/") for k in arts)
     with pytest.raises(KeyError):
         vs.search(Tenant(name="bob"), "policies", "x")
+
+
+def test_rag_hits_without_metadata_read_as_internal(cfg, clients, fakes, alice) -> None:
+    """A hit whose id has no stored metadata fails closed in the policy retriever."""
+    from nw.platform.retrievers import chunk_from_hit
+
+    fakes["rag"].corpora.append(
+        SimpleNamespace(display_name="northwind-alice-policies", name="c/7")
+    )
+    vs = gcp.RagEngineVectorStore(cfg, clients, score_kind="similarity")
+    [hit] = vs.search(alice, "policies", "refund?")
+    assert "audience" not in hit.metadata and hit.score == 0.91
+    assert chunk_from_hit(hit).audience == "internal"
+
+
+def test_live_canary_promote_undeploys_the_old_model(cfg, clients, fakes, alice) -> None:
+    """The live endpoint keeps one stable model and one canary; finishing undeploys the rest,
+    so no old replica keeps billing (audit 01 H11)."""
+    reg = gcp.VertexModelRegistry(cfg, clients)
+    ep = gcp.CloudRunEndpointClient(cfg, clients)
+    live = Tenant(name="live")
+    versions = []
+    for _ in range(3):
+        versions.append(_registered(reg, alice, fakes))
+    ep.deploy(alice, versions[0], live=True)
+    endpoint = fakes["aiplatform"].endpoints[cfg.live_endpoint_name("triage")]
+    assert endpoint.traffic_split == {"m1": 100}
+    ep.deploy(alice, versions[1], live=True, canary_percent=10)
+    assert endpoint.traffic_split == {"m1": 90, "m2": 10}
+    record = ep.live_record("triage")
+    assert (record["stable"], record["canary"]) == ("m1", "m2")
+    # finishing the same version never deploys a second copy
+    ep.deploy(alice, versions[1], live=True, canary_percent=0)
+    assert endpoint.traffic_split == {"m2": 100} and endpoint.undeployed_ids == ["m1"]
+    assert len(fakes["aiplatform"].models["northwind-alice-triage"].deployed) == 2
+    ep.deploy(alice, versions[2], live=True, canary_percent=20)
+    assert ep.promote(live, "triage") == "m3"
+    assert endpoint.traffic_split == {"m3": 100} and endpoint.undeployed_ids == ["m1", "m2"]
+    with pytest.raises(KeyError, match="no canary"):
+        ep.promote(live, "triage")
+
+
+def test_live_rollback_undeploys_the_canary_and_one_canary_at_a_time(
+    cfg, clients, fakes, alice
+) -> None:
+    reg = gcp.VertexModelRegistry(cfg, clients)
+    ep = gcp.CloudRunEndpointClient(cfg, clients)
+    live = Tenant(name="live")
+    v1, v2, v3 = (_registered(reg, alice, fakes) for _ in range(3))
+    ep.deploy(alice, v1, live=True)
+    endpoint = fakes["aiplatform"].endpoints[cfg.live_endpoint_name("triage")]
+    ep.deploy(alice, v2, live=True, canary_percent=50)
+    # a second canary replaces the unfinished one instead of stacking a third model
+    ep.deploy(alice, v3, live=True, canary_percent=10)
+    assert set(endpoint.models) == {"m1", "m3"} and endpoint.undeployed_ids == ["m2"]
+    assert ep.rollback(live, "triage") == "m1"
+    assert endpoint.traffic_split == {"m1": 100} and endpoint.undeployed_ids == ["m2", "m3"]
+    assert ep.status(live, "triage")["canary"] is None
+
+
+def test_shared_documents_retry_instead_of_losing_an_update(cfg, clients, fakes) -> None:
+    docs = gcp.Documents(clients, "arts")
+    docs.write("agents/agents.json", {"agents": []})
+    real = docs.update_text
+    raced = {"done": False}
+
+    def racing(path, mutate, content_type):
+        def interleaved(text):
+            if not raced["done"]:
+                raced["done"] = True
+                gcp.Documents(clients, "arts").update(
+                    "agents/agents.json", lambda d: {**d, "agents": ["bob"]}, {}
+                )
+            return mutate(text)
+
+        return real(path, interleaved, content_type)
+
+    docs.update_text = racing  # type: ignore[method-assign]
+    docs.update("agents/agents.json", lambda d: {**d, "agents": [*d["agents"], "alice"]}, {})
+    assert json.loads(fakes["storage"].buckets["arts"]["agents/agents.json"])["agents"] == [
+        "bob",
+        "alice",
+    ]
+
+
+def _bundle(tmp_path: Path):
+    from nw.pipelines.source import Bundle
+
+    path = tmp_path / "nw-source-0123456789ab.tar.gz"
+    path.write_bytes(b"bundle")
+    return Bundle(path=path, sha256_12="0123456789ab", git_sha="abc", files=1)
+
+
+def _registered(reg, alice, fakes):
+    import tempfile
+
+    tmp = Path(tempfile.mkdtemp(prefix="nw-art-"))
+    (tmp / "model.joblib").write_text("m")
+    return reg.register(alice, "triage", tmp, {"f1": 0.9}, {})
 
 
 def test_agents_deploy_invoke_register_status(
@@ -772,7 +942,10 @@ def test_agents_deploy_invoke_register_status(
     uri = rt.register(
         alice, {"name": "agent", "owner": "alice", "risk": "medium", "evaluation_tier": "session"}
     )
-    assert uri == "gs://arts/agents/agents.json"
+    # the tenant writes only its own prefix; the platform identity merges the cards
+    assert uri == "gs://arts/northwind-alice/agents/northwind-alice-agent.json"
+    assert "agents/agents.json" not in fakes["storage"].buckets["arts"]
+    assert rt.merge_registry() == "gs://arts/agents/agents.json"
     registry = json.loads(fakes["storage"].buckets["arts"]["agents/agents.json"])
     assert len(registry["agents"]) == 1
     card = registry["agents"][0]
@@ -790,3 +963,6 @@ def test_agents_deploy_invoke_register_status(
     assert rt.status(Tenant(name="bob"))["state"] == "absent"
     with pytest.raises(KeyError):
         rt.invoke(Tenant(name="bob"), {"task": "x"})
+    # a tenant never creates an engine: Terraform does
+    with pytest.raises(KeyError, match="Terraform creates"):
+        rt.deploy(Tenant(name="bob"), "img:2", {}, version="v1")

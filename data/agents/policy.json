@@ -29,6 +29,17 @@
   "ticket_text",
   "policy_corpus"
  ],
+ "reachable_data_classes": [
+  "policy_corpus",
+  "ticket_text"
+ ],
+ "governance": {
+  "eu_ai_act_class": "transparency",
+  "annex_iii_item": null,
+  "article_50_disclosure": "This reply was written by an AI system. Reply HUMAN to reach a Northwind support agent.",
+  "dpia_ref": "docs/governance/dpia.md#uc-policy",
+  "privacy_approver": "privacy-office"
+ },
  "endpoints": [
   "POST /run",
   "GET /version",
@@ -50,5 +61,5 @@
   "approver": "support-operations"
  },
  "runtime_id": null,
- "written_at": "2026-09-29T07:06:51.441779+00:00"
+ "written_at": "2026-09-30T10:03:30.571266+00:00"
 }

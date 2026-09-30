@@ -4,10 +4,16 @@ Every training run appends one line to `artifacts/triage/runs.jsonl`: version, p
 data hash, git SHA and the test metrics. That file is the experiment log the course can
 always read, with no server. When MLflow is installed (the `mlops` extra) the same run is
 also logged to an MLflow experiment and registered as a version of the registered model
-`registered_model_name()` with the alias `candidate`; promotion moves the alias `production`.
-The name is the platform's: `<environment>-<tenant>-triage` (`northwind-alice-triage`) when
-`NW_TENANT` is set, so a laptop run and a pipeline run land on one model, and `northwind-triage`
-when it is not.
+`registered_model_name()` with the alias `candidate` and the tag `source=laptop`; promotion
+moves the alias `production`.
+
+Laptop runs never land on the platform's model. The platform registry (`nw.platform`) holds
+what pipelines register, `<environment>-<tenant>-triage`, and only pipelines (and `bootstrap`)
+register there, so its version 1 is the first pipeline run. A laptop run with `NW_TENANT` set
+logs to the experiment `<environment>-<tenant>-laptop-triage` and registers
+`<environment>-<tenant>-triage-laptop`; with no tenant, the experiment `triage` and the model
+`northwind-triage`, as on a laptop with no platform at all. The two can share one MLflow server
+(`NW_MLFLOW_URI`) without ever sharing a version number.
 
     uv run python -m nw.triage.tracking            # the runs table
     make mlflow-ui                                 # the MLflow UI on :5000 over the same store
@@ -33,16 +39,60 @@ def mlflow_uri() -> str:
     return os.environ.get("NW_MLFLOW_URI", "sqlite:///artifacts/mlflow.db")
 
 
+LAPTOP = "laptop"
+
+
 def registered_model_name(project: str = "triage") -> str:
-    """`<environment>-<tenant>-<project>` when `NW_TENANT` is set (the name every platform
-    registers under, `Tenant.resource`), `northwind-<project>` when it is not."""
+    """Where a laptop run registers: `<environment>-<tenant>-<project>-laptop` when `NW_TENANT`
+    is set (never the platform's `<environment>-<tenant>-<project>`, which only pipelines
+    write), `northwind-<project>` when it is not."""
     from nw.config import Settings
     from nw.platform.base import tenant_from_env
 
     cfg = Settings()
     if not cfg.tenant:
         return f"northwind-{project}"
-    return tenant_from_env(cfg).resource(project)
+    return tenant_from_env(cfg).resource(f"{project}-{LAPTOP}")
+
+
+def experiment_name(project: str = "triage") -> str:
+    """The laptop's MLflow experiment: `<environment>-<tenant>-laptop-<project>` when
+    `NW_TENANT` is set, `<project>` when not; never the platform's `<environment>-<tenant>`."""
+    from nw.config import Settings
+    from nw.platform.base import tenant_from_env
+
+    cfg = Settings()
+    if not cfg.tenant:
+        return project
+    return tenant_from_env(cfg).resource(f"{LAPTOP}-{project}")
+
+
+def artifact_location(experiment: str) -> str | None:
+    """Where a new experiment keeps its artifacts. `NW_MLFLOW_ARTIFACT_ROOT` when set; on the
+    AWS track with a tenant, `s3://<artifacts>/mlflow/tenants/<tenant>/<experiment>`, the only
+    prefix the tenant's role may write on the shared SageMaker MLflow server; else the server's
+    default (None)."""
+    root = os.environ.get("NW_MLFLOW_ARTIFACT_ROOT")
+    if not root:
+        from nw.config import Settings, Track
+
+        cfg = Settings()
+        if cfg.track != Track.AWS or not cfg.tenant:
+            return None
+        from nw.platform.aws import AwsPlatformConfig
+
+        bucket = AwsPlatformConfig.from_settings(cfg).artifacts_bucket
+        if not bucket:
+            return None
+        root = f"s3://{bucket}/mlflow/tenants/{cfg.tenant}"
+    return f"{root.rstrip('/')}/{experiment}"
+
+
+def use_experiment(mlflow: Any, name: str) -> None:
+    """`mlflow.set_experiment`, creating the experiment with `artifact_location` first."""
+    if mlflow.get_experiment_by_name(name) is None:
+        mlflow.create_experiment(name, artifact_location=artifact_location(name))
+    mlflow.set_experiment(name)
 
 
 def record_run(out: Path, metadata: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
@@ -60,11 +110,17 @@ def record_run(out: Path, metadata: dict[str, Any], report: dict[str, Any]) -> d
         "test_brier_p0": t["brier_p0"],
         "p0_threshold": report["p0_threshold"],
     }
+    from nw.platform.lineage import lineage
+    from nw.platform.lineage import resolve as resolve_git_sha
+
+    found = lineage()
     run = {
         "version": metadata["version"],
         "trained_at": metadata["trained_at"],
         "data_sha256_12": metadata["data_sha256_12"],
-        "git_sha": metadata["git_sha"],
+        # a container without .git wrote `nogit`; the environment may know the commit
+        "git_sha": resolve_git_sha(metadata["git_sha"]),
+        "lineage": {k: v for k, v in found.items() if k != "git_sha"},
         "params": params,
         "metrics": metrics,
         "artifact": str(out / metadata["version"]),
@@ -84,11 +140,13 @@ def _log_to_mlflow(artifact_dir: Path, run: dict[str, Any]) -> dict[str, Any] | 
         log.info("mlflow not installed; run recorded in runs.jsonl only")
         return None
     mlflow.set_tracking_uri(mlflow_uri())
-    mlflow.set_experiment("triage")
+    mlflow.set_registry_uri(mlflow_uri())  # never a registry another caller pointed at
+    use_experiment(mlflow, experiment_name("triage"))
     with mlflow.start_run(run_name=run["version"]) as active:
         mlflow.log_params(
             {**run["params"], "data_sha256_12": run["data_sha256_12"], "git_sha": run["git_sha"]}
         )
+        mlflow.set_tags({f"lineage.{k}": v for k, v in (run.get("lineage") or {}).items() if v})
         mlflow.log_metrics(run["metrics"])
         mlflow.log_artifacts(str(artifact_dir), artifact_path="model")
         client = mlflow.MlflowClient()
@@ -102,6 +160,7 @@ def _log_to_mlflow(artifact_dir: Path, run: dict[str, Any]) -> dict[str, Any] | 
         )
         client.set_registered_model_alias(name, "candidate", version.version)
         client.set_model_version_tag(name, version.version, "artifact_version", run["version"])
+        client.set_model_version_tag(name, version.version, "source", LAPTOP)
     return {
         "run_id": active.info.run_id,
         "registered_model": name,
@@ -116,6 +175,7 @@ def set_production_alias(artifact_version: str) -> bool:
     except ImportError:
         return False
     mlflow.set_tracking_uri(mlflow_uri())
+    mlflow.set_registry_uri(mlflow_uri())  # never a registry another caller pointed at
     client = mlflow.MlflowClient()
     name = registered_model_name()
     for mv in client.search_model_versions(f"name='{name}'"):

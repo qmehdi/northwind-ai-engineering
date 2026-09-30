@@ -1,6 +1,6 @@
 {
- "dataset_version": "2026.09.1",
- "written_at": "2026-09-29T07:06:51+00:00",
+ "dataset_version": "2026.09.7",
+ "written_at": "2026-09-30T13:47:17+00:00",
  "licence": "Synthetic, generated for the course and for the cohort's use. No row of the reference dataset Tobi-Bueck/customer-support-tickets (CC BY-NC 4.0) is included.",
  "provenance": "The schema and the label distributions are modelled on the public dataset Tobi-Bueck/customer-support-tickets on Hugging Face (English subset), which has three priority levels: high 39 percent, medium 41 percent, low 20 percent.",
  "files": {
@@ -10,39 +10,64 @@
    "rows": 240
   },
   "adversarial/tickets.jsonl": {
-   "sha256": "6572d28719e450a728242296028e7fa87eda11ecdb101144b9b86a6eaa62476c",
-   "bytes": 7016,
-   "rows": 15
+   "sha256": "da686b3425e97b559c57a53722eca39d805e9a60c24078640e4d37a73f6d1d9d",
+   "bytes": 8118,
+   "rows": 17
   },
   "golden/agent_baseline.json": {
-   "sha256": "eea85ef0e2157933d753b28c0eabac49353165d7d5f7a5437d35ecc16bccfdaf",
-   "bytes": 2790,
-   "rows": 8
+   "sha256": "9a089a9d6ae6a19c2957f005f06516d70c0c568ee8aaa3eba7924fbfa1980b30",
+   "bytes": 3164,
+   "rows": 10
+  },
+  "golden/agent_cases.jsonl": {
+   "sha256": "2309d12ba898a030414e530024ce65137935b7862c0bf12cad95aad612ca1299",
+   "bytes": 9487,
+   "rows": 18
+  },
+  "golden/agent_judge_calibration.jsonl": {
+   "sha256": "c5cbbe75cfd1fc16785106d346c464756cfd318e35779e0f0efe3d07c7e48a79",
+   "bytes": 20371,
+   "rows": 40
   },
   "golden/baseline.json": {
-   "sha256": "9424eabe7a96c978a4daa6071d9fceac8ef97e74107c7e3603f93746ba09b818",
-   "bytes": 46466,
-   "rows": 3
+   "sha256": "515853718a8ab9a90d376f9b241140c07c7e2358f8a3534fde87193ef7721368",
+   "bytes": 46886,
+   "rows": 5
   },
   "golden/judge_calibration.jsonl": {
-   "sha256": "c65d6c74c7c0e7dce26e24b468484457c8a0158fc41d2f84d36c341b28e806e7",
-   "bytes": 20712,
-   "rows": 30
+   "sha256": "37f9fca67d9dd7d35efce49a895f3fd4e2ac4d872abe276e72c64a5e6f70f69c",
+   "bytes": 112209,
+   "rows": 102
   },
   "golden/policy_qa.jsonl": {
-   "sha256": "028a395d80f5093827e5d7767ec26e386ed135db65b986c44aba109c05ac2d6d",
-   "bytes": 35610,
-   "rows": 77
+   "sha256": "00e4f2faaaf40819c364be5027a2201fc5df23debdbd36d1b9b54d06c585aba4",
+   "bytes": 52084,
+   "rows": 111
   },
   "golden/semantic_production.json": {
-   "sha256": "144da44971c35918e03c55695b1cd65b1966f9bffcd92f4b914d5712110c21e7",
-   "bytes": 785,
-   "rows": 6
+   "sha256": "7384742a4dfd97f8713e1278bb9f5e9ac19a1acb60fd3b35029cebeb95b1dcb3",
+   "bytes": 1250,
+   "rows": 10
   },
   "golden/triage_production.json": {
-   "sha256": "d3ba626946957907754fc065c218eaccd3f676fb92e398ebe27158db7b84a68f",
-   "bytes": 346,
-   "rows": 5
+   "sha256": "625c919f1028cd791a5eaa4be8774edff8e94049a8466f9349da649bfa27502e",
+   "bytes": 2456,
+   "rows": 11
+  },
+  "golden/triage_slices.jsonl": {
+   "sha256": "dc562ee43bbed210a6e0f0ce3a714668142958deacee8a21e78547d2eb524cb7",
+   "bytes": 54262,
+   "rows": 82
+  },
+  "pii/messages.jsonl": {
+   "sha256": "ceee889077d704a61a26f6ff927b59748b1b5c7f9f6e1487ed816c9edad1a947",
+   "bytes": 403731,
+   "rows": 600
+  },
+  "pii/subjects.jsonl": {
+   "sha256": "ba690ac0eeb8c63013ccf15aa76b493a22b4e12b5cfdd773ea8a306d2f172d51",
+   "bytes": 36201,
+   "rows": 120
   },
   "policies/acceptable-use.md": {
    "sha256": "c01003882274121fa7deacab14b18244a03939a01ca81f6d88ae1f3aaf3b9ac6",

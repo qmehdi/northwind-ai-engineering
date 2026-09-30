@@ -64,7 +64,10 @@ async def test_card_version_is_the_version_a_trajectory_carries(
     assert t.agent_version == card.agent_version
     assert card.models == {"workhorse": local_settings.model_for(ModelRole.WORKHORSE)}
     assert [x.name for x in card.tools] == sorted(agents["resolver"].tools)
-    assert card.evaluation.cases == 15 and set(card.evaluation.tiers) == {
+    from nw.agent.evaluate import DEFAULT_CASES, load_cases
+
+    n = len(load_cases(*(ROOT / p for p in DEFAULT_CASES)))
+    assert card.evaluation.cases == n and set(card.evaluation.tiers) == {
         "tool",
         "turn",
         "session",
@@ -152,3 +155,21 @@ def test_cli(written, monkeypatch, capsys):
     assert "stay on disk" in capsys.readouterr().err
     assert reg.main(["--cards", str(written), "--write", "triage"]) == 0
     assert "triage:" in capsys.readouterr().out
+
+
+def test_cards_carry_governance_and_derived_reach(agents, catalog, local_settings):
+    card = reg.build_card(
+        agents["orchestrator"], catalog.get("orchestrator"), local_settings, agents=agents
+    )
+    assert card.reachable_data_classes == sorted(cat.DATA_CLASSES)
+    assert card.governance["eu_ai_act_class"] == "transparency"
+    assert card.governance["dpia_ref"] == "docs/governance/dpia.md#uc-orchestrator"
+    assert card.governance["privacy_approver"] != card.approval["approver"]
+
+
+def test_check_fails_when_the_catalog_governance_moves(written, agents, catalog, local_settings):
+    cards = reg.load_cards(written)
+    moved = catalog.model_copy(deep=True)
+    moved.get("triage").privacy_approver = "someone-else"
+    r = reg.check(cards, agents, moved, local_settings)
+    assert any(x.startswith("triage: governance or data classes") for x in r.problems)

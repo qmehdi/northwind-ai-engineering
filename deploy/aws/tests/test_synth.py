@@ -151,7 +151,8 @@ def test_domain_mlflow_and_per_tenant_profiles_groups_and_roles(cohort):
     assert groups == {f"northwind-{t}-{p}" for t in TENANTS for p in ("triage", "semantic")}
     roles = {r.get("RoleName") for r in props(cohort, "AWS::IAM::Role")}
     assert {f"northwind-{t}-sagemaker" for t in TENANTS} <= roles
-    assert "northwind-platform-sagemaker" in roles and "northwind-serving" in roles
+    assert "northwind-platform-sagemaker" in roles and "northwind-live-serving" in roles
+    assert {f"northwind-{t}-serving" for t in TENANTS} <= roles
 
 
 def test_tenant_roles_stay_inside_their_prefix(cohort):
@@ -266,7 +267,9 @@ def test_approval_event_reaches_the_deployer_with_the_rollback_alarms(cohort):
     assert pattern["source"] == ["aws.sagemaker"]
     assert pattern["detail-type"] == ["SageMaker Model Package State Change"]
     assert pattern["detail"]["ModelApprovalStatus"] == ["Approved"]
-    assert pattern["detail"]["ModelPackageGroupName"] == [{"prefix": "northwind-"}]
+    assert sorted(pattern["detail"]["ModelPackageGroupName"]) == sorted(
+        f"northwind-{o}-{p}" for o in OWNERS for p in ("triage", "semantic")
+    ), "exact names: a prefix would catch a second environment's groups"
     fn = next(
         f
         for f in props(cohort, "AWS::Lambda::Function")
@@ -313,10 +316,8 @@ def test_policy_lambda_is_arm64_versioned_canaried_and_behind_cognito(cohort):
     assert group["DeploymentGroupName"] == "northwind-policy"
     assert group["DeploymentConfigName"] == "CodeDeployDefault.LambdaCanary10Percent15Minutes"
     assert group["AutoRollbackConfiguration"]["Enabled"] is True
-    assert (
-        group["AlarmConfiguration"]["Enabled"] is True
-        and len(group["AlarmConfiguration"]["Alarms"]) == 2
-    )
+    assert group["AlarmConfiguration"]["Enabled"] is True
+    assert len(group["AlarmConfiguration"]["Alarms"]) == 3, "errors, p95 and the quality level"
     api = next(iter(props(cohort, "AWS::ApiGatewayV2::Api")))
     assert api["Name"] == "northwind-policy" and api["ProtocolType"] == "HTTP"
     authorizer = next(iter(props(cohort, "AWS::ApiGatewayV2::Authorizer")))
@@ -393,7 +394,15 @@ def test_agentcore_plane_and_registry(cohort):
         target["Name"] == "northwind-tools" and "McpServer" in target["TargetConfiguration"]["Mcp"]
     )
     policies = {p["Name"]: p for p in props(cohort, "AWS::BedrockAgentCore::Policy")}
-    assert set(policies) == {"AllowReadTools", "DenyEscalateUnlessApprover"}
+    assert set(policies) == {
+        "AllowReadTools",
+        "AllowEscalateForApprovers",
+        "DenyEscalateUnlessApprover",
+    }
+    permit = policies["AllowEscalateForApprovers"]["Definition"]["Cedar"]["Statement"]
+    assert (
+        permit.startswith("permit(") and "___escalate" in permit and "NorthwindApprovers" in permit
+    )
     assert (
         "NorthwindApprovers"
         in policies["DenyEscalateUnlessApprover"]["Definition"]["Cedar"]["Statement"]
@@ -460,11 +469,17 @@ def test_model_gateway_profiles_config_and_database(cohort):
         assert {t["Key"] for t in p["Tags"]} == {"nw:tenant", "nw:role"}
     task = next(iter(props(cohort, "AWS::ECS::TaskDefinition")))
     container = task["ContainerDefinitions"][0]
-    assert container["Image"].startswith("ghcr.io/berriai/litellm")
+    assert container["Image"].startswith("ghcr.io/berriai/litellm:v")
+    assert "@sha256:" in container["Image"], "the gateway image is pinned by digest"
     env = {e["Name"]: e["Value"] for e in container["Environment"]}
     assert env["LITELLM_CONFIG_BUCKET_OBJECT_KEY"] == "gateway/litellm.yaml"
     secrets = {s["Name"] for s in container["Secrets"]}
-    assert secrets == {"LITELLM_MASTER_KEY", "DATABASE_USERNAME", "DATABASE_PASSWORD"}
+    assert secrets == {
+        "LITELLM_MASTER_KEY",
+        "LITELLM_SALT_KEY",
+        "DATABASE_USERNAME",
+        "DATABASE_PASSWORD",
+    }
     assert task["RuntimePlatform"]["CpuArchitecture"] == "ARM64"
     config = next(
         v["Properties"]
@@ -478,7 +493,8 @@ def test_model_gateway_profiles_config_and_database(cohort):
         "  - model_name: workhorse\n" in body
         and "master_key: os.environ/LITELLM_MASTER_KEY" in body
     )
-    assert body.count("model: bedrock/") == 9
+    assert body.count("model: bedrock/converse/") == 18, "9 on the profiles, 9 on the EU route"
+    assert body.count("aws_region_name: eu-central-1") == 9
     db = next(iter(props(cohort, "AWS::RDS::DBCluster")))
     assert db["ServerlessV2ScalingConfiguration"]["MinCapacity"] == 0
     assert db["StorageEncrypted"] is True and db["Port"] == 5433
@@ -513,10 +529,18 @@ def test_delivery_pipeline_is_v2_with_source_build_approve_deploy(cohort, solo):
     body = text(pipelines_build["Source"])
     assert "docker build --platform linux/amd64" in body and "APP=pipelines" in body
     assert "--extra pipelines" in body and "imageDigest" in body
+    assert ":latest" not in body, "no image is pushed as latest"
+    assert "IMAGE_PARAM_PIPELINES" in body and "notation sign" in body
+    assert "/northwind/images/pipelines" in text(pipelines_build["Environment"])
     build_stage = [a["Name"] for a in pipeline["Stages"][1]["Actions"]]
     assert build_stage == ["Images", "PipelinesImage"]
-    assert "RepoPipelines" in text(cohort["Outputs"]["PipelineImage"])
-    assert ":latest" in text(cohort["Outputs"]["PipelineImage"])
+    assert cohort["Outputs"]["PipelineImage"]["Value"] == "/northwind/images/pipelines"
+    assert "notation sign" in text(projects["northwind-build"]["Source"])
+    for r in props(cohort, "AWS::ECR::Repository"):
+        assert r["ImageTagMutability"] == "IMMUTABLE", r["RepositoryName"]
+    signing = next(iter(props(cohort, "AWS::Signer::SigningProfile")))
+    assert signing["PlatformId"] == "Notation-OCI-SHA384-ECDSA"
+    assert "notation verify" in (HERE / "delivery" / "deploy.sh").read_text()
     assert "PipelineImage" in solo["Outputs"]
     roles = {r.get("RoleName") for r in props(cohort, "AWS::IAM::Role")}
     assert "northwind-deployer" in roles
@@ -659,6 +683,14 @@ def test_outputs_have_the_keys_the_scripts_read(cohort):
         "DeployerRoleArn",
         "UserPoolId",
         "Models",
+        "RuntimeRoleArns",
+        "ServingRoleArns",
+        "LearnerRoles",
+        "ApproversRoleArn",
+        "TenantApiKeys",
+        "AgentNetworkMode",
+        "AgentSubnets",
+        "AgentSecurityGroup",
     } <= keys, keys
     assert not any("GatewayService" in k for k in keys), (
         "the pattern's generated outputs are removed"
@@ -708,3 +740,543 @@ def test_every_suppression_in_nag_py_is_used(cohort):
     with report.open() as f:
         used = {r["Rule ID"] for r in csv.DictReader(f) if r["Compliance"] == "Suppressed"}
     assert listed == used, (listed - used, used - listed)
+
+
+# ----- audit 2026-09-29 fixes ------------------------------------------------------------------
+
+
+def _role(t, name):
+    return next(
+        (k, v)
+        for k, v in resources(t, "AWS::IAM::Role").items()
+        if v["Properties"].get("RoleName") == name
+    )
+
+
+def _policies_of(t, role_id):
+    """Every policy document attached to a role: inline, default policy and managed policies."""
+    docs = []
+    for p in props(t, "AWS::IAM::Policy"):
+        if any(r.get("Ref") == role_id for r in p.get("Roles", [])):
+            docs.append(p["PolicyDocument"])
+    for p in props(t, "AWS::IAM::ManagedPolicy"):
+        if any(r.get("Ref") == role_id for r in p.get("Roles", [])):
+            docs.append(p["PolicyDocument"])
+    return docs
+
+
+def test_trail_key_policy_lets_cloudtrail_encrypt(cohort):
+    """C1: CreateTrail needs the CloudTrail statements in the key policy (the guide's shape)."""
+    trail = next(iter(props(cohort, "AWS::CloudTrail::Trail")))
+    key_id = trail["KMSKeyId"]["Fn::GetAtt"][0]
+    key = cohort["Resources"][key_id]
+    statements = key["Properties"]["KeyPolicy"]["Statement"]
+    encrypt = next(s for s in statements if s.get("Sid") == "AllowCloudTrailEncryptLogs")
+    assert encrypt["Principal"] == {"Service": "cloudtrail.amazonaws.com"}
+    assert encrypt["Action"] == "kms:GenerateDataKey*"
+    assert "trail/northwind-platform" in text(encrypt["Condition"]["StringEquals"]["aws:SourceArn"])
+    assert "kms:EncryptionContext:aws:cloudtrail:arn" in encrypt["Condition"]["StringLike"]
+    describe = next(s for s in statements if s.get("Sid") == "AllowCloudTrailDescribeKey")
+    assert describe["Action"] == "kms:DescribeKey"
+    decrypt = next(s for s in statements if s.get("Sid") == "EnableCloudTrailLogDecryptPermissions")
+    assert decrypt["Condition"]["Null"] == {"kms:EncryptionContext:aws:cloudtrail:arn": "false"}
+    assert trail["CloudWatchLogsLogGroupArn"]
+
+
+def test_learner_role_per_tenant_with_abac_trust_and_own_scope(cohort):
+    """H1: a usable, least-privilege identity per tenant."""
+    role_id, role = _role(cohort, "northwind-alice-learner")
+    trust = role["Properties"]["AssumeRolePolicyDocument"]["Statement"][0]
+    assert trust["Condition"]["StringEquals"] == {"aws:PrincipalTag/nw:tenant": "alice"}
+    assert {"Key": "nw:tenant", "Value": "alice"} in role["Properties"]["Tags"]
+    body = text(_policies_of(cohort, role_id))
+    assert "northwind-bob" not in body and "tenants/bob" not in body and "_bob_" not in body
+    for action in (
+        "sagemaker:StartPipelineExecution",
+        "sagemaker:CreatePresignedDomainUrl",
+        "bedrock:CreatePrompt",
+        "bedrock:Retrieve",
+        "bedrock:StartIngestionJob",
+        "s3vectors:QueryVectors",
+        "bedrock-agentcore:CreateAgentRuntime",
+        "agent-registry:SubmitRegistryRecordForApproval",
+        "sagemaker-mlflow:*",
+    ):
+        assert action in body, action
+    assert "${aws:PrincipalTag/nw:tenant}" in body, "prompts are scoped by attribute"
+    passes = [
+        st
+        for d in _policies_of(cohort, role_id)
+        for st in d["Statement"]
+        if st.get("Action") == "iam:PassRole" or st.get("Action") == ["iam:PassRole"]
+    ]
+    assert passes and all(st.get("Condition", {}).get("StringEquals") for st in passes)
+    passed = text([st["Resource"] for st in passes])
+    assert "Alice" in passed and "Bob" not in passed and "RuntimeExecutionRole" not in passed
+
+
+def test_tenant_roles_cannot_start_expensive_compute(cohort):
+    """H6: instance types and accelerators are denied outside the course sizes."""
+    for name in ("northwind-alice-sagemaker", "northwind-alice-learner"):
+        role_id, _ = _role(cohort, name)
+        denies = [
+            st
+            for d in _policies_of(cohort, role_id)
+            for st in d["Statement"]
+            if st["Effect"] == "Deny"
+        ]
+        guard = next(st for st in denies if st.get("Sid") == "OnlyCourseInstanceTypes")
+        allowed = guard["Condition"]["ForAnyValue:StringNotLike"]["sagemaker:InstanceTypes"]
+        assert "ml.m5.large" in allowed and not any("p4" in a or "g5" in a for a in allowed)
+        assert any(st.get("Sid") == "NoAccelerators" for st in denies)
+        assert any(st.get("Sid") == "MlflowNoDeletes" for st in denies), name
+
+
+def test_one_runtime_role_per_tenant_scoped_to_its_own_resources(cohort):
+    """H2: alice's runtime role reaches alice's memory, knowledge base, endpoints and keys only."""
+    role_id, role = _role(cohort, "northwind-alice-agentcore")
+    body = text(_policies_of(cohort, role_id))
+    assert "MemoryAlice" in body and "MemoryBob" not in body and "MemoryLive" not in body
+    assert "KnowledgeBaseAlice" in body and "KnowledgeBaseLive" not in body
+    assert "endpoint/northwind-alice-*" in body
+    assert "LiveGatewayKey" not in body and '"ApiKey' not in body.replace("ApiKeyAlice", "")
+    assert "GatewayKeyAlice" in body and "ApiKeyAlice" in body
+    live_id, _ = _role(cohort, "NorthwindBedrockAgentCoreRuntime-us-east-1")
+    live = text(_policies_of(cohort, live_id))
+    assert "LiveGatewayKey" in live and "MemoryAlice" not in live
+    assert cohort["Outputs"]["RuntimeRoleArns"]
+
+
+def test_deployer_validates_and_passes_only_owner_serving_roles(cohort):
+    """H3: allow-listed images, owner prefixes, one serving role per owner, ECR in the account."""
+    fn_id, fn = next(
+        (k, v)
+        for k, v in resources(cohort, "AWS::Lambda::Function").items()
+        if v["Properties"].get("FunctionName") == "northwind-deploy-on-approval"
+    )
+    env = fn["Properties"]["Environment"]["Variables"]
+    allowed = text(env["NW_ALLOWED_IMAGES"])
+    assert "123456789012.dkr.ecr.us-east-1.amazonaws.com/northwind-" in allowed
+    assert "683313688378" in allowed and "763104351884" in allowed
+    role_ref = fn["Properties"]["Role"]["Fn::GetAtt"][0]
+    body = text(_policies_of(cohort, role_ref))
+    assert "ServingRoleAlice" in body and "ServingRoleLive" in body
+    for owner in ("alice", "live"):
+        rid, _ = _role(cohort, f"northwind-{owner}-serving")
+        sbody = text(_policies_of(cohort, rid))
+        assert "repository/*" not in sbody.replace("repository/cdk-", ""), "ECR pinned"
+        assert ":*:repository" not in sbody
+        if owner == "alice":
+            assert "tenants/alice/*" in sbody and "capture/*" not in sbody
+        else:
+            assert "live/*" in sbody and "tenants/" not in sbody
+
+
+def test_deployer_handler_refuses_foreign_images_and_paths(monkeypatch):
+    import importlib
+    import types
+
+    monkeypatch.setenv("NW_PREFIX", "northwind")
+    monkeypatch.setenv("NW_OWNERS", "alice,bob,live")
+    monkeypatch.setenv("NW_SERVING_ROLE_ARNS", json.dumps({"alice": "a", "live": "l"}))
+    monkeypatch.setenv("NW_ARTIFACTS_BUCKET", "arts")
+    monkeypatch.setenv(
+        "NW_ALLOWED_IMAGES",
+        json.dumps(
+            [
+                "1.dkr.ecr.us-east-1.amazonaws.com/northwind-",
+                "2.dkr.ecr.us-east-1.amazonaws.com/sk:",
+            ]
+        ),
+    )
+    for k in ("NW_CAPTURE_URI", "NW_MONITOR_URI", "NW_PREPROCESSOR_URI", "NW_MONITOR_IMAGE"):
+        monkeypatch.setenv(k, "x")
+    fake = types.SimpleNamespace(client=lambda *_a, **_k: object())
+    monkeypatch.setitem(sys.modules, "boto3", fake)
+    exceptions = types.ModuleType("botocore.exceptions")
+    exceptions.ClientError = type("ClientError", (Exception,), {})
+    monkeypatch.setitem(sys.modules, "botocore", types.ModuleType("botocore"))
+    monkeypatch.setitem(sys.modules, "botocore.exceptions", exceptions)
+    sys.path.insert(0, str(HERE / "functions" / "deploy_on_approval"))
+    try:
+        handler = importlib.import_module("handler")
+        handler = importlib.reload(handler)
+    finally:
+        sys.path.pop(0)
+    ok = {
+        "Image": "2.dkr.ecr.us-east-1.amazonaws.com/sk:1.9",
+        "ModelDataUrl": "s3://arts/tenants/alice/triage/1/model.tar.gz",
+    }
+    handler.validate("alice", [ok])
+    handler.validate("live", [ok])
+    bad = [
+        ("alice", {**ok, "Image": "999.dkr.ecr.us-east-1.amazonaws.com/evil:1"}),
+        ("alice", {**ok, "ModelDataUrl": "s3://arts/tenants/bob/triage/1/model.tar.gz"}),
+        ("alice", {**ok, "ModelDataUrl": "s3://other/tenants/alice/m.tar.gz"}),
+        ("live", {**ok, "ModelDataUrl": "s3://arts/baselines/x.tar.gz"}),
+        ("alice", {**ok, "ModelDataUrl": "s3://arts/tenants/alice/../bob/m.tar.gz"}),
+    ]
+    for owner, container in bad:
+        with pytest.raises(handler.Refused):
+            handler.validate(owner, [container])
+    primary = handler.container_for(
+        {**ok, "Environment": {"A": "1"}}, {"model_sha256": "abc", "other": "x"}
+    )
+    assert primary == {
+        "Image": ok["Image"],
+        "ModelDataUrl": ok["ModelDataUrl"],
+        "Environment": {"A": "1", "NW_MODEL_SHA256": "abc"},
+    }
+    assert handler.parse_group("northwind-staging-alice-triage") is None
+    assert handler.parse_group("northwind-alice-triage") == ("alice", "triage")
+
+
+def test_models_come_from_config_and_the_judge_goes_through_its_geo_profile(cohort):
+    """H11: one source of model ids; profile-only models copy from the system profile."""
+    sys.path.insert(0, str(HERE))
+    try:
+        from stacks.common import MODEL_IDS, config_models
+    finally:
+        sys.path.pop(0)
+    assert MODEL_IDS == config_models()
+    copies = {
+        p["InferenceProfileName"]: text(p["ModelSource"]["CopyFrom"])
+        for p in props(cohort, "AWS::Bedrock::ApplicationInferenceProfile")
+    }
+    assert "inference-profile/us.anthropic.claude-opus-5" in copies["northwind-alice-judge"]
+    body = _asset_text(
+        cohort,
+        next(
+            v["Properties"]
+            for k, v in resources(cohort, "Custom::CDKBucketDeployment").items()
+            if "Gateway" in k
+        )["SourceObjectKeys"][0],
+        "gateway/litellm.yaml",
+    )
+    assert "model_name: eu/alice/judge" in body and "model_name: eu/workhorse" in body
+    assert "aws_region_name: eu-central-1" in body
+    assert "eu.anthropic.claude-opus-5" in text(cohort["Outputs"]["EuModels"])
+    assert "anthropic.claude-opus-5" in text(cohort["Outputs"]["Models"])
+    assert "foundation-model/openai.gpt-oss-120b-1:0" in copies["northwind-alice-workhorse"]
+    evaluator = next(iter(props(cohort, "AWS::BedrockAgentCore::Evaluator")))
+    assert "us.anthropic.claude-opus-5" in text(evaluator)
+    _, eval_role = _role(cohort, "AgentCoreEvaluationRole-northwind")
+    assert "Models" in cohort["Outputs"]
+
+
+def test_gateway_is_https_through_cloudfront_and_the_alb_only_answers_it(cohort):
+    """H9: CloudFront's certificate, the prefix list, the secret header, 403 otherwise."""
+    assert cohort["Outputs"]["GatewayUrl"]["Value"]["Fn::Join"][1][0] == "https://"
+    dist = next(iter(props(cohort, "AWS::CloudFront::Distribution")))["DistributionConfig"]
+    assert dist["DefaultCacheBehavior"]["ViewerProtocolPolicy"] == "https-only"
+    origin = dist["Origins"][0]
+    header = origin["OriginCustomHeaders"][0]
+    assert header["HeaderName"] == "X-Origin-Verify"
+    assert "resolve:secretsmanager" in text(header["HeaderValue"])
+    for sg in props(cohort, "AWS::EC2::SecurityGroup"):
+        for rule in sg.get("SecurityGroupIngress", []):
+            assert rule.get("CidrIp") != "0.0.0.0/0", sg.get("GroupDescription")
+    ingress = [
+        r for r in props(cohort, "AWS::EC2::SecurityGroupIngress") if "SourcePrefixListId" in r
+    ]
+    assert ingress and "CloudFrontPrefixList" in text(ingress[0]["SourcePrefixListId"])
+    listener = next(iter(props(cohort, "AWS::ElasticLoadBalancingV2::Listener")))
+    assert listener["DefaultActions"][0]["Type"] == "fixed-response"
+    rule = next(iter(props(cohort, "AWS::ElasticLoadBalancingV2::ListenerRule")))
+    assert rule["Conditions"][0]["HttpHeaderConfig"]["HttpHeaderName"] == "X-Origin-Verify"
+    nag = (HERE / "stacks" / "nag.py").read_text()
+    assert "AwsSolutions-EC23" not in nag
+
+
+def test_retention_lifecycle_rules(cohort):
+    """06 H7: capture, traces and monitoring 90 days; audit logs 400 days."""
+    buckets = {b["BucketName"]: b for b in props(cohort, "AWS::S3::Bucket")}
+    arts = buckets["northwind-artifacts-123456789012-us-east-1"]["LifecycleConfiguration"]["Rules"]
+    by_prefix = {r.get("Prefix"): r.get("ExpirationInDays") for r in arts}
+    assert by_prefix["capture/"] == 90 and by_prefix["traces/"] == 90
+    assert any(r.get("NoncurrentVersionExpiration") for r in arts)
+    for name in ("northwind-logs-", "northwind-trail-"):
+        rules = next(b for n, b in buckets.items() if n.startswith(name))["LifecycleConfiguration"]
+        assert rules["Rules"][0]["ExpirationInDays"] == 400, name
+
+
+def test_agents_run_in_vpc_mode_behind_an_egress_allow_list(cohort, solo):
+    """M12: private subnets by AgentCore AZ ID, HTTPS out only, DNS firewall blocks the rest."""
+    for r in props(cohort, "AWS::BedrockAgentCore::Runtime"):
+        assert r["NetworkConfiguration"]["NetworkMode"] == "VPC"
+    subnets = [s for s in props(cohort, "AWS::EC2::Subnet") if "AvailabilityZoneId" in s]
+    assert {s["AvailabilityZoneId"] for s in subnets} <= {"use1-az1", "use1-az2", "use1-az4"}
+    assert len(subnets) == 2
+    sg = next(
+        s
+        for s in props(cohort, "AWS::EC2::SecurityGroup")
+        if s.get("GroupName") == "northwind-agents"
+    )
+    assert sg["SecurityGroupEgress"] == [
+        {
+            "CidrIp": "0.0.0.0/0",
+            "Description": "HTTPS to allow-listed names",
+            "FromPort": 443,
+            "IpProtocol": "tcp",
+            "ToPort": 443,
+        }
+    ]
+    group = next(iter(props(cohort, "AWS::Route53Resolver::FirewallRuleGroup")))
+    actions = {r["Action"]: r for r in group["FirewallRules"]}
+    assert actions["BLOCK"]["BlockResponse"] == "NXDOMAIN" and "ALLOW" in actions
+    lists = {
+        d["Name"]: d["Domains"] for d in props(cohort, "AWS::Route53Resolver::FirewallDomainList")
+    }
+    assert lists["northwind-agents-everything"] == ["*"]
+    assert "*.amazonaws.com" in text(lists["northwind-agents-allowed"])
+    assert "Distribution" in text(lists["northwind-agents-allowed"]), "the gateway's name"
+    assert props(cohort, "AWS::Route53Resolver::FirewallRuleGroupAssociation")
+    public = synth("public-agents", {"mode": "solo", "agentEgress": "public"})
+    for r in props(public, "AWS::BedrockAgentCore::Runtime"):
+        assert r["NetworkConfiguration"]["NetworkMode"] == "PUBLIC"
+    assert not props(public, "AWS::Route53Resolver::FirewallRuleGroup")
+
+
+def test_images_have_one_owner_and_delivery_passes_the_full_runtime_config(cohort):
+    """H7: SSM parameters own the promoted images; the update keeps the configuration."""
+    params = cohort["Parameters"]
+    assert params["PolicyImage"]["Type"] == "AWS::SSM::Parameter::Value<String>"
+    assert params["PolicyImage"]["Default"] == "/northwind/images/policy"
+    assert params["AgentImageParam"]["Default"] == "/northwind/images/agent"
+    fn = next(
+        f
+        for f in props(cohort, "AWS::Lambda::Function")
+        if f.get("FunctionName") == "northwind-policy"
+    )
+    assert fn["Code"]["ImageUri"]["Fn::If"][0] == "PolicyUsesAsset"
+    runtime = next(
+        r
+        for r in props(cohort, "AWS::BedrockAgentCore::Runtime")
+        if r["AgentRuntimeName"] == "northwind_live_resolver"
+    )
+    assert "AgentUsesAsset" in text(runtime["AgentRuntimeArtifact"])
+    script = (HERE / "delivery" / "deploy.sh").read_text()
+    for field in (
+        "networkConfiguration",
+        "protocolConfiguration",
+        "environmentVariables",
+        "requestHeaderConfiguration",
+        "lifecycleConfiguration",
+        "authorizerConfiguration",
+    ):
+        assert f'"{field}"' in script, field
+    assert "--cli-input-json" in script and "ssm put-parameter" in script
+    repo = next(
+        r
+        for r in props(cohort, "AWS::ECR::Repository")
+        if r["RepositoryName"] == "northwind-policy"
+    )
+    lam_stmt = repo["RepositoryPolicyText"]["Statement"][0]
+    assert lam_stmt["Principal"] == {"Service": "lambda.amazonaws.com"}
+    assert "function:*" in text(lam_stmt["Condition"])
+
+
+def test_approvers_role_and_cedar_permit(cohort, staged):
+    roles = {r.get("RoleName") for r in props(cohort, "AWS::IAM::Role")}
+    assert "NorthwindApprovers" in roles
+    assert "NorthwindStagingApprovers" in {
+        r.get("RoleName") for r in props(staged, "AWS::IAM::Role")
+    }
+
+
+def test_budget_action_stops_tenant_spend_and_invocation_logging_is_metadata_only(cohort):
+    action = next(iter(props(cohort, "AWS::Budgets::BudgetsAction")))
+    assert action["ActionType"] == "APPLY_IAM_POLICY" and action["ApprovalModel"] == "AUTOMATIC"
+    assert action["ActionThreshold"] == {"Type": "PERCENTAGE", "Value": 100}
+    roles = text(action["Definition"]["IamActionDefinition"]["Roles"])
+    assert "LearnerAlice" in roles and "RoleTenantAlice" in roles
+    logging = next(
+        v
+        for k, v in cohort["Resources"].items()
+        if "InvocationLogging" in k and v["Type"] == "Custom::AWS"
+    )
+    call = text(logging["Properties"]["Create"])
+    assert "PutModelInvocationLoggingConfiguration" in call
+    assert '\\"textDataDeliveryEnabled\\":false' in call
+
+
+def test_domain_cleanup_runs_after_the_domain_and_before_the_vpc(cohort):
+    """H12: the domain depends on the cleanup, which references the VPC."""
+    domain = next(v for v in cohort["Resources"].values() if v["Type"] == "AWS::SageMaker::Domain")
+    cleanup_id = next(
+        k
+        for k, v in cohort["Resources"].items()
+        if k.startswith("TrackingDomainCleanup")
+        and v["Type"] == "AWS::CloudFormation::CustomResource"
+    )
+    assert cleanup_id in domain.get("DependsOn", [])
+    assert "NetworkVpc" in text(cohort["Resources"][cleanup_id]["Properties"]["VpcId"])
+
+
+def test_tenant_gateway_keys_are_stack_owned(cohort):
+    names = {s.get("Name") for s in props(cohort, "AWS::SecretsManager::Secret")}
+    assert {f"northwind-{t}-gateway-key" for t in TENANTS} <= names
+    assert "northwind-live-gateway-key" in names
+
+
+def test_reserved_and_environment_tenant_names_are_refused():
+    for bad in (
+        {"tenants": "platform"},
+        {"tenants": "staging"},
+        {"tenants": "alice", "env": "alice"},
+    ):
+        with pytest.raises(subprocess.CalledProcessError):
+            synth("bad-reserved", bad)
+
+
+# ----- durable ops state (nw/agent/opstore.py) and the approval gate's data-plane half ------
+
+OPS_BUCKET = "northwind-ops-123456789012-us-east-1"
+
+
+def role_id(t, name: str) -> str:
+    return next(
+        k
+        for k, v in resources(t, "AWS::IAM::Role").items()
+        if v["Properties"].get("RoleName") == name
+    )
+
+
+def ops_resources(t, rid: str) -> str:
+    """The ops statements (Sid Ops...) of every policy attached to one role, as text."""
+    out = []
+    for kind in ("AWS::IAM::Policy", "AWS::IAM::ManagedPolicy"):
+        for p in props(t, kind):
+            if any(r.get("Ref") == rid for r in p.get("Roles", [])):
+                out += [
+                    s
+                    for s in p["PolicyDocument"]["Statement"]
+                    if s.get("Sid", "").startswith("Ops")
+                ]
+    return text(out)
+
+
+def test_ops_bucket_keeps_the_retention_table_per_owner(cohort):
+    """Trajectories and feedback 90 days, approvals 400, on `<environment>-<owner>/<kind>/`,
+    the keys `nw.agent.opstore.store_for` writes; versioned, KMS, noncurrent versions 30 days."""
+    bucket = next(b for b in props(cohort, "AWS::S3::Bucket") if b["BucketName"] == OPS_BUCKET)
+    rules = {r.get("Prefix"): r for r in bucket["LifecycleConfiguration"]["Rules"]}
+    for owner in OWNERS:
+        assert rules[f"northwind-{owner}/trajectories/"]["ExpirationInDays"] == 90
+        assert rules[f"northwind-{owner}/feedback/"]["ExpirationInDays"] == 90
+        assert rules[f"northwind-{owner}/approvals/"]["ExpirationInDays"] == 400
+    assert any(r.get("NoncurrentVersionExpiration") for r in rules.values())
+    assert bucket["VersioningConfiguration"]["Status"] == "Enabled"
+    outputs = cohort["Outputs"]
+    assert "s3://" in text(outputs["OpsStore"]["Value"])
+
+
+def test_services_and_runtimes_keep_ops_state_in_the_ops_bucket(cohort, solo):
+    for t in (cohort, solo):
+        fn = next(
+            f
+            for f in props(t, "AWS::Lambda::Function")
+            if f.get("FunctionName") == "northwind-policy"
+        )
+        env = fn["Environment"]["Variables"]
+        assert "NW_TRACE_DIR" not in env, "a Lambda's /tmp lasts one instance"
+        assert "s3://" in text(env["NW_OPS_STORE"])
+        assert env["NW_REDACT_DETECTOR"] == "heuristic"
+        assert "NW_RUNTIME_AUTH" not in env
+        runtimes = {r["AgentRuntimeName"]: r for r in props(t, "AWS::BedrockAgentCore::Runtime")}
+        for name, r in runtimes.items():
+            env = r["EnvironmentVariables"]
+            assert "s3://" in text(env["NW_OPS_STORE"]), name
+            assert env["NW_REDACT_DETECTOR"] == "heuristic", name
+        resolver = runtimes["northwind_live_resolver"]
+        # IAM (SigV4) is AgentCore's inbound auth when no JWT authorizer is configured.
+        assert "AuthorizerConfiguration" not in resolver
+        assert resolver["EnvironmentVariables"]["NW_RUNTIME_AUTH"] == "platform"
+        assert "NW_RUNTIME_AUTH" not in runtimes["northwind_tools"]["EnvironmentVariables"]
+
+
+def test_runtimes_cannot_write_approvals_and_approvers_can(cohort):
+    """ADR 0005 on the data plane: runtime roles reach trajectories/ and feedback/ of their own
+    owner only; the learner (a tenant's approver) and the approvers role (live) also approvals/."""
+    alice = ops_resources(cohort, role_id(cohort, "northwind-alice-agentcore"))
+    assert "northwind-alice/trajectories/*" in alice and "northwind-alice/feedback/*" in alice
+    assert "approvals" not in alice and "northwind-bob" not in alice and "live" not in alice
+    live = ops_resources(cohort, role_id(cohort, "NorthwindBedrockAgentCoreRuntime-us-east-1"))
+    assert "northwind-live/trajectories/*" in live and "approvals" not in live
+    fn = next(
+        f
+        for f in props(cohort, "AWS::Lambda::Function")
+        if f.get("FunctionName") == "northwind-policy"
+    )
+    policy = ops_resources(cohort, fn["Role"]["Fn::GetAtt"][0])
+    assert "northwind-live/feedback/*" in policy and "approvals" not in policy
+    learner = ops_resources(cohort, role_id(cohort, "northwind-alice-learner"))
+    assert "northwind-alice/approvals/*" in learner and "northwind-bob" not in learner
+    approvers = ops_resources(cohort, role_id(cohort, "NorthwindApprovers"))
+    assert "northwind-live/approvals/*" in approvers and "northwind-alice" not in approvers
+    for body in (alice, live, policy, learner, approvers):
+        assert "s3:DeleteObject" not in body
+
+
+def test_quality_alarms_read_the_exported_signals(cohort, staged):
+    """The alarms name exactly the series nw/metrics_export.py emits (EMF names), with the bars
+    of deploy/SLO.md; only QualityLevel rolls a canary back."""
+    alarms = {a["AlarmName"]: a for a in props(cohort, "AWS::CloudWatch::Alarm")}
+    expected = {
+        "northwind-policy-quality-level": ("QualityLevel", "GreaterThanOrEqualToThreshold", 2),
+        "northwind-policy-quality-refusal": ("RefusalRatio", "GreaterThanOrEqualToThreshold", 2),
+        "northwind-agent-quality-level": ("QualityLevel", "GreaterThanOrEqualToThreshold", 2),
+        "northwind-agent-quality-judge": ("JudgeScore", "LessThanThreshold", 3.5),
+    }
+    for svc in ("triage", "semantic"):
+        expected |= {
+            f"northwind-{svc}-quality-level": ("QualityLevel", "GreaterThanOrEqualToThreshold", 2),
+            f"northwind-{svc}-quality-shadow": ("ShadowAgreement", "LessThanThreshold", 0.9),
+            f"northwind-{svc}-quality-p0-high": (
+                "P0ShareRatio",
+                "GreaterThanOrEqualToThreshold",
+                2,
+            ),
+            f"northwind-{svc}-quality-p0-low": ("P0ShareRatio", "LessThanOrEqualToThreshold", 0.5),
+        }
+    for name, (metric, op, bar) in expected.items():
+        a = alarms[name]
+        assert (a["MetricName"], a["ComparisonOperator"], a["Threshold"]) == (metric, op, bar), name
+        assert a["Namespace"] == "Northwind"
+        dims = {d["Name"]: d["Value"] for d in a["Dimensions"]}
+        assert dims == {"Service": name.split("-")[1], "Stage": "default"}, name
+    names = " ".join(alarms)
+    metrics = {a.get("MetricName") for a in alarms.values()}
+    assert not metrics & {"RefusalRate", "P0Share"}, "reported, not alarmed: the bars are on ratios"
+    assert all("agent" in n for n, a in alarms.items() if a.get("MetricName") == "JudgeScore")
+    assert "quality-alert" in names
+    filters = [f["FilterPattern"] for f in props(cohort, "AWS::Logs::MetricFilter")]
+    assert sum("quality_alert" in f for f in filters) == 2, "policy Lambda and the agent runtimes"
+    group = next(iter(props(cohort, "AWS::CodeDeploy::DeploymentGroup")))
+    rollback = text(group["AlarmConfiguration"]["Alarms"])
+    assert "QualityPolicyLevel" in rollback and "Refusal" not in rollback
+    staged_alarms = {a["AlarmName"]: a for a in props(staged, "AWS::CloudWatch::Alarm")}
+    level = staged_alarms["northwind-staging-policy-quality-level"]
+    assert {d["Name"]: d["Value"] for d in level["Dimensions"]}["Stage"] == "staging"
+    for r in props(cohort, "AWS::BedrockAgentCore::Runtime"):
+        assert r["EnvironmentVariables"]["NW_METRICS_FORMAT"] == "emf"
+
+
+def test_pipeline_role_registers_from_the_register_step(cohort):
+    """The register step runs inside the pipeline as the tenant's execution role: it reads the
+    source bundle, writes under the tenant's prefix, creates and tags model package versions in
+    the tenant's groups, and lists a group's versions for the champion (no resource scope)."""
+    rid = role_id(cohort, "northwind-alice-sagemaker")
+    body = [
+        s
+        for p in props(cohort, "AWS::IAM::Policy")
+        if any(r.get("Ref") == rid for r in p["Roles"])
+        for s in p["PolicyDocument"]["Statement"]
+    ]
+    own = next(s for s in body if s.get("Sid") == "OwnModelPackages")
+    assert {"sagemaker:CreateModelPackage", "sagemaker:AddTags"} <= set(own["Action"])
+    lists = next(s for s in body if s.get("Sid") == "ListsAreAccountWide")
+    assert "sagemaker:ListModelPackages" in lists["Action"] and lists["Resource"] == "*"
+    assert "tenants/alice/*" in text(body)
+    learner = text([p["PolicyDocument"] for p in props(cohort, "AWS::IAM::ManagedPolicy")])
+    assert "parameter/northwind/images/*" in learner

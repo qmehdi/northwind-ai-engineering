@@ -5,6 +5,12 @@ Dense retrieval finds paraphrases; BM25 finds exact terms like "99.95" or
 without tuning a weight. A cross-encoder reranker then reads query and chunk
 together and reorders the short list, which is where most of the quality
 comes from and most of the latency goes.
+
+Access control happens in the store, before ranking: a customer query is scored only
+against chunks marked `audience: customer`, so an internal chunk can neither be returned
+nor take a candidate slot. Anything not marked customer, or an audience the index does
+not know, is treated as internal: the filter fails closed. The caller's audience is
+decided by the service from the caller's identity, never by the request body.
 """
 
 from __future__ import annotations
@@ -104,8 +110,10 @@ class CrossEncoderReranker:
     def __init__(self, name: str = DEFAULT_RERANKER) -> None:
         from sentence_transformers import CrossEncoder
 
+        from nw.config import hf_revision
+
         self.name = name
-        self.model = CrossEncoder(name)
+        self.model = CrossEncoder(name, revision=hf_revision(name))  # a pinned commit
 
     def score(self, query: str, texts: list[str]) -> list[float]:
         return [float(s) for s in self.model.predict([(query, t) for t in texts])]
@@ -123,7 +131,7 @@ class OverlapReranker:
 
 def rrf(rankings: list[list[str]], k: int = 60) -> dict[str, float]:
     """Reciprocal rank fusion: each list contributes 1 / (k + rank)."""
-    return {cid: 1.0 for cid in rankings[0]}  # Step 4: fuse both lists
+    return {cid: 1.0 for cid in rankings[0]}  # the hybrid retrieval step: fuse both lists
 
 
 class PolicyIndex:
@@ -147,14 +155,22 @@ class PolicyIndex:
 
     # ----- single retrievers ------------------------------------------------
 
-    def dense(self, query: str, k: int) -> list[Retrieved]:
+    def visible(self, audience: str = "customer", current_only: bool = True) -> np.ndarray:
+        """A boolean mask over the chunks this audience may see: the store-side filter."""
+        return np.array([self._allowed(c, current_only, audience) for c in self.chunks], dtype=bool)
+
+    def dense(self, query: str, k: int, mask: np.ndarray | None = None) -> list[Retrieved]:
         q = self.embeddings.encode([query])[0]
         scores = self.vectors @ q
-        top = np.argsort(-scores)[:k]
+        if mask is not None:
+            scores = np.where(mask, scores, -np.inf)
+        top = [i for i in np.argsort(-scores)[:k] if np.isfinite(scores[i])]
         return [Retrieved(self.chunks[i], float(scores[i]), "dense") for i in top]
 
-    def lexical(self, query: str, k: int) -> list[Retrieved]:
+    def lexical(self, query: str, k: int, mask: np.ndarray | None = None) -> list[Retrieved]:
         scores = self.bm25.get_scores(tokenize(query))
+        if mask is not None:
+            scores = np.where(mask, scores, 0.0)
         top = np.argsort(-scores)[:k]
         return [Retrieved(self.chunks[i], float(scores[i]), "bm25") for i in top if scores[i] > 0]
 
@@ -171,19 +187,23 @@ class PolicyIndex:
         current_only: bool = True,
         audience: str = "customer",
     ) -> list[Retrieved]:
-        """Candidates from both retrievers, fused, filtered by policy metadata, reranked, top k.
+        """Candidates from both retrievers over the chunks this audience may see, fused,
+        reranked, top k.
 
-        Filtering happens after retrieval on purpose: a superseded document or an
-        internal one may be the best lexical match, and the filter is the place where
-        that is decided by metadata, not by luck.
+        The metadata filter runs in the store, before ranking: a superseded document or an
+        internal one may be the best lexical match, and it is excluded by metadata before it
+        can be scored, not dropped afterwards by luck. The post-filter below is a second
+        line for any retriever that cannot filter in the store.
         """
-        return [r for r in self.dense(query, k) if self._allowed(r.chunk, True, audience)]
+        mask = self.visible(audience, current_only)
+        return self.dense(query, k, mask)  # hybrid: BM25, fusion, reranker
 
     @staticmethod
     def _allowed(chunk: Chunk, current_only: bool, audience: str) -> bool:
+        """Fails closed: only an `internal` caller sees anything that is not marked customer."""
         if current_only and not chunk.current:
             return False
-        if audience == "customer" and chunk.audience == "internal":
+        if audience != "internal" and chunk.audience != "customer":
             return False
         return True
 
@@ -232,7 +252,7 @@ def real_embeddings() -> Any:
 
 
 class S3VectorsDense:
-    """The managed dense retriever on the AWS Reference stack: Amazon S3 Vectors.
+    """The managed dense retriever on the AWS platform: Amazon S3 Vectors.
 
     Shapes verified against the installed botocore model (s3vectors 2025-07-15):
     `query_vectors(vectorBucketName, indexName, topK, queryVector={"float32": [...]},
@@ -272,8 +292,11 @@ class S3VectorsDense:
             )
         return len(chunks)
 
-    def query(self, text: str, k: int) -> list[tuple[str, float]]:
+    def query(self, text: str, k: int, *, customer_only: bool = False) -> list[tuple[str, float]]:
+        """`customer_only` filters in the vector store on the `audience` metadata, so an
+        internal chunk is never among the k returned."""
         q = self.embeddings.encode([text])[0]
+        kw: dict[str, Any] = {"filter": {"audience": "customer"}} if customer_only else {}
         r = self.client.query_vectors(
             vectorBucketName=self.bucket,
             indexName=self.index,
@@ -281,13 +304,14 @@ class S3VectorsDense:
             queryVector={"float32": [float(x) for x in q]},
             returnMetadata=False,
             returnDistance=True,
+            **kw,
         )
         return [(v["key"], 1.0 - float(v.get("distance", 0.0))) for v in r.get("vectors", [])]
 
 
 class ManagedPolicyIndex(PolicyIndex):
     """PolicyIndex whose dense stage is a managed service. BM25, fusion, filters and the
-    reranker are unchanged, so everything Session 4 taught still applies; only the
+    reranker are unchanged, so everything Project 3 taught still applies; only the
     vector store moved."""
 
     def __init__(
@@ -304,9 +328,15 @@ class ManagedPolicyIndex(PolicyIndex):
         self._dense = dense
         self.manifest = {}
 
-    def dense(self, query: str, k: int) -> list[Retrieved]:
+    def dense(self, query: str, k: int, mask: np.ndarray | None = None) -> list[Retrieved]:
+        allowed = (
+            None if mask is None else {c.id for c, ok in zip(self.chunks, mask, strict=True) if ok}
+        )
+        customer_only = allowed is not None and all(
+            self.by_id[cid].audience == "customer" for cid in allowed
+        )
         return [
             Retrieved(self.by_id[cid], score, "dense")
-            for cid, score in self._dense.query(query, k)
-            if cid in self.by_id
+            for cid, score in self._dense.query(query, k, customer_only=customer_only)
+            if cid in self.by_id and (allowed is None or cid in allowed)
         ]

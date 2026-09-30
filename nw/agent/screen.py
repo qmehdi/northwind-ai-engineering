@@ -5,8 +5,8 @@ GCP: Model Armor, `sanitizeUserPrompt` on a template.
 Azure: Azure AI Content Safety Prompt Shields, `text:shieldPrompt` on the Foundry resource.
 
 All are optional: with no template or endpoint configured, `screen()` allows everything
-and says so, so the Session path runs without them and the Reference stack
-turns them on with two environment variables. A blocked ticket never reaches
+and says so, so a laptop runs without them and the platform deploy
+turns them on with environment variables. A blocked ticket never reaches
 the model; the trajectory records the decision and the reason.
 """
 

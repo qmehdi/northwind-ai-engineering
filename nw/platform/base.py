@@ -3,11 +3,34 @@
 Six protocols, one value object and one factory. The protocols are deliberately small: the
 course teaches the operations every platform has (register, approve, submit, invoke, retrieve,
 deploy) and leaves vendor extras to the reference tab. Implementations live in
-`nw/platform/aws.py`, `nw/platform/gcp.py` and `nw/platform/local.py`; each is imported lazily
-so a track never needs the other tracks' SDKs installed.
+`nw/platform/aws.py`, `nw/platform/gcp.py`, `nw/platform/azure.py` and `nw/platform/local.py`;
+each is imported lazily so a track never needs the other tracks' SDKs installed.
 
-Naming: every resource a tenant creates carries `Tenant.prefix` (cohort mode) or the empty
-prefix (solo mode), so two learners on one platform never collide (ADR 0009).
+Naming: every resource a tenant creates carries `Tenant.prefix` (`northwind-alice`, or
+`northwind-solo` in solo mode), so two learners on one platform never collide (ADR 0009).
+
+Stage semantics (one meaning on every track; `tests/platform/test_contract.py` holds all four
+implementations to it):
+
+- `candidate`: registered by a pipeline (or `bootstrap`) after its gate passed; waiting for a
+  person. Any number of versions can be candidates.
+- `approved`: a person approved it for serving. At most one version per model is approved:
+  approving a version steps the previous approved version back to `candidate`.
+- `live`: the version the live target serves. At most one version per model is live: making a
+  version live steps the previous live version back to `retired`. A live version is not also
+  approved; `set_stage(..., LIVE)` takes it out of `approved`.
+- `retired`: served once, replaced. Any number. Setting any stage on any version is allowed
+  (rolling back is `set_stage(old, LIVE, reason)`), and every change records its reason.
+
+`versions()` lists every version oldest first, so `[-1]` is the newest registration. `live()`
+returns the live version or None; it never falls back to an approved one. Prompt stores follow
+the same rules; registering a text that is already registered returns the existing version,
+and `get(name)` without a version returns the live one, else the approved one, else the newest.
+To pick what to approve or promote, use `promotion_candidate`, never `versions()[-1]`.
+
+Scores: `Hit.score` is on one scale on every track: 0 to 1, higher is more relevant, the scale
+of a cosine similarity. Each vector store maps its native score onto it and keeps the native one
+in `metadata["raw_score"]` with `metadata["score_kind"]`.
 """
 
 from __future__ import annotations
@@ -96,18 +119,66 @@ class PipelineRun:
 
 @dataclass
 class Hit:
+    """One retrieval result. `score` is 0 to 1, higher is better, on every track."""
+
     id: str
     text: str
     score: float
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
+# What a stage holder becomes when another version takes its stage (see the module docstring).
+STEP_BACK: Mapping[Stage, Stage] = {Stage.LIVE: Stage.RETIRED, Stage.APPROVED: Stage.CANDIDATE}
+# Stages at most one version of a model holds at a time.
+UNIQUE_STAGES: tuple[Stage, ...] = (Stage.LIVE, Stage.APPROVED)
+
+
+def clamp_score(value: float) -> float:
+    """A score on the contract's 0 to 1 scale."""
+    return max(0.0, min(1.0, float(value)))
+
+
+def newest(versions: Sequence[Any], *stages: Stage) -> Any | None:
+    """The newest of `versions` (oldest first, as `versions()` returns them) in one of
+    `stages`, or None."""
+    for v in reversed(list(versions)):
+        if v.stage in stages:
+            return v
+    return None
+
+
+def promotion_candidate(registry: ModelRegistry, tenant: Tenant, name: str) -> ModelVersion:
+    """The version to approve or promote: the approved version when there is one, else the
+    newest candidate. A learner who approved in Project 1 gets that approved version in the
+    capstone; one who did not gets the candidate to approve. Raises LookupError naming what the
+    registry holds and how to recover (`bootstrap`) when there is neither."""
+    found = list(registry.versions(tenant, name))
+    chosen = newest(found, Stage.APPROVED) or newest(found, Stage.CANDIDATE)
+    if chosen is None:
+        held = ", ".join(f"{v.version}:{v.stage.value}" for v in found) or "no versions"
+        raise LookupError(
+            f"{tenant.resource(name)} has no approved or candidate version ({held}): run the "
+            f"pipeline, or `bootstrap` from artifacts/{name}/latest to recover"
+        )
+    return chosen
+
+
+def default_prompt(versions: Sequence[PromptVersion]) -> PromptVersion:
+    """What `PromptStore.get(name)` returns without a version: live, else approved, else the
+    newest. `versions` is oldest first."""
+    if not versions:
+        raise KeyError("no prompt versions")
+    return newest(versions, Stage.LIVE) or newest(versions, Stage.APPROVED) or versions[-1]
+
+
 @runtime_checkable
 class ModelRegistry(Protocol):
-    """Register a trained artifact, move it through stages, find the live one.
+    """Register a trained artifact, move it through stages, find the live one. Stage rules are
+    in the module docstring and hold on every track.
 
-    AWS: SageMaker Model Registry (model package groups, approval status).
-    GCP: Model Registry with aliases. Local: MLflow registry with aliases."""
+    AWS: SageMaker Model Registry (model package groups, approval status and metadata).
+    GCP: Model Registry with aliases and a stage log. Azure: Azure ML models with a `stage`
+    tag. Local: MLflow registry with aliases."""
 
     def register(
         self,
@@ -128,7 +199,10 @@ class ModelRegistry(Protocol):
 @runtime_checkable
 class PipelineRunner(Protocol):
     """Submit a compiled pipeline and follow it. The step code is shared across tracks;
-    only the definition differs (SageMaker SDK on AWS, Kubeflow SDK on GCP and local).
+    only the definition differs (SageMaker SDK on AWS, Kubeflow SDK on GCP and local, the
+    Azure ML SDK on Azure). On the cloud tracks `submit` ships the submitting checkout's `nw/`
+    with the run (`nw.pipelines.source`), so the steps run the learner's code, not the copy
+    baked into the image.
 
     `pipeline` names the definition (`triage`, `semantic`, `retrain-triage`); the implementation
     resolves it to `<NW_PIPELINE_DIR>/<pipeline>.yaml` (Kubeflow) or the tenant's SageMaker
@@ -163,8 +237,9 @@ class EndpointClient(Protocol):
 class PromptStore(Protocol):
     """Prompts are versioned artifacts with a hash that travels in answers and spans.
 
-    AWS: Bedrock Prompt Management. GCP: the Gen AI SDK prompt management. Local: the
-    in-repo registry under `nw/llm/prompts` with MLflow as the store of record."""
+    AWS: Bedrock Prompt Management. GCP: the Gen AI SDK prompt management. Azure: blob records
+    plus an Azure ML data asset. Local: the in-repo registry under `nw/llm/prompts` with
+    MLflow as the store of record."""
 
     def register(
         self, tenant: Tenant, name: str, text: str, tags: Mapping[str, str]
@@ -178,7 +253,9 @@ class PromptStore(Protocol):
 class VectorStore(Protocol):
     """The managed retrieval behind the policy service's Retriever.
 
-    AWS: Bedrock Knowledge Base on S3 Vectors. GCP: RAG Engine on Vector Search. Local: Qdrant."""
+    AWS: Bedrock Knowledge Base on S3 Vectors. GCP: RAG Engine on Vector Search. Azure: AI
+    Search. Local: Qdrant. Metadata given to `upsert` comes back on every hit (the policy
+    service filters on `audience` and `current`), and `drop` removes the documents for good."""
 
     def upsert(
         self,

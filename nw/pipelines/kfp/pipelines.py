@@ -33,6 +33,9 @@ def triage_pipeline(image: str = DEFAULT_IMAGE):
         force: bool = False,
         register_model: bool = True,
         trigger: str = "manual",
+        source_uri: str = "",
+        champion: str = "registry",
+        platform_env: str = "",
         production_summary: str = "data/golden/triage_production.json",
         target_recall: float = 0.90,
         min_precision: float = 0.25,
@@ -43,11 +46,18 @@ def triage_pipeline(image: str = DEFAULT_IMAGE):
         max_brier_increase: float = 0.01,
         max_p0_recall_drop: float = 0.03,
     ) -> str:
-        check = c["triage_data_check"](data_uri=data_uri, output_root=output_root)
+        check = c["triage_data_check"](
+            data_uri=data_uri,
+            output_root=output_root,
+            source_uri=source_uri,
+            platform_env=platform_env,
+        )
         check.set_caching_options(False)
         train = c["triage_train"](
             data_uri=data_uri,
             output_root=output_root,
+            source_uri=source_uri,
+            platform_env=platform_env,
             target_recall=target_recall,
             min_precision=min_precision,
             seed=seed,
@@ -55,6 +65,8 @@ def triage_pipeline(image: str = DEFAULT_IMAGE):
         train.set_caching_options(False).after(check)
         evaluate = c["triage_evaluate"](
             output_root=output_root,
+            source_uri=source_uri,
+            platform_env=platform_env,
             version=train.outputs["Output"],
             production_summary=production_summary,
             min_p0_recall=min_p0_recall,
@@ -63,11 +75,16 @@ def triage_pipeline(image: str = DEFAULT_IMAGE):
             max_brier_increase=max_brier_increase,
             max_p0_recall_drop=max_p0_recall_drop,
             force=force,
+            champion=champion,
+            tenant=tenant,
+            environment=environment,
         )
         evaluate.set_caching_options(False)
         registered = c["register"](
             pipeline="triage",
             output_root=output_root,
+            source_uri=source_uri,
+            platform_env=platform_env,
             version=train.outputs["Output"],
             passed=evaluate.outputs["Output"],
             tenant=tenant,
@@ -98,6 +115,9 @@ def semantic_pipeline(image: str = DEFAULT_IMAGE):
         force: bool = False,
         register_model: bool = True,
         trigger: str = "manual",
+        source_uri: str = "",
+        champion: str = "registry",
+        platform_env: str = "",
         production_summary: str = "data/golden/semantic_production.json",
         epochs: int = 2,
         subset: int = 2000,
@@ -115,11 +135,18 @@ def semantic_pipeline(image: str = DEFAULT_IMAGE):
         max_tag_micro_f1_drop: float = 0.02,
         max_priority_macro_f1_drop: float = 0.02,
     ) -> str:
-        prep = c["semantic_data_prep"](data_uri=data_uri, output_root=output_root)
+        prep = c["semantic_data_prep"](
+            data_uri=data_uri,
+            output_root=output_root,
+            source_uri=source_uri,
+            platform_env=platform_env,
+        )
         prep.set_caching_options(False)
         train = c["semantic_train"](
             data_uri=data_uri,
             output_root=output_root,
+            source_uri=source_uri,
+            platform_env=platform_env,
             epochs=epochs,
             subset=subset,
             lr=lr,
@@ -131,12 +158,19 @@ def semantic_pipeline(image: str = DEFAULT_IMAGE):
         train.set_caching_options(False).after(prep)
         version = train.outputs["Output"]
         export = c["semantic_export"](
-            data_uri=data_uri, output_root=output_root, version=version, parity_n=parity_n
+            data_uri=data_uri,
+            output_root=output_root,
+            source_uri=source_uri,
+            platform_env=platform_env,
+            version=version,
+            parity_n=parity_n,
         )
         export.set_caching_options(False)
         bench = c["semantic_benchmark"](
             data_uri=data_uri,
             output_root=output_root,
+            source_uri=source_uri,
+            platform_env=platform_env,
             version=version,
             triage_artifact=triage_artifact,
             latency_n=latency_n,
@@ -144,6 +178,8 @@ def semantic_pipeline(image: str = DEFAULT_IMAGE):
         bench.set_caching_options(False).after(export)
         gate = c["semantic_gate"](
             output_root=output_root,
+            source_uri=source_uri,
+            platform_env=platform_env,
             version=version,
             production_summary=production_summary,
             min_p0_recall=min_p0_recall,
@@ -152,11 +188,16 @@ def semantic_pipeline(image: str = DEFAULT_IMAGE):
             max_tag_micro_f1_drop=max_tag_micro_f1_drop,
             max_priority_macro_f1_drop=max_priority_macro_f1_drop,
             force=force,
+            champion=champion,
+            tenant=tenant,
+            environment=environment,
         )
         gate.set_caching_options(False).after(bench)
         registered = c["register"](
             pipeline="semantic",
             output_root=output_root,
+            source_uri=source_uri,
+            platform_env=platform_env,
             version=version,
             passed=gate.outputs["Output"],
             tenant=tenant,

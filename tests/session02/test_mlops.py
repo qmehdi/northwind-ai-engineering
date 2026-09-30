@@ -88,7 +88,9 @@ def test_gate_blocks_regressions_and_data_changes():
     assert not worse.passed and any("macro-F1" in r for r in worse.reasons)
     moved = gate(summary("v2", sha="d2"), prod)
     assert not moved.passed and any("test split changed" in r for r in moved.reasons)
-    assert gate(summary("v2", p0_recall=0.86), prod, GatePolicy(max_p0_recall_drop=0.05)).passed
+    # Two missed P0 tickets more than production: over the one-ticket bar, inside a looser one.
+    assert not gate(summary("v2", p0_recall=0.86), prod).passed
+    assert gate(summary("v2", p0_recall=0.86), prod, GatePolicy(max_p0_missed_increase=2)).passed
 
 
 def test_promote_points_latest_and_records_the_decision(trained, tmp_path):
@@ -111,17 +113,21 @@ def test_run_is_recorded_and_the_card_is_written(trained):
     assert render(model.metadata).startswith("# Model card")
 
 
-def test_registered_model_is_the_tenants_when_a_tenant_is_set(monkeypatch, tmp_path):
+def test_laptop_runs_never_register_under_the_platform_name(monkeypatch, tmp_path):
+    """Only pipelines write `<environment>-<tenant>-triage`, so its version 1 is the first
+    pipeline run; a laptop run registers beside it under `-laptop` (audit 04 H2)."""
     from nw.triage import tracking
 
     monkeypatch.delenv("NW_TENANT", raising=False)
     monkeypatch.delenv("NW_ENVIRONMENT", raising=False)
     monkeypatch.chdir(tmp_path)  # no .env here
     assert tracking.registered_model_name() == "northwind-triage"
+    assert tracking.experiment_name() == "triage"
     monkeypatch.setenv("NW_TENANT", "alice")
-    assert tracking.registered_model_name() == "northwind-alice-triage"
+    assert tracking.registered_model_name() == "northwind-alice-triage-laptop"
+    assert tracking.experiment_name() == "northwind-alice-laptop-triage"
     monkeypatch.setenv("NW_ENVIRONMENT", "northwind-dev")
-    assert tracking.registered_model_name() == "northwind-dev-alice-triage"
+    assert tracking.registered_model_name() == "northwind-dev-alice-triage-laptop"
 
 
 def test_mlflow_registers_under_the_tenant_name(tmp_path, monkeypatch):
@@ -144,8 +150,17 @@ def test_mlflow_registers_under_the_tenant_name(tmp_path, monkeypatch):
         "git_sha": "def",
     }
     logged = tracking._log_to_mlflow(artifact, run)
-    assert logged["registered_model"] == "northwind-alice-triage"
+    assert logged["registered_model"] == "northwind-alice-triage-laptop"
     assert tracking.set_production_alias("v1") is True
+    import mlflow
+
+    db = f"sqlite:///{tmp_path / 'mlflow.db'}"
+    client = mlflow.MlflowClient(tracking_uri=db, registry_uri=db)
+    version = client.get_model_version("northwind-alice-triage-laptop", "1")
+    assert version.tags["source"] == "laptop"
+    assert client.get_registered_model("northwind-alice-triage-laptop")
+    names = [m.name for m in client.search_registered_models()]
+    assert "northwind-alice-triage" not in names, "the platform's model stays pipeline-only"
 
 
 def test_by_language_metrics_are_in_the_report(trained):
@@ -174,10 +189,19 @@ def test_shadow_scores_every_request_and_capture_records_it(shadow_client):
     assert c.get("/version").json()["shadow_version"]
     lines = [json.loads(line) for line in capture.read_text().splitlines()]
     assert len(lines) == 6 and lines[0]["shadow_priority"] == lines[0]["priority"]
+    # Every line can be joined with its label later: the correlation id always, the ticket id
+    # when the caller sends one.
+    assert all(x["correlation_id"] for x in lines) and lines[0]["ticket_id"] is None
     snap = c.get("/drift").json()
     assert snap["window"] == 6 and snap["level"] in {"ok", "watch", "alert"}
     text = c.get("/metrics").text
     assert 'nw_triage_shadow_total{agree="true"}' in text and "nw_triage_drift_psi" in text
+    assert snap["shadow_agreement"] == 1.0 and snap["shadow_n"] == 6
+    assert "nw_triage_shadow_agreement 1.0" in text
+    r = c.post("/triage", json={"body": "cannot sign in", "ticket_id": "T-100042"})
+    assert r.status_code == 200
+    assert json.loads(capture.read_text().splitlines()[-1])["ticket_id"] == "T-100042"
+    assert c.post("/triage", json={"body": "x", "ticket_id": "nope"}).status_code == 422
 
 
 def test_backtest_reports_agreement_and_metrics(trained, ticket_rows):

@@ -3,9 +3,19 @@
 // container registry; the training cluster that scales to zero; the datastores over the lake;
 // the pipelines environment; one user-assigned managed identity per tenant; and the two
 // custom roles that give a tenant the workspace without its neighbours' endpoints.
-// Azure Machine Learning's finest RBAC scope for jobs and models is the workspace, so tenants
-// share it and are kept apart by name (`northwind-<tenant>-triage`) and by the endpoint role,
-// which is assigned on the tenant's own endpoint only (tenant.bicep).
+//
+// Azure Machine Learning's finest RBAC scope for jobs, models, environments, components and
+// data assets is the workspace, and its actions carry no ABAC conditions, so tenants share it.
+// What the tenant role allows and what it does not (the precise limit, deploy/azure/README.md
+// "Identity and security notes"):
+//   - no delete of any model, environment, component, data asset, code, job, experiment or
+//     run: a tenant cannot destroy what another tenant registered;
+//   - no key, token or score on any online endpoint through this role: the endpoint role
+//     carries those, assigned on the tenant's own endpoints only (tenant.bicep);
+//   - still possible and not preventable in one workspace: registering a new version under a
+//     neighbour's model name, changing tags (the `stage` tag) on a neighbour's version,
+//     cancelling a neighbour's job. Every such write is in the workspace's diagnostic logs
+//     with the caller's identity; a workspace per tenant is the organisation's answer.
 metadata owner = 'northwind'
 
 param environment string
@@ -21,11 +31,28 @@ param appInsightsId string
 param logsWorkspaceId string
 param pipelinesImage string
 param pipelinesImageVersion string
+param workspaceStorageName string
 @secure()
 param apiKey string
+@description('Owner to its own service key: the apps of an owner accept only that owner key.')
+@secure()
+param apiKeys object
+@secure()
+param appInsightsConnectionString string
 param enableTelemetry bool
 
 var storageBlobDataReader = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
+
+// A key map of one entry per owner, the owner as key id (nw/auth.py): logs, metrics and the
+// rate limiter attribute every request to the owner, and one owner's key opens only its own
+// apps.
+var ownerKeySecrets = [
+  for t in tenants: {
+    name: '${environment}-${t}-api-key'
+    value: string(toObject([t], k => k, k => apiKeys[?k] ?? ''))
+    contentType: 'x-api-key map for the apps of ${environment}-${t}; deploy_azure.sh keeps it across deploys'
+  }
+]
 
 module vault 'br/public:avm/res/key-vault/vault:0.14.2' = {
   name: '${environment}-vault'
@@ -42,13 +69,22 @@ module vault 'br/public:avm/res/key-vault/vault:0.14.2' = {
     // `make destroy-azure`; the course turns it off, an organisation turns it on.
     enablePurgeProtection: false
     publicNetworkAccess: 'Enabled'
-    secrets: [
-      {
-        name: '${environment}-api-key'
-        value: apiKey
-        contentType: 'The cohort x-api-key every service checks (nw/auth.py); scripts/rotate_key.sh adds versions'
-      }
-    ]
+    secrets: concat(
+      [
+        {
+          name: '${environment}-api-key'
+          value: apiKey
+          contentType: 'The platform owner key (instructor tooling); no app accepts it since the per-owner keys'
+        }
+        {
+          // The apps read it by reference; it never sits in a plain environment variable.
+          name: '${environment}-appinsights'
+          value: appInsightsConnectionString
+          contentType: 'Application Insights connection string for the services (APPLICATIONINSIGHTS_CONNECTION_STRING)'
+        }
+      ],
+      ownerKeySecrets
+    )
     diagnosticSettings: [
       {
         name: 'to-logs'
@@ -221,50 +257,52 @@ resource pipelinesEnvironmentVersion 'Microsoft.MachineLearningServices/workspac
   }
 }
 
-// A tenant's rights on the shared workspace: everything a data scientist does (jobs, models,
-// environments, components, data assets, experiments, reading endpoints and schedules) and
-// nothing that touches the workspace itself, compute, datastores, connections, schedules or
-// someone's endpoint. It is AzureML Data Scientist with more NotActions.
+// A tenant's rights on the shared workspace, as an allow-list: read everything, run jobs,
+// register models, environments, components, data assets and code, track experiments. No
+// delete of anything shared, nothing on the workspace itself, compute, datastores,
+// connections or schedules, no endpoint writes, and no key, token or score on any endpoint
+// (operation names from the Microsoft.MachineLearningServices permissions page, 2026-09-30).
+var mlOps = 'Microsoft.MachineLearningServices/workspaces'
 resource tenantWorkspaceRole 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
   name: guid(resourceGroup().id, environment, 'tenant-workspace')
   properties: {
     roleName: '${environment} tenant on the workspace (${resourceGroup().name})'
-    description: 'Northwind course: a tenant runs jobs and registers models in the shared Azure Machine Learning workspace'
+    description: 'Northwind course: a tenant runs jobs and registers models in the shared Azure Machine Learning workspace, deletes nothing shared, calls no endpoint'
     type: 'CustomRole'
     assignableScopes: [resourceGroup().id]
     permissions: [
       {
         actions: [
-          'Microsoft.MachineLearningServices/workspaces/*/read'
-          'Microsoft.MachineLearningServices/workspaces/*/action'
-          'Microsoft.MachineLearningServices/workspaces/*/write'
-          'Microsoft.MachineLearningServices/workspaces/*/delete'
+          '${mlOps}/read'
+          '${mlOps}/*/read'
+          '${mlOps}/experiments/write'
+          '${mlOps}/experiments/runs/write'
+          '${mlOps}/experiments/runs/submit/action'
+          '${mlOps}/jobs/write'
+          '${mlOps}/jobs/cancel/action'
+          '${mlOps}/models/write'
+          '${mlOps}/models/versions/write'
+          '${mlOps}/environments/write'
+          '${mlOps}/environments/versions/write'
+          '${mlOps}/environments/build/action'
+          '${mlOps}/components/write'
+          '${mlOps}/components/versions/write'
+          '${mlOps}/data/write'
+          '${mlOps}/data/versions/write'
+          '${mlOps}/codes/write'
+          '${mlOps}/codes/versions/write'
           'Microsoft.Authorization/*/read'
         ]
-        notActions: [
-          'Microsoft.MachineLearningServices/workspaces/write'
-          'Microsoft.MachineLearningServices/workspaces/delete'
-          'Microsoft.MachineLearningServices/workspaces/listKeys/action'
-          'Microsoft.MachineLearningServices/workspaces/computes/*/write'
-          'Microsoft.MachineLearningServices/workspaces/computes/*/delete'
-          'Microsoft.MachineLearningServices/workspaces/computes/listKeys/action'
-          'Microsoft.MachineLearningServices/workspaces/datastores/write'
-          'Microsoft.MachineLearningServices/workspaces/datastores/delete'
-          'Microsoft.MachineLearningServices/workspaces/connections/*'
-          'Microsoft.MachineLearningServices/workspaces/schedules/write'
-          'Microsoft.MachineLearningServices/workspaces/schedules/delete'
-          'Microsoft.MachineLearningServices/workspaces/onlineEndpoints/write'
-          'Microsoft.MachineLearningServices/workspaces/onlineEndpoints/delete'
-          'Microsoft.MachineLearningServices/workspaces/onlineEndpoints/deployments/write'
-          'Microsoft.MachineLearningServices/workspaces/onlineEndpoints/deployments/delete'
-        ]
+        notActions: []
       }
     ]
   }
 }
 
-// Assigned on one online endpoint: the tenant creates, updates and deletes deployments on it
-// and moves its traffic. Nothing at workspace scope.
+// Assigned on one online endpoint: the owner creates, updates and deletes deployments on it,
+// moves its traffic and reads its key to score it. Nothing at workspace scope. A tenant holds
+// it on its own two endpoints; on the live endpoints only the live identity, the platform
+// owner (instructor) and the deployer do (tenant.bicep, admin.bicep, delivery.bicep).
 resource tenantEndpointRole 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
   name: guid(resourceGroup().id, environment, 'tenant-endpoint')
   properties: {
@@ -285,6 +323,43 @@ resource tenantEndpointRole 'Microsoft.Authorization/roleDefinitions@2022-04-01'
         notActions: []
       }
     ]
+  }
+}
+
+// Capture retention (deploy/azure/README.md "Retention"): the live endpoints' data collector
+// writes request and response payloads to the workspace's default blob container under
+// modelDataCollector/; they are deleted 90 days after they were written. Job snapshots and
+// registered model files in the same container are not touched.
+resource workspaceStorage 'Microsoft.Storage/storageAccounts@2026-04-01' existing = {
+  name: workspaceStorageName
+}
+
+resource captureRetention 'Microsoft.Storage/storageAccounts/managementPolicies@2026-04-01' = {
+  parent: workspaceStorage
+  name: 'default'
+  properties: {
+    policy: {
+      rules: [
+        {
+          name: 'capture90days'
+          enabled: true
+          type: 'Lifecycle'
+          definition: {
+            filters: {
+              blobTypes: ['blockBlob', 'appendBlob']
+              prefixMatch: ['azureml-blobstore-${ml.properties.workspaceId}/modelDataCollector/']
+            }
+            actions: {
+              baseBlob: {
+                delete: {
+                  daysAfterModificationGreaterThan: 90
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
   }
 }
 

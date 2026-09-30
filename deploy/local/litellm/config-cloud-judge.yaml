@@ -10,13 +10,18 @@ model_list:
     litellm_params:
       model: ollama_chat/gpt-oss:120b
       api_base: os.environ/NW_OLLAMA_INTERNAL_URL
+  # The smaller-model fallback for a 16 GB Mac (docker-compose.small.yml, SMALL=1).
+  - model_name: qwen3:4b
+    litellm_params:
+      model: ollama_chat/qwen3:4b
+      api_base: os.environ/NW_OLLAMA_INTERNAL_URL
   - model_name: workhorse
     litellm_params:
       model: os.environ/NW_GATEWAY_WORKHORSE
       api_base: os.environ/NW_OLLAMA_INTERNAL_URL
   - model_name: economy
     litellm_params:
-      model: ollama_chat/gpt-oss:20b
+      model: os.environ/NW_GATEWAY_LOCAL_MODEL
       api_base: os.environ/NW_OLLAMA_INTERNAL_URL
   - model_name: claude-opus-5
     litellm_params:

@@ -1,6 +1,6 @@
 """The SageMaker definitions: built on a fake session, the JSON carries the processing
-steps in order, a condition on the gate file, a register step into the tenant's model
-package group with PendingManualApproval and a fail step, and never calls AWS."""
+steps in order, each running the launcher on the source bundle, a condition on the gate file,
+the shared register step (one AWS registration path) and a fail step, and never calls AWS."""
 
 from __future__ import annotations
 
@@ -65,8 +65,12 @@ def test_triage_steps_in_order_and_the_image(triage, config):
     for step in triage["Steps"][:3]:
         app = step["Arguments"]["AppSpecification"]
         assert app["ImageUri"] == config.image_uri
-        assert app["ContainerEntrypoint"][:2] == ["python", "-m"]
-        assert app["ContainerEntrypoint"][2].startswith("nw.pipelines.steps.")
+        entry = app["ContainerEntrypoint"]
+        assert entry[:4] == ["python", "-m", "nw.pipelines.source", "run"]
+        assert entry[4:6] == ["--source", "/opt/ml/processing/input/source"]
+        assert entry[6] == "--" and entry[7].startswith("nw.pipelines.steps.")
+        inputs = {i["InputName"]: i for i in step["Arguments"]["ProcessingInputs"]}
+        assert inputs["source"]["S3Input"]["S3Uri"] == {"Get": "Parameters.SourceUri"}
     train = triage["Steps"][1]
     assert train["DependsOn"] == ["DataCheck"]
     assert "--package-dir" in train["Arguments"]["AppSpecification"]["ContainerArguments"]
@@ -87,7 +91,7 @@ def test_triage_steps_in_order_and_the_image(triage, config):
     assert env["NW_TENANT"] == "alice" and env["NW_TRACK"] == "aws"
 
 
-def test_gate_condition_registers_pending_approval_or_fails(triage, config):
+def test_gate_condition_runs_the_shared_register_step_or_fails(triage, config):
     gate = triage["Steps"][3]["Arguments"]
     [condition] = gate["Conditions"]
     assert condition["Type"] == "GreaterThanOrEqualTo" and condition["RightValue"] == 1
@@ -96,26 +100,33 @@ def test_gate_condition_registers_pending_approval_or_fails(triage, config):
         "Get": "Steps.Evaluate.PropertyFiles.TriageGate"
     }
     [register] = gate["IfSteps"]
-    assert register["Name"] == "Register" and register["Type"] == "RegisterModel"
+    assert register["Name"] == "Register" and register["Type"] == "Processing"
     args = register["Arguments"]
-    assert args["ModelPackageGroupName"] == "northwind-alice-triage"
-    assert args["ModelApprovalStatus"] == "PendingManualApproval"
-    assert args["CustomerMetadataProperties"]["pipeline"] == "triage"
-    assert args["CustomerMetadataProperties"]["tenant"] == "northwind-alice"
-    [container] = args["InferenceSpecification"]["Containers"]
-    assert container["Image"] == config.serving_image_uri
-    assert container["ModelDataUrl"]["Std:Join"]["Values"][-1] == "model.tar.gz"
+    entry = args["AppSpecification"]["ContainerEntrypoint"]
+    assert entry[-1] == "nw.pipelines.steps.register", "one registration path on every track"
+    flags = args["AppSpecification"]["ContainerArguments"]
+    assert flags[:4] == ["--pipeline", "triage", "--out", "/opt/ml/processing/artifacts"]
+    assert ["--tenant", "alice"] == flags[4:6]
+    inputs = {i["InputName"]: i for i in args["ProcessingInputs"]}
+    assert inputs["artifacts"]["S3Input"]["S3Uri"]["Get"].startswith("Steps.Evaluate.")
+    env = args["Environment"]
+    assert env["NW_TRACK"] == "aws" and env["NW_AWS_ARTIFACTS_BUCKET"] == config.bucket
+    assert env["NW_AWS_IMAGE_TRIAGE"] == config.serving_image_uri
     [fail] = gate["ElseSteps"]
     assert fail["Type"] == "Fail" and "gate failed" in json.dumps(fail["Arguments"])
 
 
-def test_trigger_is_declared_and_recorded_on_the_package(triage, semantic):
+def test_trigger_and_champion_are_declared_and_passed_to_the_steps(triage, semantic):
     for d in (triage, semantic):
         got = {p["Name"]: p for p in d["Parameters"]}
         assert got["Trigger"] == {"Name": "Trigger", "Type": "String", "DefaultValue": "manual"}
+        assert got["Champion"]["DefaultValue"] == "registry"
+        assert got["SourceUri"]["Type"] == "String"
         [register] = d["Steps"][-1]["Arguments"]["IfSteps"]
-        trigger = register["Arguments"]["CustomerMetadataProperties"]["trigger"]
-        assert {"Get": "Parameters.Trigger"} in trigger["Std:Join"]["Values"]
+        flags = register["Arguments"]["AppSpecification"]["ContainerArguments"]
+        assert {"Get": "Parameters.Trigger"} in flags
+        gate_step = d["Steps"][-2]["Arguments"]["AppSpecification"]["ContainerArguments"]
+        assert {"Get": "Parameters.Champion"} in gate_step
 
 
 def test_deployed_defaults_replace_the_repo_paths(config, session):
@@ -188,12 +199,11 @@ def test_semantic_steps_chain_through_the_artifacts_prefix(semantic, config):
         "artifacts",
     ]
     gate = by_name["Gate"]["Arguments"]
-    assert gate["IfSteps"][0]["Arguments"]["ModelPackageGroupName"] == "northwind-alice-semantic"
-    assert gate["IfSteps"][0]["Arguments"]["ModelApprovalStatus"] == "PendingManualApproval"
-    model_data = gate["IfSteps"][0]["Arguments"]["InferenceSpecification"]["Containers"][0][
-        "ModelDataUrl"
-    ]
-    assert model_data["Std:Join"]["Values"][0]["Get"].startswith("Steps.Export.")
+    register = gate["IfSteps"][0]["Arguments"]
+    assert register["AppSpecification"]["ContainerArguments"][:2] == ["--pipeline", "semantic"]
+    inputs = {i["InputName"]: i for i in register["ProcessingInputs"]}
+    assert inputs["artifacts"]["S3Input"]["S3Uri"]["Get"].startswith("Steps.GateCheck.")
+    assert register["Environment"]["NW_AWS_IMAGE_SEMANTIC"] == config.serving_image_uri
 
 
 def test_definition_cli_prints_json(capsys):
@@ -217,6 +227,15 @@ def test_definition_cli_prints_json(capsys):
         == 0
     )
     printed = json.loads(capsys.readouterr().out)
-    assert printed["Steps"][3]["Arguments"]["IfSteps"][0]["Arguments"]["ModelPackageGroupName"] == (
-        "northwind-bob-triage"
+    register = printed["Steps"][3]["Arguments"]["IfSteps"][0]["Arguments"]
+    assert register["Environment"]["NW_TENANT"] == "bob"
+
+
+def test_without_a_serving_image_the_registry_uses_the_prebuilt_one(session):
+    """The pipelines image is not an inference image: with no serving image given, the
+    register step names none and `SageMakerRegistry` falls back to the prebuilt one."""
+    bare = SageMakerConfig(
+        tenant=Tenant(name="alice"), role_arn="arn:aws:iam::1:role/r", image_uri="img", bucket="b"
     )
+    [register] = definition("triage", bare, session)["Steps"][-1]["Arguments"]["IfSteps"]
+    assert not any(k.startswith("NW_AWS_IMAGE_") for k in register["Arguments"]["Environment"])

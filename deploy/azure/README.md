@@ -11,18 +11,21 @@ Modules wherever the AVM index has one:
 
 | Module | What it creates | AVM | What needed a script instead |
 | --- | --- | --- | --- |
+| `network` | The virtual network of the Container Apps environment; the apps subnet's security group allows the virtual network and Azure service tags on 443 and denies the internet (`egressControl`); in LiteLLM mode a delegated subnet and private DNS zone for PostgreSQL | | Native: VNet, NSG and private DNS zone |
+| `policy` | The allowed-sizes Azure Policy definition (subscription scope, deny): Azure ML computes and managed online deployments only in `allowedMlSizes`, at most `maxDeploymentInstances` instances; `main.bicep` assigns it to the resource group | | Native |
 | `observability` | Log Analytics (1 GB a day cap), workspace-based Application Insights, the action group, the budget, the platform workbook, the `drift_alert` log search alert | workspace, component, action group, scheduled query rule | Budget and workbook are native (no resource group AVM for budgets, no workbook module) |
-| `data` | The lake: Storage with hierarchical namespace, containers `data`, `artifacts`, `pipelines`, `baselines`, soft delete 7 days; the workspace's flat storage account; Microsoft Purview (`purview = true`, off) | storage account | The tickets and the two production summaries are blobs: `deploy_azure.sh deploy` uploads them |
-| `tracking` | Azure ML workspace with its Key Vault (RBAC), Application Insights, storage and ACR; the lake's containers as identity-based datastores; the CPU cluster (0 to 4 nodes); the pipelines environment; a user-assigned identity per owner; the tenant workspace role and the endpoint role (custom) | vault, registry, user-assigned identity, ML workspace | |
+| `data` | The lake: Storage with hierarchical namespace, containers `data`, `artifacts`, `pipelines`, `baselines`, soft delete 7 days, lifecycle rules per owner (capture and traces 90 days, audit 400 days); the workspace's flat storage account; Microsoft Purview (`purview = true`, off) | storage account | The tickets and the two production summaries are blobs: `deploy_azure.sh deploy` uploads them |
+| `tracking` | Azure ML workspace with its Key Vault (RBAC), Application Insights, storage and ACR; the lake's containers as identity-based datastores; the CPU cluster (0 to 4 nodes); the pipelines environment; a user-assigned identity per owner; the tenant workspace role (an allow-list) and the endpoint role (custom); a key map per owner and the Application Insights string in Key Vault; the 90-day rule on the data collector's prefix | vault, registry, user-assigned identity, ML workspace | |
 | `retrieval` | Azure AI Search, Entra ID only, semantic ranker on the free plan; Basic up to 15 owners, Standard S1 above (Basic holds 15 indexes) | search service | Indexes are data plane: `deploy_azure.sh indexes` creates `northwind-<owner>-policies` from `search/policies-index.json` and grants its roles on that index |
-| `foundry` | The Foundry resource and the project `northwind-project`; deployments `gpt-oss-120b` (Workhorse), `mistral-small-2503` (Economy, Mistral Small 3.1 through Azure Marketplace), `claude-opus-5` (Judge), `text-embedding-3-small` (the indexes' vectorizer); the content filter policy with Prompt Shields on every deployment; the project's connections to Application Insights and AI Search | cognitive services account | Foundry evaluation runs and agent versions are created in the project by `nw/platform/azure.py` |
-| `gateway` | API Management Basic v2 with two APIs (`/openai`, `/anthropic`), `llm-token-limit` and `llm-emit-token-metric` per tenant subscription, a backend pool with a circuit breaker per API, managed identity to Foundry, a subscription per owner whose key lands in Key Vault; or LiteLLM on Container Apps with PostgreSQL | API Management service, container app, PostgreSQL flexible server | LiteLLM keys are registered with the proxy by `deploy_azure.sh keys` |
+| `foundry` | The Foundry resource and the project `northwind-project`; deployments `gpt-oss-120b` (Workhorse), `mistral-small-2503` (Economy, Mistral Small 3.1 through Azure Marketplace), `claude-opus-5` (Judge), `text-embedding-3-small` (the indexes' vectorizer); the content filter policy with Prompt Shields on every deployment; the project's connections to Application Insights and AI Search; the tenant project role (agents and evaluations, no model inference) | cognitive services account | Foundry evaluation runs and agent versions are created in the project by `nw/platform/azure.py` |
+| `gateway` | API Management Basic v2 with two APIs (`/openai`, `/anthropic`), `llm-token-limit` (tokens a minute and a monthly `token-quota`) and `llm-emit-token-metric` per tenant subscription, a backend pool with a circuit breaker per API, managed identity to Foundry, a subscription per owner whose key lands in Key Vault; or LiteLLM on Container Apps (pinned by digest) with PostgreSQL in a delegated subnet, no public endpoint | API Management service, container app, PostgreSQL flexible server | LiteLLM keys are registered with the proxy by `deploy_azure.sh keys` |
 | `tenant` (per owner) | Online endpoints `nw-<owner>-triage-<scope>` and `-semantic-<scope>`; the weekly retraining schedule (disabled); every role of the owner | | |
 | `agents` (per owner) | Container Apps `northwind-<owner>-policy`, `-agent` (external) and `-mcp` (internal only); the live policy and agent apps run in multiple-revision mode for the traffic split | container app, managed environment | |
-| `serving` | Metric alerts on the live endpoint (5xx, p95) and on the live apps (5xx): what the canary is judged by | metric alert | |
-| `delivery` | The `northwind-deployer` identity with federated credentials for Azure Pipelines and GitHub Actions, AcrPush, the deployer custom role | user-assigned identity | Approvals are environment checks in Azure DevOps (or GitHub environment rules), not ARM |
+| `serving` | Metric alerts on both live endpoints (5xx, p95) and on the three live apps (5xx): what the canary is judged by | metric alert | |
+| `delivery` | The `northwind-builder` identity (image pushes, trusted by `main`) and the `northwind-deployer` identity (trusted by the canary and live environments only) with the deployer custom role assigned on the live apps, the live identity and the environment, and the endpoint role on the live endpoints | user-assigned identity | Approvals are environment checks in Azure DevOps (or GitHub environment rules), not ARM |
 | `defender` | Defender for Containers at subscription scope (`defenderForContainers = true`, off) | | |
-| `admin` | The platform owner's data plane roles (lake, search, Key Vault, Foundry) for the uploads and indexes | | |
+| `foundry-eu` | The EU Foundry resource in `euLocation` (swedencentral): `Mistral-Large-3` on Data Zone Standard (EU data zone) for EU accounts' Workhorse and Economy calls, the same content filter, Cognitive Services User on it for every owner's identity and learner (`euFoundry = true`, `NW_AZURE_EU=false` skips it) | cognitive services account | |
+| `admin` | The platform owner's data plane roles (lake, search, Key Vault, Foundry) for the uploads and indexes, and the endpoint role on the live endpoints (the instructor runs the model promotion drill) | | |
 
 Agents run in two places, split by owner (the same split is documented on the `AgentRuntime`
 class in `nw/platform/azure.py`):
@@ -109,7 +112,8 @@ Environment: `NW_MODE`, `NW_TENANTS`, `NW_ENVIRONMENT` (default `northwind`),
 `NW_ALERT_EMAIL`, `NW_BUDGET_USD`, `NW_GATEWAY_KIND=apim|litellm`, `NW_APIM_SKU`
 (`BasicV2`, `Developer`, `StandardV2`), `NW_SEARCH_SKU`, `NW_TENANT_USERS=alice=<object id>,...`,
 `NW_RETRAIN_ENABLED`, `NW_DEFENDER`, `NW_PURVIEW`, `NW_GITHUB_REPOSITORY`, `NW_ADO_ISSUER`,
-`NW_ADO_SUBJECT`. A first deploy takes 20 to 35 minutes (API Management v2 and the model
+`NW_ADO_SUBJECT`, `NW_ADO_BUILDER_SUBJECT`, `NW_TENANT_TOKENS_PER_MONTH` (default 6,000,000),
+`NW_EGRESS_CONTROL` (default `true`; `false` leaves the apps' outbound open). A first deploy takes 20 to 35 minutes (API Management v2 and the model
 deployments are the slow parts); the apps start on a public placeholder image until
 `make images-azure` has pushed the course images, and the next deploy moves them over.
 
@@ -133,6 +137,7 @@ same roles as the tenant identity. Solo mode: the learner is `solo` and owns the
 | Online endpoints | `nw-<tenant>-triage-<scope>`, `nw-<tenant>-semantic-<scope>` | the deployment; deployments by the tenant |
 | Search index | `northwind-<tenant>-policies` | `deploy_azure.sh`; filled by `VectorStore.upsert` |
 | Gateway key | APIM subscription `northwind-<tenant>`, Key Vault `northwind-<tenant>-gateway-key` | the deployment |
+| Service key | Key Vault `northwind-<tenant>-api-key`: the `x-api-key` map (`{"<tenant>": "<key>"}`) the tenant's apps accept, and no other owner's apps | `deploy_azure.sh`, kept across deploys |
 | Apps | `northwind-<tenant>-policy`, `-agent`, `-mcp` | the deployment |
 | Blob prefixes | `artifacts/northwind-<tenant>/`, `pipelines/northwind-<tenant>/` | the tenant; nothing outside them (ABAC) |
 
@@ -143,6 +148,7 @@ NW_TRACK=azure
 NW_TENANT=alice
 NW_ENVIRONMENT=northwind
 NW_GATEWAY_KEY=<az keyvault secret show --vault-name <NW_AZURE_KEY_VAULT> -n northwind-alice-gateway-key --query value -o tsv>
+NW_API_KEY=<az keyvault secret show --vault-name <NW_AZURE_KEY_VAULT> -n northwind-alice-api-key --query value -o tsv>
 NW_AZURE_PIPELINE_IDENTITY_CLIENT_ID=<identity_client_id from make tenants-azure>
 ```
 
@@ -185,7 +191,8 @@ key is the LiteLLM virtual key. In the order of the course:
 6. Capstone: the promotion drill below.
 
 Every model call goes through the gateway: API Management counts tokens per tenant subscription
-(`llm-token-limit`, 20,000 a minute by default) and emits them to Application Insights by
+(`llm-token-limit`, 20,000 a minute and 6,000,000 a calendar month by default; past the minute
+rate the answer is a 429, past the monthly quota a 403 until the month turns) and emits them to Application Insights by
 subscription (`llm-emit-token-metric`), which the workbook's "Model tokens per tenant" tile reads:
 that is the per-tenant cost line.
 
@@ -199,6 +206,8 @@ live=True, canary_percent=10)` creates the colour that is not serving (`blue` or
 `northwind-live-5xx` (RequestsPerMinute, statusCodeClass 5xx) and `northwind-live-p95`
 (RequestLatency_P95 above 2,000 ms) watch the endpoint; the workbook shows both. Then
 `promote` moves the rest and deletes the old colour, or `rollback` sends everything back.
+Nothing rolls back on its own on this track: the alerts email the action group and a person runs
+`rollback`; the model endpoint's alerts do not gate `promote`, which is a person's call.
 Every live deployment carries data collection (`data_collector` on the ManagedOnlineDeployment
 that `nw/platform/azure.py` creates). `request` and `response` payload logging fills without
 code in the custom container, so every request and response the promoted version served is kept;
@@ -206,8 +215,11 @@ the data lands in `workspaceblobstore` under `modelDataCollector/<endpoint>/<dep
 partitioned by hour. `model_inputs` and `model_outputs`, the collections model monitoring reads,
 are enabled but stay empty until the serving image logs through the `azureml-ai-monitoring`
 `Collector`, which it does not yet, so an Azure ML model monitor has nothing to compute on; the
-services' own `/drift` is the drift signal. Tenants opt in with `NW_AZURE_TENANT_DATA_COLLECTION=1`. In a cohort the instructor calls turns: the
-live endpoint is shared, every tenant holds the endpoint role on it.
+services' own `/drift` is the drift signal. Tenants opt in with `NW_AZURE_TENANT_DATA_COLLECTION=1`. The collected payloads are deleted 90
+days after they were written (lifecycle rule on the workspace storage). In a cohort the instructor
+runs the live drill, signed in as the platform owner: the endpoint role on the live endpoints
+belongs to the live identity, the platform owner and the deployer only, so a tenant cannot move
+the live traffic or read the live key. In solo mode the learner is the platform owner.
 
 **A service image into the live apps.** `make release-azure` resolves the images tagged with the
 current commit to digests, pins the serving revision of `northwind-live-policy` and
@@ -215,7 +227,9 @@ current commit to digests, pins the serving revision of `northwind-live-policy` 
 (label `canary`). `make approve-azure REASON="..."` reads the fired alerts at resource group
 scope (the deployer's role reaches no further) and refuses while a live alert fires or when the
 alerts cannot be read, then gives the canary 100 percent and tags the app with the time and the
-reason. `NW_FORCE=1` overrides both refusals. Then register the release:
+reason. The alerts it reads are the ones named `<environment>-live*`: the endpoints' and apps'
+5xx and p95 alerts and `<environment>-live-quality-level`; the other quality alerts and the
+`drift_alert` search alert page and never block. `NW_FORCE=1` overrides both refusals. Then register the release:
 `NW_TENANT=live make agent-cards PUSH=1`. On a push to `main` the
 Azure Pipelines delivery pipeline does the same with an approval check between the two.
 
@@ -261,27 +275,137 @@ Azure Pipelines (`pipelines/azure-pipelines.yml`), set up once in the Azure DevO
    checks, Approvals, the approvers. Approvals are not YAML: the environment's owner sets them.
 3. A pipeline from the YAML on the GitHub repository.
 
+Two identities keep building apart from releasing: `northwind-builder` pushes images and reads
+the deployment outputs, nothing else; `northwind-deployer` releases. In Azure Pipelines each has
+its own service connection (`northwind-builder` for the Build stage, set `NW_ADO_BUILDER_SUBJECT`
+to its subject); restrict `northwind-deployer` to this pipeline and to `main` (a Branch control
+check on the connection).
+
 GitHub Actions instead: `pipelines/github-actions.yml` (copy to `.github/workflows/`), the
-environment `northwind-live` with required reviewers, `NW_GITHUB_REPOSITORY=owner/name` at
-deploy so the deployer trusts `repo:owner/name:environment:northwind-live` and `ref:refs/heads/main`.
+environments `northwind-canary` and `northwind-live`, both limited to the `main` branch, required
+reviewers on `northwind-live`, and `NW_GITHUB_REPOSITORY=owner/name` at deploy. The builder trusts
+`repo:owner/name:ref:refs/heads/main`; the deployer trusts only
+`repo:owner/name:environment:northwind-canary` and `...:environment:northwind-live`, so a job on
+`main` that declares neither environment can build but cannot touch the live apps. Secrets:
+`AZURE_BUILDER_CLIENT_ID` (`NW_AZURE_BUILDER_CLIENT_ID`) and `AZURE_CLIENT_ID`
+(`NW_AZURE_DEPLOYER_CLIENT_ID`).
 Pull-request checks stay in the existing Actions workflows (ADR 0012).
 
 ## Identity and security notes
 
 - Every workload identity is a user-assigned managed identity; no client secret or storage key
-  exists. Key Vault uses RBAC and each identity reads only its two secrets (role assignments on
-  the secrets). The Foundry resource and AI Search have local auth off.
+  exists. Key Vault uses RBAC and each identity reads only its three secrets (its owner's API key
+  map, its gateway key, the Application Insights string; role assignments on the secrets). The
+  Foundry resource and AI Search have local auth off.
+- **A key per owner.** Every owner's apps accept only that owner's `x-api-key`
+  (`northwind-<owner>-api-key`, a key map whose id is the owner, so logs, metrics and the rate
+  limiter attribute every request). Alice's key does not open Bob's apps or the live ones. The
+  Application Insights connection string reaches the apps as a Key Vault reference, never as a
+  plain environment value, and pipeline jobs (which cannot take a Key Vault reference) do not get it.
 - A tenant writes blobs only under its prefix (and reads the shared `agents/` registry document):
   the Storage Blob Data Contributor assignments carry an ABAC condition on the blob path.
-- Azure ML's finest scope for jobs and models is the workspace, so tenants share it under the
-  custom role `northwind tenant on the workspace` (AzureML Data Scientist without workspace,
-  compute, datastore, connection, schedule or endpoint writes) and operate only their own
-  endpoints (the endpoint role, assigned on each endpoint) and the live ones.
+- **The shared Azure ML workspace, precisely.** Azure ML's finest RBAC scope for jobs, models,
+  environments, components and data assets is the workspace, and its actions take no conditions,
+  so tenants share it under the custom role `northwind tenant on the workspace`, an allow-list:
+  read everything, submit and cancel jobs, register models, environments, components, data assets
+  and code, track experiments. It grants no delete of anything, nothing on the workspace, compute,
+  datastores, connections or schedules, no endpoint write, and no key, token or score on any
+  endpoint. A tenant operates and scores only its own two endpoints (the endpoint role, assigned
+  on each). What one workspace cannot prevent: a tenant can register a version under a neighbour's
+  model name, change the tags (the `stage` tag) of a neighbour's version, or cancel a neighbour's
+  job. Each of those writes is in the workspace's diagnostic logs with the caller's identity; an
+  organisation that needs hard isolation gives each team its own workspace.
+- **The live endpoints** are operated by the live identity, the platform owner (instructor) and the
+  deployer, and by nobody else.
+- **Compute sizes.** An Azure Policy assignment on the resource group denies any Azure ML compute or
+  managed online deployment outside `allowedMlSizes` (Standard_F2s_v2, F4s_v2, DS2_v2, DS3_v2) or
+  above `maxDeploymentInstances` (2). Serverless jobs name their instance type inside the job, not
+  as an ARM property the policy sees; the subscription's Azure ML vCPU quota per family (GPU
+  families are zero unless requested) bounds them. Budgets alert, the policy and the quota stop.
+- **Models only through the gateway.** Tenants hold a custom role on the Foundry project with the
+  agents and evaluations data actions only, not Foundry User, whose account-wide data actions
+  include model inference: a tenant cannot call the deployments directly past the gateway's key,
+  token limit and monthly quota. Known limit: an agent built in the shared project runs on the
+  account's deployments, so its tokens count against the project, not the tenant's quota; the
+  workbook shows agent runs by name.
+- **Search.** Each tenant's identity holds the search roles on its own index only;
+  `deploy_azure.sh indexes` stops with an error when the service refuses an index-scoped
+  assignment instead of granting the role on the whole service. Known limit: the Foundry project
+  is shared, and its connection and identity read every index, so an agent in the project (any
+  tenant's) can search every tenant's policies; a project per tenant is the organisation's answer.
+- **Network.** The Container Apps environment runs in the platform's virtual network. The apps
+  subnet's security group allows the virtual network and Azure service tags on 443
+  (MicrosoftContainerRegistry, AzureFrontDoor.FirstParty, AzureActiveDirectory, AzureMonitor,
+  AzureContainerRegistry, Storage, AzureCloud) and denies the internet, so an agent cannot fetch
+  from or post to an arbitrary host. What it does not stop: service tags name Azure services, not
+  this platform's instances, so a storage account or web app someone else runs in Azure is still
+  reachable on 443. Egress by fully qualified name needs Azure Firewall with a route table on the
+  subnet (priced in `deploy/COSTS-platform.md`, not deployed). `NW_EGRESS_CONTROL=false` turns the
+  rules off if a dependency is missing. In LiteLLM mode PostgreSQL has no public endpoint: a
+  delegated subnet and a private DNS zone, reachable from the apps only.
+- **Signed images.** `make images-azure` signs every pushed digest with cosign and the Key Vault
+  key `northwind-image-signing` (`azurekms://`; the signature is stored in the registry, not the
+  public transparency log); `make release-azure` verifies it before creating a revision and
+  stops on a missing or bad signature (`NW_ALLOW_UNSIGNED=1` overrides, loudly). Only the builder
+  (and the platform owner) can sign; the deployer can only read the public key. Install cosign
+  2.6 (`brew install cosign`) to build or release from a laptop.
+- **Delivery.** The deployer's custom role is assigned on the live apps, the live identity and the
+  environment, never at the resource group, so it cannot read or change a tenant's app; the
+  `main` branch credential belongs to the builder, which only pushes images.
+- **Tenant removal** (`make tenants-azure ACTION=remove TENANT=bob`) deletes every role assignment
+  of the tenant's identity and of the learner (`NW_TENANT_USERS`) at every scope, child scopes
+  included (containers, secrets, endpoints, the index, the project), before it deletes the identity.
 - Defender for Containers scans every pushed image when `NW_DEFENDER=true`; it is a subscription
   plan, so the course leaves it to the organisation. Purview is the same (`NW_PURVIEW=true`).
-- The apps' ingress is public with the cohort `x-api-key` (`nw/auth.py`); the MCP server has
+- The apps' ingress is public with the owner's `x-api-key` (`nw/auth.py`); the MCP server has
   internal ingress only. An organisation adds Entra ID authentication on the Container Apps
   (built-in auth) and private endpoints.
+
+## Operations state and the approval gate
+
+The policy and agent apps keep their durable state in the lake's `artifacts` container
+(`NW_OPS_STORE=https://<lake>.blob.core.windows.net/artifacts`, output `NW_OPS_STORE`,
+`nw/agent/opstore.py`), under the owner's prefix: `<environment>-<owner>/trajectories/` (every
+run, with its proposed actions), `/feedback/` (policy verdicts) and `/approvals/` (claim markers,
+approval records, the escalation queue), with the lifecycle rules of the Retention section. The
+owner's identity, which the apps and jobs run as, writes its prefix except `approvals/` (the
+ABAC condition in `modules/tenant.bicep` adds `StringNotStartsWith '<prefix>/approvals/'`); the
+learner keeps the whole prefix and approves its own tenant's proposals, and the platform owner
+approves the live ones. That is the data-plane half of the approval gate (ADR 0005). A hosted
+agent in the Foundry project gets `NW_OPS_STORE` and `NW_RUNTIME_AUTH=platform` from
+`nw/platform/azure.py`, but tenant hosted agents run as the shared project identity, which holds no
+lake role, so their trajectories stay in the container and never reach the ops store (open item,
+ADR 0005); the Container Apps keep checking `x-api-key` because their ingress is
+public.
+
+## Residency
+
+The main deployments are Global Standard (`models` in `main.bicep`): Azure may process a request
+in any region. EU accounts (`region: eu` in the data, `data/policies/gdpr-data-residency.md`)
+are routed by `nw/config.py` (`EU_MODELS`) to the EU Foundry resource
+(`NW_AZURE_FOUNDRY_EU_ENDPOINT`, `modules/foundry-eu.bicep`): gpt-oss-120b, mistral-small-2503
+and Claude have no EU Data Zone deployment on Foundry, so the EU side runs `Mistral-Large-3` on
+`DataZoneStandard` for the Workhorse and Economy roles. There is no EU Judge on this track:
+Claude on Foundry is processed by Anthropic in the United States, and `nw` refuses an EU call to
+the Judge by design. Two limits, said plainly: the EU resource is called directly with Entra ID,
+not through API Management, so EU calls are bounded by the deployment's capacity (tokens per
+minute) and not by the tenant's monthly gateway quota; and the model version and Data Zone
+availability of `Mistral-Large-3` in `euLocation` must be confirmed in the Foundry catalogue in
+the delivery week (`NW_AZURE_EU=false` deploys without it; EU calls are then refused). The
+subprocessor table is in `docs/governance`.
+
+## Retention
+
+| Store | What | Kept | How |
+| --- | --- | --- | --- |
+| Lake, `artifacts/<environment>-<owner>/capture/`, `/traces/`, `/trajectories/`, `/feedback/`, `/monitoring/` | captured requests, agent trajectories, feedback rows, monitoring and drift output (operational) | 90 days after the last write | lifecycle rule per owner (`data.bicep`) |
+| Lake, `artifacts/<environment>-<owner>/registry/`, `/audit/` and `/approvals/` | the stage trail of every model version, claim markers, approval records, the escalation queue | 400 days after the last write | lifecycle rule per owner |
+| Workspace storage, `modelDataCollector/` | the live endpoints' request and response payloads | 90 days | lifecycle rule (`tracking.bicep`) |
+| Log Analytics and Application Insights | service logs, traces, metrics | 30 days | workspace retention |
+| Deleted blobs | any | 7 days | soft delete (the lake has a hierarchical namespace, so blob versioning, and a noncurrent-version rule, is not available) |
+| LiteLLM PostgreSQL (LiteLLM mode) | virtual keys, spend logs | backups 7 days | `backupRetentionDays` |
+
+The periods follow the retention table in `docs/governance`.
 
 ## Costs, stop and destroy
 
@@ -289,9 +413,11 @@ Read the Azure track of `deploy/COSTS-platform.md` first. The meter while idle i
 Management v2 and AI Search (hourly, cannot be paused), the registry (daily) and whatever online
 deployment holds a VM. `make stop-azure` deletes every online deployment (an approval brings it
 back), keeps the apps at zero replicas when idle and stops the LiteLLM database; API Management
-and Search bill until `make destroy-azure`, which deletes the resource group, purges the
+and Search bill until `make destroy-azure`, which deletes the Azure ML workspace permanently (a
+group delete alone soft-deletes it for 14 days), deletes the resource group, purges the
 soft-deleted Key Vault, Foundry resource and API Management names, removes the custom roles and
-turns Defender back to Free when it was on. Nothing is billed afterwards.
+the allowed-sizes policy definition (subscription scope) and turns Defender back to Free when it
+was on. Nothing is billed afterwards.
 
 ## Scripts and where the API is
 
@@ -310,5 +436,12 @@ turns Defender back to Free when it was on. Nothing is billed afterwards.
 (`alice`, `bob`, APIM) and a solo fixture (LiteLLM): every tenant-scoped name carries the tenant,
 each tenant gets its identity, apps, endpoints, schedule (disabled), gateway subscription, key
 and prefix-bound blob roles; solo yields `solo` and `live` only; the model deployments, the AI
-gateway policies and the pools are there once. `make what-if-azure` is the review against the
+gateway policies and the pools are there once. The security checks: the tenant workspace role
+deletes nothing and calls no endpoint, the live endpoint role is not a tenant's, tenants have no
+inference data action on Foundry, the allowed-sizes policy is assigned, the monthly token quota
+is in both API policies, LiteLLM is pinned by digest with a private database, the apps' subnet
+denies the internet, the retention rules exist per owner, every live endpoint and app has
+alerts, apps read their owner's key and the Application Insights string by reference, the
+deployer is scoped and `main` only builds, and the scripts fail closed on search roles and clean
+up role assignments and the workspace. `make what-if-azure` is the review against the
 subscription.

@@ -46,5 +46,6 @@ def test_p0_route_records_a_version_without_a_model(make_agent_app):
     from nw.agent import service
     from nw.agent.trace import Trajectory
 
-    t = Trajectory.load(service.state.trace_dir / "route-T-200001.json")
+    (path,) = service.state.trace_dir.glob("route-T-200001-*.json")  # one file per routed run
+    t = Trajectory.load(path)
     assert t.agent == "router" and t.agent_version and len(t.agent_version) == 12

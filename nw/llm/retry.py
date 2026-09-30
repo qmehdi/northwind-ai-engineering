@@ -23,4 +23,4 @@ class RetryPolicy(BaseModel):
           better than equal jitter; see the AWS Architecture Blog post
           "Exponential Backoff And Jitter".
         """
-        raise NotImplementedError("Session 1, Step 3")
+        raise NotImplementedError("Service layer, backoff: Retry-After, then full jitter")

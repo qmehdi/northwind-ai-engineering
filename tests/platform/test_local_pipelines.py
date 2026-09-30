@@ -110,3 +110,35 @@ def test_failure_is_recorded_not_raised(tmp_path: Path, tenant):
     assert any("step exploded" in line for line in runner.logs(tenant, run))
     with pytest.raises(KeyError):
         runner.status(tenant, run.__class__("x", "nope", RunStatus.QUEUED))
+
+
+def test_a_run_is_a_child_process_and_never_swaps_the_callers_streams(
+    compiled: Path, tmp_path: Path, tenant
+):
+    """The runner used to redirect `sys.stdout` and replace `sys.executable` from a thread,
+    which changed them for the whole process while a run was going (audit 01 Medium)."""
+    import sys
+
+    stdout, executable = sys.stdout, sys.executable
+    runner = LocalPipelineRunner(tmp_path / "runs", "subprocess")
+    run = runner.submit(tenant, str(compiled), {"a": 2, "b": 2})
+    child = runner._children[run.run_id]
+    assert sys.stdout is stdout and sys.executable == executable
+    done = runner.wait(tenant, run, timeout_s=300)
+    assert done.status is RunStatus.SUCCEEDED and done.outputs.get("Output") == "4"
+    assert child.poll() == 0 and sys.stdout is stdout and sys.executable == executable
+    assert not LocalPipelineRunner.runs_in_process, "the run outlives a CLI that submits"
+
+
+def test_a_child_that_dies_is_recorded_as_failed(compiled: Path, tmp_path: Path, tenant):
+    runner = LocalPipelineRunner(tmp_path / "runs", "subprocess")
+    run = runner.submit(tenant, str(compiled), {"a": 1, "b": 1})
+    runner._children[run.run_id].kill()
+    runner._children[run.run_id].wait()
+    run_dir = runner.run_dir(tenant, run.run_id)
+    import json
+
+    record = json.loads((run_dir / "run.json").read_text())
+    if record["status"] not in ("succeeded", "failed"):
+        assert runner.status(tenant, run).status is RunStatus.FAILED
+        assert "exited" in json.loads((run_dir / "run.json").read_text())["error"]

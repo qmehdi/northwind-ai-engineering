@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from nw.agent.approve import load_trajectories
+from nw.agent.approve import load_trajectories, traces_store
 from nw.agent.trace import Termination, Trajectory
 
 SUBJECT = re.compile(r"^Subject:\s*(.*)$", re.MULTILINE)
@@ -126,7 +126,9 @@ def to_cases(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--traces", type=Path, default=Path("artifacts/traces"))
+    ap.add_argument(
+        "--traces", type=Path, default=None, help="default NW_OPS_STORE, else artifacts/traces"
+    )
     ap.add_argument("--sample", type=int, default=10)
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--out", type=Path, default=Path("artifacts/review.jsonl"))
@@ -139,9 +141,10 @@ def main() -> int:
         write_rows(cases, args.out)
         print(f"{len(cases)} candidate cases written to {args.out}; edit each expect block")
         return 0
-    ts = load_trajectories(args.traces)
+    store = traces_store(args.traces)
+    ts = load_trajectories(store)
     if not ts:
-        print(f"no traces under {args.traces}")
+        print(f"no traces under {store.location}")
         return 1
     rows = [to_row(t) for t in sample(ts, args.sample, args.seed)]
     write_rows(rows, args.out)

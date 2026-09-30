@@ -58,19 +58,52 @@ def read_result(out: Path, step: str) -> dict[str, Any]:
     return read_json(path)
 
 
-def localize(uri: str | Path, suffix: str = ".jsonl") -> Path:
-    """The local path a data URI means inside a step's container.
+def local_path(uri: str | Path) -> Path:
+    """The local path a URI means inside a step's container, without looking inside it.
 
-    Vertex AI Pipelines mounts every bucket under `/gcs/<bucket>/`, so a `gs://` URI is a
-    directory away. SageMaker downloads an S3 input into a directory before the step starts,
-    so a directory means the one file of `suffix` inside it. Anything else is a path."""
+    Vertex AI Pipelines mounts every bucket under `/gcs/<bucket>/`, so `gs://b/k` is
+    `/gcs/b/k`. Step command lines take URIs as strings (`type=str`): `Path("gs://b/k")` is
+    `gs:/b/k`, which no longer names the bucket, and a gate that cannot find its production
+    summary would silently compare against nothing."""
     text = str(uri)
-    path = Path("/gcs") / text[len("gs://") :] if text.startswith("gs://") else Path(text)
+    if text.startswith("gs:/") and not text.startswith("gs://"):
+        raise SystemExit(f"{text!r} is a mangled gs:// URI: pass URIs as strings, not paths")
+    return Path("/gcs") / text[len("gs://") :] if text.startswith("gs://") else Path(text)
+
+
+def localize(uri: str | Path, suffix: str = ".jsonl") -> Path:
+    """The local file a data URI means inside a step's container.
+
+    `gs://` is the `/gcs/` mount (`local_path`). SageMaker downloads an S3 input into a
+    directory before the step starts, so a directory means the one file of `suffix` inside it.
+    Anything else is a path."""
+    path = local_path(uri)
     if path.is_dir():
         found = sorted(p for p in path.iterdir() if p.suffix == suffix)
         if len(found) != 1:
             raise SystemExit(f"{path}: expected one {suffix} file, found {len(found)}")
         return found[0]
+    return path
+
+
+NO_SUMMARY = ("", "none")
+
+
+def production_summary_path(value: str | Path | None, default: Path) -> Path | None:
+    """The production summary a gate step reads. None (not given) means `default`, which may
+    be missing (the first model). An explicit value must exist, or be `none` for a deliberate
+    first model: a named summary that is not there raises instead of turning the regression
+    bars off."""
+    if value is None:
+        return default
+    if str(value).strip().lower() in NO_SUMMARY:
+        return None
+    path = localize(value, ".json")
+    if not path.is_file():
+        raise SystemExit(
+            f"production summary {value} not found at {path}: the gate would run without its "
+            "regression bars; pass the right URI, or `none` for a first model"
+        )
     return path
 
 
@@ -89,13 +122,21 @@ def add_flag(ap: Any, name: str, help: str) -> None:  # noqa: A002
 def package(version_dir: Path, into: Path, name: str = "model.tar.gz") -> Path:
     """`model.tar.gz` of one version directory, the shape a model registry ingests: the
     artifact plus `code/inference.py` for SageMaker's prebuilt containers
-    (`nw.serving.sagemaker.package`). Checkpoints and the fp32 graph stay out."""
-    try:
-        from nw.serving.sagemaker.package import package as sagemaker_package
+    (`nw.serving.sagemaker.package`) when it is a triage or semantic artifact, a plain archive
+    otherwise. Checkpoints and the fp32 graph stay out. Only the kind check decides; an error
+    while packaging a servable artifact propagates instead of producing a tarball with no
+    `inference.py`."""
+    from nw.serving.sagemaker.package import kind_of
+    from nw.serving.sagemaker.package import package as sagemaker_package
 
-        return sagemaker_package(Path(version_dir), Path(into), name)
+    try:
+        kind_of(Path(version_dir))
     except FileNotFoundError:
-        pass  # not a recognisable artifact: the plain archive below
+        servable = False
+    else:
+        servable = True
+    if servable:
+        return sagemaker_package(Path(version_dir), Path(into), name)
     into = Path(into)
     into.mkdir(parents=True, exist_ok=True)
     target = into / name
@@ -118,8 +159,10 @@ __all__ = [
     "STEP_RESULTS",
     "add_flag",
     "env_flag",
+    "local_path",
     "localize",
     "package",
+    "production_summary_path",
     "read_json",
     "read_result",
     "truthy",

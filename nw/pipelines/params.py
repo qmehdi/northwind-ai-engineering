@@ -7,6 +7,10 @@ retraining workflows already use (`epochs`, `force`), plus the gate bars from th
 `GatePolicy` classes, so a weekly job can tighten a bar without a code change, and `trigger`,
 which tells a scheduled run from a hand submission on the registered version.
 
+`source_uri` is the bundle of the submitting checkout's `nw/` (`nw.pipelines.source`), which the
+cloud platform clients set on every submit so the steps run the learner's code. `champion`
+picks what the gate compares against (`nw.pipelines.champion`).
+
 The defaults of `data_uri`, `output_root` and `production_summary` are repo paths, right for the
 Local track. The platform clients replace them with the deployed locations: the tickets in the
 data bucket, the tenant's prefix in the artifacts bucket, and the production summaries the
@@ -54,6 +58,22 @@ COMMON: tuple[Param, ...] = (
     # For the record only: no step reads it to decide anything. The weekly jobs pass
     # `schedule`, a hand submission keeps `manual`, and the registered version carries it.
     Param("trigger", "manual", "who started the run: manual or schedule, recorded on the version"),
+    # The learner's code (nw.pipelines.source): the cloud clients build, upload and set it on
+    # every submit; empty runs the code the step finds (the checkout on the Local track).
+    Param("source_uri", "", "the source bundle of nw/ the steps run; set by the platform client"),
+    # NW_* settings the steps that reach the registry need (the gate's champion lookup and the
+    # register step), as a JSON object; Vertex runs have no other way to learn their platform.
+    Param(
+        "platform_env",
+        "",
+        "JSON object of NW_* settings for the steps that reach the registry",
+        sagemaker=False,
+    ),
+    Param(
+        "champion",
+        "registry",
+        "what the gate compares against: registry (the live version, else the summary) or summary",
+    ),
 )
 
 TRIAGE: tuple[Param, ...] = COMMON + (

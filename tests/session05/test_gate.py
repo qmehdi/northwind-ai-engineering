@@ -9,10 +9,13 @@ import pytest
 
 from nw.agent.evaluate import (
     BASELINE,
+    DEFAULT_CASES,
+    LEGACY_BASELINE,
     CaseScore,
     GatePolicy,
     aggregate,
     baseline_from,
+    cases_sha,
     evaluate,
     format_decision,
     gate,
@@ -25,6 +28,7 @@ pytestmark = pytest.mark.session05
 
 ROOT = Path(__file__).resolve().parents[2]
 ADVERSARIAL = ROOT / "data" / "adversarial" / "tickets.jsonl"
+CASE_FILES = [ROOT / p for p in DEFAULT_CASES]
 
 
 def _scores(n=15, fails=(), steps=5, cost=0.10, unapproved=False):
@@ -57,13 +61,17 @@ def _baseline():
     return baseline_from(aggregate(s, "base00000000"), s, "test")
 
 
-def test_committed_baseline_matches_the_shipped_evaluation_and_the_case_file():
+def test_committed_baseline_matches_the_case_files_and_carries_provenance():
     b = load_baseline(ROOT / BASELINE)
-    assert b is not None and b["aggregate"]["success"] == 15 and b["aggregate"]["n"] == 15
-    assert len(b["steps"]) == 15 and len(b["costs"]) == 15
-    assert set(b["cases"]) == {c.id for c in load_cases(ADVERSARIAL)}
-    shipped = json.loads((ROOT / "artifacts" / "agent_eval.json").read_text())["aggregate"]
-    assert b["aggregate"]["cost_usd_per_resolution"] == shipped["cost_usd_per_resolution"]
+    cases = load_cases(*CASE_FILES)
+    assert b is not None and not b.get("legacy")
+    assert b["aggregate"]["n"] == len(cases) == b["aggregate"]["success"]
+    assert set(b["cases"]) == {c.id for c in cases}, "regenerate: make agent-baseline-offline"
+    prov = b["provenance"]
+    assert prov["mode"] == "offline" and prov["repeats"] == 1 and prov["judge"] == "scripted"
+    assert prov["cases_sha256_12"] == cases_sha(CASE_FILES)
+    legacy = load_baseline(ROOT / LEGACY_BASELINE)
+    assert legacy["legacy"] and "Claude" in legacy["legacy_reason"]
 
 
 def test_one_case_down_is_variance_two_is_a_regression():
@@ -124,7 +132,7 @@ def offline(monkeypatch, tmp_path, local_settings):
     from nw.agent.offline import offline_registry, scripted_provider
 
     monkeypatch.setattr(nwmod, "ESCALATION_QUEUE", tmp_path / "escalations.jsonl")
-    cases = load_cases(ADVERSARIAL)
+    cases = load_cases(*CASE_FILES)
     registry = offline_registry(ROOT / "data" / "accounts.json")
     client = LLMClient(scripted_provider(cases), settings=local_settings)
     return cases, registry, client
@@ -133,11 +141,11 @@ def offline(monkeypatch, tmp_path, local_settings):
 async def test_offline_run_through_the_real_loop_passes_the_gate(offline, tmp_path):
     cases, registry, client = offline
     scores, agg = await evaluate(cases, registry, client, trace_dir=tmp_path / "traces")
-    assert agg["success"] == 15 and agg["injection_resisted"] and agg["agent_version"]
+    assert agg["success"] == len(cases) and agg["injection_resisted"] and agg["agent_versions"]
     assert agg["unapproved_executions"] == 0 and not (tmp_path / "escalations.jsonl").exists()
     d = gate(agg, scores, load_baseline(ROOT / BASELINE))
     assert d.passed, d.reasons
-    assert len(list((tmp_path / "traces").glob("*.json"))) == 15
+    assert len(list((tmp_path / "traces").glob("*.json"))) == len(cases)
 
 
 def test_cli_gate_offline(monkeypatch, tmp_path, capsys):
@@ -166,9 +174,10 @@ def test_cli_gate_offline(monkeypatch, tmp_path, capsys):
     )
     assert cli.main() == 0
     printed = capsys.readouterr().out
-    assert "REGRESSION GATE PASSED" in printed and "15/15 cases succeeded" in printed
+    n = len(load_cases(*CASE_FILES))
+    assert "REGRESSION GATE PASSED" in printed and f"{n}/{n} cases succeeded" in printed
     report = json.loads(out.read_text())
-    assert report["aggregate"]["agent_version"] and (tmp_path / "agent_gate.jsonl").exists()
+    assert report["aggregate"]["agent_versions"] and (tmp_path / "agent_gate.jsonl").exists()
 
 
 def test_cli_writes_the_first_baseline(monkeypatch, tmp_path, capsys):
@@ -194,7 +203,9 @@ def test_cli_writes_the_first_baseline(monkeypatch, tmp_path, capsys):
     assert cli.main() == 0 and baseline.exists()
     assert "this run becomes the baseline" in capsys.readouterr().out
     b = json.loads(baseline.read_text())
-    assert b["aggregate"]["success"] == 15 and len(b["steps"]) == 15
+    n = len(load_cases(*CASE_FILES))
+    assert b["aggregate"]["success"] == n and len(b["steps"]) == n and b["provenance"]
     monkeypatch.setattr(sys, "argv", argv)
     assert cli.main() == 0  # second run compares with the baseline it just wrote
-    assert "against baseline " + b["agent_version"] in capsys.readouterr().out
+    printed = capsys.readouterr().out
+    assert "REGRESSION GATE PASSED" in printed and "against" in printed

@@ -5,6 +5,10 @@ Copied from the AWS developer guides on 2026-09-08 (see the instructor research 
 what the course needs on top (the API key and gateway key secrets, `bedrock:ApplyGuardrail` on
 the course guardrail, `bedrock:Retrieve` on the knowledge bases, Memory and Identity actions,
 `sagemaker:InvokeEndpoint` on the platform's endpoints); `tests/test_synth.py` pins the shape.
+The stack builds one such role per owner: `NorthwindBedrockAgentCoreRuntime-<region>` for the
+live runtimes (the only one that reads the live gateway key and the service API key) and
+`northwind-<tenant>-agentcore` for each tenant, scoped to that tenant's memory, knowledge base,
+endpoints, inference profiles, gateway key and API key.
 
 | File | What |
 | --- | --- |

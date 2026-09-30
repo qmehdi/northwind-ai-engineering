@@ -22,17 +22,28 @@ the model id) is passed to `modelId` unchanged: Converse accepts a model id, a p
 or either one's ARN in the same field.
 
 Auth is the AWS credential chain (profile, environment, or the execution role in the
-cloud). boto3 is synchronous, so the call runs in a worker thread; the SDK's own retries
-are off because the course's retry loop is the one in charge.
+cloud). boto3 is synchronous, so the call runs in a worker thread from the provider's own
+pool, sized to the client's concurrency: the event loop's default pool is shared with every
+other `to_thread` in the process and would cap real concurrency below the semaphore. The
+botocore connection pool gets the same size. The SDK's own retries are off because the
+course's retry loop is the one in charge.
 """
 
 from __future__ import annotations
 
 import asyncio
+import functools
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from nw.llm.errors import ContentFilteredError, RequestTimeout, RetryableError, TerminalError
+from nw.llm.errors import (
+    RETRYABLE_STATUS,
+    ContentFilteredError,
+    RequestTimeout,
+    RetryableError,
+    TerminalError,
+)
 from nw.llm.types import Completion, Message, StopReason, ToolCall, ToolSpec, Usage
 
 # Converse stop reasons that mean the provider blocked the content.
@@ -204,11 +215,13 @@ def classify(exc: Exception, *, timeout_s: float) -> RetryableError | TerminalEr
     message = f"{code}: {error.get('Message') or exc}"
     if code in _TIMEOUT_CODES:
         return RequestTimeout(message, timeout_s=timeout_s, request_id=request_id)
-    if code in _RETRYABLE_CODES or (isinstance(status, int) and status >= 500):
+    if code in _RETRYABLE_CODES or (
+        isinstance(status, int) and (status >= 500 or status in RETRYABLE_STATUS)
+    ):
         return RetryableError(
             message, request_id=request_id, retry_after_s=_retry_after(meta), status=status
         )
-    return TerminalError(message, request_id=request_id, status=status)
+    return TerminalError(message, request_id=request_id, status=status, code=code)
 
 
 def _retry_after(meta: dict[str, Any]) -> float | None:
@@ -232,10 +245,20 @@ class BedrockConverseProvider:
         profile: str | None = None,
         timeout_s: float = 60.0,
         client: Any | None = None,
+        max_concurrency: int = 8,
     ) -> None:
         self._timeout_s = timeout_s
+        self.region = region
         self.endpoint = f"https://bedrock-runtime.{region}.amazonaws.com"
-        self._client = client if client is not None else _make_client(region, profile, timeout_s)
+        self.max_workers = max(1, int(max_concurrency))
+        self._pool = ThreadPoolExecutor(
+            max_workers=self.max_workers, thread_name_prefix="nw-bedrock"
+        )
+        self._client = (
+            client
+            if client is not None
+            else _make_client(region, profile, timeout_s, pool_size=self.max_workers)
+        )
 
     async def complete(
         self,
@@ -257,14 +280,21 @@ class BedrockConverseProvider:
         )
         started = time.perf_counter()
         try:
-            response = await asyncio.to_thread(self._client.converse, **kwargs)
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(
+                self._pool, functools.partial(self._client.converse, **kwargs)
+            )
         except Exception as exc:  # noqa: BLE001  (every botocore family is classified)
             raise classify(exc, timeout_s=self._timeout_s) from exc
         latency_ms = (time.perf_counter() - started) * 1000
         return from_vendor_response(response, model=model, latency_ms=latency_ms)
 
+    async def aclose(self) -> None:
+        """Release the worker threads; calls in flight finish first."""
+        self._pool.shutdown(wait=False, cancel_futures=True)
 
-def _make_client(region: str, profile: str | None, timeout_s: float) -> Any:
+
+def _make_client(region: str, profile: str | None, timeout_s: float, *, pool_size: int = 10) -> Any:
     import boto3
     from botocore.config import Config
 
@@ -275,5 +305,6 @@ def _make_client(region: str, profile: str | None, timeout_s: float) -> Any:
         read_timeout=timeout_s,
         connect_timeout=min(10.0, timeout_s),
         retries={"mode": "standard", "max_attempts": 1},
+        max_pool_connections=max(10, pool_size),
     )
     return session.client("bedrock-runtime", config=config)

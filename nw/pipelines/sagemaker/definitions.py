@@ -1,5 +1,16 @@
 """The SageMaker pipeline graphs. SDK imports are inside the functions so the module loads
-without the SDK and the tests can skip cleanly when the `pipelines` extra is absent."""
+without the SDK and the tests can skip cleanly when the `pipelines` extra is absent.
+
+Every step runs the launcher (`nw.pipelines.source`): the parameter `SourceUri` is the source
+bundle of the checkout that submitted the run, a ProcessingInput of every step, so the steps
+run the learner's `nw/` and the image supplies only the dependencies. `SageMakerPipelines`
+uploads the bundle and sets the parameter's default on every upsert, so the weekly schedule
+runs the last submitted code.
+
+Registration is the shared register step (`nw.pipelines.steps.register`) running under the
+track's `SageMakerRegistry`, the same code and the same tags as every other track and as
+`bootstrap`: one AWS registration path, one metadata shape.
+"""
 
 from __future__ import annotations
 
@@ -14,7 +25,7 @@ from nw.platform.base import Tenant
 ARTIFACTS = "/opt/ml/processing/artifacts"
 DATA_DIR = "/opt/ml/processing/input/data"
 PRODUCTION_DIR = "/opt/ml/processing/input/production"
-CONTENT_TYPES = ["application/json"]
+SOURCE_DIR = "/opt/ml/processing/input/source"
 
 
 @dataclass(frozen=True)
@@ -47,6 +58,24 @@ class SageMakerConfig:
 
     def group_name(self, pipeline: str) -> str:
         return self.tenant.resource(pipeline)
+
+    def platform_env(self, pipeline: str) -> dict[str, str]:
+        """What the steps that reach the registry need to build `SageMakerRegistry`: the track,
+        the tenant, the region, the artifacts bucket and, when one is given, the image the
+        package serves with (else the registry uses the prebuilt inference image of
+        `nw.serving.sagemaker.IMAGES`, never the pipelines image)."""
+        env = {
+            "NW_TRACK": "aws",
+            "NW_TENANT": self.tenant.name,
+            "NW_ENVIRONMENT": self.tenant.environment,
+            "NW_AWS_REGION": self.region,
+            "AWS_DEFAULT_REGION": self.region,
+            "NW_AWS_ARTIFACTS_BUCKET": self.bucket,
+            "TOKENIZERS_PARALLELISM": "false",
+        }
+        if self.serving_image_uri:
+            env[f"NW_AWS_IMAGE_{pipeline.upper()}"] = self.serving_image_uri
+        return env
 
 
 def fake_session(region: str = "us-east-1", bucket: str = "nw-bucket") -> Any:
@@ -118,6 +147,8 @@ def _processing_step(
     config: SageMakerConfig,
     session: Any,
     *,
+    pipeline: str,
+    source: Any,
     arguments: list[Any],
     inputs: list[tuple[str, Any, str]],
     artifacts_out: Any,
@@ -134,21 +165,18 @@ def _processing_step(
     )
     from sagemaker.mlops.workflow.steps import ProcessingStep
 
+    from nw.pipelines.source import launcher
+
     processor = Processor(
         role=config.role_arn,
         image_uri=config.image_uri,
         instance_count=1,
         instance_type=instance_type or config.instance_type,
         volume_size_in_gb=config.volume_size_gb,
-        entrypoint=["python", "-m", module],
+        entrypoint=launcher(module, SOURCE_DIR),
         base_job_name=config.tenant.resource(name.lower()),
         sagemaker_session=session,
-        env={
-            "NW_TENANT": config.tenant.name,
-            "NW_ENVIRONMENT": config.tenant.environment,
-            "NW_TRACK": "aws",
-            "TOKENIZERS_PARALLELISM": "false",
-        },
+        env=config.platform_env(pipeline),
     )
     step_inputs = [
         ProcessingInput(
@@ -160,7 +188,7 @@ def _processing_step(
                 s3_input_mode="File",
             ),
         )
-        for input_name, s3_uri, local_path in inputs
+        for input_name, s3_uri, local_path in [("source", source, SOURCE_DIR), *inputs]
     ]
     outputs = [
         ProcessingOutput(
@@ -187,47 +215,40 @@ def _register_and_gate(
     config: SageMakerConfig,
     session: Any,
     *,
-    trigger: Any,
+    params: dict[str, Any],
     gate_step: Any,
     gate_file: Any,
-    model_artifacts_uri: Any,
 ) -> Any:
+    """`Gate`: the shared register step when the gate's `passed_int` is 1, else `GateFailed`
+    with the gate's reasons. The register step reads the run's tree from the gate step's
+    output, refuses a failed gate a second time, and registers through `SageMakerRegistry`
+    (`PendingManualApproval`, the tenant's package group, the shared tags)."""
     from sagemaker.core.workflow.conditions import ConditionGreaterThanOrEqualTo
     from sagemaker.core.workflow.functions import Join, JsonGet
     from sagemaker.mlops.workflow.condition_step import ConditionStep
     from sagemaker.mlops.workflow.fail_step import FailStep
-    from sagemaker.mlops.workflow.model_step import ModelStep
-    from sagemaker.serve.model_builder import ModelBuilder
 
-    builder = ModelBuilder(
-        s3_model_data_url=Join(on="/", values=[model_artifacts_uri, "model.tar.gz"]),
-        image_uri=config.serving_image,
-        sagemaker_session=session,
-        role_arn=config.role_arn,
-    )
-    register = ModelStep(
-        name="Register",
-        step_args=builder.register(
-            model_package_group_name=config.group_name(pipeline),
-            content_types=CONTENT_TYPES,
-            response_types=CONTENT_TYPES,
-            inference_instances=[config.inference_instance_type],
-            approval_status="PendingManualApproval",
-            customer_metadata_properties={
-                "pipeline": pipeline,
-                "tenant": config.tenant.prefix,
-                "environment": config.tenant.environment,
-                "trigger": Join(on="", values=[trigger]),
-                "gate": Join(
-                    on="",
-                    values=[
-                        JsonGet(
-                            step_name=gate_step.name, property_file=gate_file, json_path="reason"
-                        )
-                    ],
-                ),
-            },
-        ),
+    register = _processing_step(
+        "Register",
+        "nw.pipelines.steps.register",
+        config,
+        session,
+        pipeline=pipeline,
+        source=params["source_uri"],
+        arguments=[
+            "--pipeline",
+            pipeline,
+            "--out",
+            ARTIFACTS,
+            "--tenant",
+            config.tenant.name,
+            "--environment",
+            config.tenant.environment,
+            "--trigger",
+            params["trigger"],
+        ],
+        inputs=[("artifacts", _artifacts_of(gate_step), ARTIFACTS)],
+        artifacts_out=_artifacts_uri(params, pipeline),
     )
     failed = FailStep(
         name="GateFailed",
@@ -269,6 +290,8 @@ def triage_pipeline(config: SageMakerConfig, session: Any | None = None) -> Any:
         "nw.pipelines.steps.triage_data_check",
         config,
         session,
+        pipeline="triage",
+        source=params["source_uri"],
         arguments=["--data", DATA_DIR, "--out", ARTIFACTS],
         inputs=[data_in],
         artifacts_out=artifacts,
@@ -278,6 +301,8 @@ def triage_pipeline(config: SageMakerConfig, session: Any | None = None) -> Any:
         "nw.pipelines.steps.triage_train",
         config,
         session,
+        pipeline="triage",
+        source=params["source_uri"],
         arguments=["--data", DATA_DIR, "--out", ARTIFACTS, "--package-dir", ARTIFACTS]
         + _flags(params, names, "target_recall", "min_precision", "seed"),
         inputs=[data_in],
@@ -292,6 +317,8 @@ def triage_pipeline(config: SageMakerConfig, session: Any | None = None) -> Any:
         "nw.pipelines.steps.triage_evaluate",
         config,
         session,
+        pipeline="triage",
+        source=params["source_uri"],
         arguments=["--out", ARTIFACTS, "--production-summary", PRODUCTION_DIR]
         + _flags(
             params,
@@ -302,7 +329,9 @@ def triage_pipeline(config: SageMakerConfig, session: Any | None = None) -> Any:
             "max_brier_increase",
             "max_p0_recall_drop",
             "force",
-        ),
+            "champion",
+        )
+        + ["--tenant", config.tenant.name, "--environment", config.tenant.environment],
         inputs=[
             ("artifacts", _artifacts_of(train), ARTIFACTS),
             ("production", params["production_summary"], PRODUCTION_DIR),
@@ -314,10 +343,9 @@ def triage_pipeline(config: SageMakerConfig, session: Any | None = None) -> Any:
         "triage",
         config,
         session,
-        trigger=params["trigger"],
+        params=params,
         gate_step=evaluate,
         gate_file=gate_file,
-        model_artifacts_uri=_artifacts_of(train),
     )
     return Pipeline(
         name=config.pipeline_name("triage"),
@@ -342,6 +370,8 @@ def semantic_pipeline(config: SageMakerConfig, session: Any | None = None) -> An
         "nw.pipelines.steps.semantic_data_prep",
         config,
         session,
+        pipeline="semantic",
+        source=params["source_uri"],
         arguments=["--data", DATA_DIR, "--out", ARTIFACTS],
         inputs=[data_in],
         artifacts_out=artifacts,
@@ -351,6 +381,8 @@ def semantic_pipeline(config: SageMakerConfig, session: Any | None = None) -> An
         "nw.pipelines.steps.semantic_train",
         config,
         session,
+        pipeline="semantic",
+        source=params["source_uri"],
         arguments=["--data", DATA_DIR, "--out", ARTIFACTS]
         + _flags(params, names, "epochs", "subset", "lr", "batch_size", "seed"),
         inputs=[data_in],
@@ -363,6 +395,8 @@ def semantic_pipeline(config: SageMakerConfig, session: Any | None = None) -> An
         "nw.pipelines.steps.semantic_export",
         config,
         session,
+        pipeline="semantic",
+        source=params["source_uri"],
         arguments=["--data", DATA_DIR, "--out", ARTIFACTS, "--package-dir", ARTIFACTS]
         + _flags(params, names, "parity_n"),
         inputs=[data_in, ("artifacts", _artifacts_of(train), ARTIFACTS)],
@@ -373,6 +407,8 @@ def semantic_pipeline(config: SageMakerConfig, session: Any | None = None) -> An
         "nw.pipelines.steps.semantic_benchmark",
         config,
         session,
+        pipeline="semantic",
+        source=params["source_uri"],
         arguments=["--data", DATA_DIR, "--out", ARTIFACTS]
         + _flags(params, names, "latency_n", "triage_artifact"),
         inputs=[data_in, ("artifacts", _artifacts_of(export), ARTIFACTS)],
@@ -386,6 +422,8 @@ def semantic_pipeline(config: SageMakerConfig, session: Any | None = None) -> An
         "nw.pipelines.steps.semantic_gate",
         config,
         session,
+        pipeline="semantic",
+        source=params["source_uri"],
         arguments=["--out", ARTIFACTS, "--production-summary", PRODUCTION_DIR]
         + _flags(
             params,
@@ -396,7 +434,9 @@ def semantic_pipeline(config: SageMakerConfig, session: Any | None = None) -> An
             "max_tag_micro_f1_drop",
             "max_priority_macro_f1_drop",
             "force",
-        ),
+            "champion",
+        )
+        + ["--tenant", config.tenant.name, "--environment", config.tenant.environment],
         inputs=[
             ("artifacts", _artifacts_of(benchmark), ARTIFACTS),
             ("production", params["production_summary"], PRODUCTION_DIR),
@@ -408,10 +448,9 @@ def semantic_pipeline(config: SageMakerConfig, session: Any | None = None) -> An
         "semantic",
         config,
         session,
-        trigger=params["trigger"],
+        params=params,
         gate_step=gate_check,
         gate_file=gate_file,
-        model_artifacts_uri=_artifacts_of(export),
     )
     return Pipeline(
         name=config.pipeline_name("semantic"),

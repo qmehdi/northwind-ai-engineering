@@ -47,8 +47,8 @@ variable "tenants" {
   default     = []
   description = "Learner handles in cohort mode (2 to 16 lowercase letters or digits, starting with a letter; `live` is reserved for the promoted target)"
   validation {
-    condition     = alltrue([for t in var.tenants : can(regex("^[a-z][a-z0-9]{1,15}$", t)) && t != "live"])
-    error_message = "each tenant is 2 to 16 lowercase letters or digits, starts with a letter, and is not `live`."
+    condition     = alltrue([for t in var.tenants : can(regex("^[a-z][a-z0-9]{1,15}$", t)) && !contains(["live", "platform", "gateway", "baselines", "agents", "monitoring", "clouddeploy", "audit"], t)])
+    error_message = "each tenant is 2 to 16 lowercase letters or digits, starts with a letter, and is none of the reserved names live, platform, gateway, baselines, agents, monitoring, clouddeploy, audit."
   }
   validation {
     condition     = length(distinct(var.tenants)) == length(var.tenants)
@@ -59,13 +59,74 @@ variable "tenants" {
 variable "tenant_members" {
   type        = map(string)
   default     = {}
-  description = "Optional tenant to Google account map (alice = \"alice@example.com\"): the account may impersonate its tenant identity service account"
+  description = "Tenant to Google account map (alice = \"alice@example.com\"): the account may impersonate its tenant identity service account nw-<tenant>-user, which is how a learner works in cohort mode"
+}
+
+variable "approvers" {
+  type        = list(string)
+  default     = []
+  description = "Members (user:alice@example.com, group:...) who may impersonate <environment>-approvers, the only identity that writes the live runtime's approvals/ folder (claim markers, approval records, the escalation queue). The project owner can impersonate it without this list"
+  validation {
+    condition     = alltrue([for m in var.approvers : can(regex("^(user|group|serviceAccount):", m))])
+    error_message = "each approver is a member string: user:<email>, group:<email> or serviceAccount:<email>."
+  }
+}
+
+variable "organization_id" {
+  type        = string
+  default     = ""
+  description = "Numeric organisation id; when set, the IAM deny policy on the platform secrets and the custom constraint on custom job machine types are created (both need organisation-level roles: roles/iam.denyAdmin and roles/orgpolicy.policyAdmin). Empty: the allow policies and the quota caps are the controls"
+}
+
+variable "secrets_generation" {
+  type        = number
+  default     = 1
+  description = "Bump to rotate every generated secret on the next apply (the values are write-only and never in state); the gateway salt key never rotates"
+}
+
+variable "data_access_logs" {
+  type        = bool
+  default     = true
+  description = "Data Access audit logs for Secret Manager and the Agent Platform (read and write), routed with Admin Activity into a 400 day log bucket"
+}
+
+variable "compute_quota_caps" {
+  type        = bool
+  default     = true
+  description = "Quota overrides on the Agent Platform in the region: zero GPUs for training and serving, capped custom job and serving CPUs"
+}
+
+variable "training_cpu_quota" {
+  type        = number
+  default     = 0
+  description = "Custom job CPUs in the region (every pipeline step is one, e2-standard-4 by default); 0 means 8 per tenant with a floor of 16"
+}
+
+variable "serving_cpu_quota" {
+  type        = number
+  default     = 16
+  description = "Endpoint serving CPUs in the region: two live endpoints on n1-standard-2 with a canary and a stable version each need 8"
+}
+
+variable "allowed_machine_types" {
+  type        = list(string)
+  default     = ["e2-standard-2", "e2-standard-4", "e2-standard-8", "n1-standard-2", "n1-standard-4"]
+  description = "Machine types custom jobs may use when the organisation constraint is on (organization_id)"
+}
+
+variable "rag_unprovision_on_destroy" {
+  type        = bool
+  default     = true
+  description = "On destroy, set the project's RagManagedDb tier to Unprovisioned (ends its hourly charge and deletes every RagManagedDb corpus in the project); turn off when another environment in the project still uses RAG Engine"
 }
 
 variable "image_tag" {
   type        = string
-  default     = "latest"
-  description = "Tag of the course images in Artifact Registry; scripts/images_gcp.sh pushes the git SHA and latest"
+  description = "Tag of the course images in Artifact Registry: the git SHA scripts/images_gcp.sh pushed (a dirty tree adds a hash of the diff). Tags are immutable and `latest` is never pushed"
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9.-]{3,63}$", var.image_tag)) && var.image_tag != "latest"
+    error_message = "image_tag is a git SHA tag such as abc1234 or abc1234-dirty-1a2b3c4d, never latest."
+  }
 }
 
 variable "billing_account" {
@@ -110,7 +171,7 @@ variable "embedding_model" {
 variable "rag_backend" {
   type        = string
   default     = "managed"
-  description = "managed: RagManagedDb, no fixed cost; vector_search: a Vertex AI Vector Search index and endpoint per tenant, billed per node hour (deploy/COSTS.md says why managed is the default)"
+  description = "managed: RagManagedDb, no fixed cost; vector_search: a Vertex AI Vector Search index and endpoint per tenant, billed per node hour (deploy/COSTS-platform.md compares the two)"
   validation {
     condition     = contains(["managed", "vector_search"], var.rag_backend)
     error_message = "rag_backend is managed or vector_search."
@@ -163,9 +224,15 @@ variable "scheduler_cron" {
 }
 
 variable "gateway_image" {
-  type        = string
-  default     = "berriai/litellm:main-stable"
-  description = "LiteLLM image path under ghcr.io, pulled through the remote repository (Cloud Run cannot pull ghcr.io directly); pin a version tag before a cohort"
+  type = string
+  # v1.103.0, the release the Local track pins (docker-compose.yml); the digest is the multi-arch
+  # index ghcr.io serves for that tag (checked 2026-09-30).
+  default     = "berriai/litellm@sha256:bd089afdcd35b894b14a93f9743cdc8b591f82da1a38dd43a010a7b0c9de5fd7"
+  description = "LiteLLM image under ghcr.io, pulled through the remote repository (Cloud Run cannot pull ghcr.io directly), pinned by digest: the container holds the master key and the model credentials"
+  validation {
+    condition     = can(regex("@sha256:[0-9a-f]{64}$", var.gateway_image))
+    error_message = "gateway_image is pinned by digest: <path>@sha256:<64 hex>."
+  }
 }
 
 variable "gateway_database" {
@@ -185,8 +252,13 @@ variable "gateway_models" {
     # route with the Economy token caps until a cheaper open model is generally available.
     economy = { model = "vertex_ai/openai/gpt-oss-120b-maas", location = "us-central1" }
     judge   = { model = "vertex_ai/claude-opus-5", location = "us-east5" }
+    # Residency: EU accounts route to `eu/<role>` (nw/config.py). Claude is served in the `eu`
+    # multi-region; gpt-oss has no EU endpoint on Google, so eu/workhorse and eu/economy exist
+    # only once an operator deploys gpt-oss to an EU endpoint, adds the entries here and sets
+    # NW_MODEL_EU_WORKHORSE and NW_MODEL_EU_ECONOMY. Until then the client refuses those routes.
+    "eu/judge" = { model = "vertex_ai/claude-opus-5", location = "eu" }
   }
-  description = "Model role to LiteLLM model route (ADR 0010); the location is where the publisher model is served"
+  description = "Model route name to LiteLLM model and location (ADR 0010); the location is where the publisher model is served, `eu/<role>` routes serve EU accounts"
 }
 
 variable "github_owner" {

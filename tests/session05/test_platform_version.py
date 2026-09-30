@@ -34,7 +34,9 @@ def test_version_reports_the_platform_fields(platform_app):
 
 def test_every_run_logs_a_line_with_the_tenant(platform_app, caplog):
     with caplog.at_level(logging.INFO, logger="nw.agent.service"), TestClient(platform_app) as c:
-        r = c.post("/route", json={"task": "The API is down for everyone.", "ticket_id": "T-2"})
+        r = c.post(
+            "/route", json={"task": "The API is down for everyone.", "ticket_id": "T-000002"}
+        )
         assert r.status_code == 200 and r.json()["cost_usd"] == 0.0  # no model call on this path
     lines = [rec for rec in caplog.records if rec.getMessage() == "run_finished"]
     assert (

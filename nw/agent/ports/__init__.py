@@ -1,5 +1,10 @@
 """Framework ports: the same registry and the same adversarial set, through the
-track's native agent framework. Strands on AWS, Agent Development Kit on GCP."""
+track's native agent framework. Strands on AWS, Agent Development Kit on GCP.
+
+What a framework does not do for you, the bridge does: every tool result comes back
+redacted (the agent path's redaction, account ids kept), screened when a screener is
+configured, and wrapped in `<untrusted_data>` exactly as the hand-built loop wraps it, so
+the system prompt's rule about untrusted data means the same thing in every runtime."""
 
 from __future__ import annotations
 
@@ -10,10 +15,24 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from nw.agent.tools import Tool, ToolRegistry
+from nw.agent.screen import Screener
+from nw.agent.tools import Observation, Tool, ToolRegistry, untrusted
 
 
-def function_for(tool: Tool, registry: ToolRegistry, *, sync: bool = False) -> Callable[..., Any]:
+async def guarded(obs: Observation, screener: Screener | None = None) -> str:
+    """A tool observation as a framework may hand it to a model: redacted, screened when a
+    screener is configured, and wrapped as untrusted data; errors as a small JSON object."""
+    from nw.agent.loop import _guard_observation
+
+    if not obs.ok:
+        return json.dumps({"error": obs.error, "detail": obs.content})
+    content = await _guard_observation(obs.content, obs.ok, screener, run_id="port")
+    return untrusted(content)
+
+
+def function_for(
+    tool: Tool, registry: ToolRegistry, *, sync: bool = False, screener: Screener | None = None
+) -> Callable[..., Any]:
     """A plain Python function with the tool's fields as typed keyword parameters.
 
     Frameworks build their tool schema from a function signature. The registry's
@@ -35,7 +54,7 @@ def function_for(tool: Tool, registry: ToolRegistry, *, sync: bool = False) -> C
 
     async def run_async(**kwargs: Any) -> str:
         obs = await registry.execute(tool.name, kwargs, approved=False)
-        return obs.content if obs.ok else json.dumps({"error": obs.error, "detail": obs.content})
+        return await guarded(obs, screener)
 
     def run_sync(**kwargs: Any) -> str:
         import asyncio

@@ -56,3 +56,20 @@ def test_ready_and_metrics(client):
     client.post("/ask", json={"question": "What uptime does Enterprise get?"})
     text = client.get("/metrics").text
     assert "nw_policy_requests_total" in text and "nw_policy_tokens_total" in text
+
+
+def test_ask_is_503_with_a_reason_when_the_model_is_down(client, make_client):
+    """Retries, fallback and deadline spent: the caller gets 503 and a reason, not a bare
+    500, and a missing model is a 503 too."""
+    from nw.llm.errors import RetryableError, TerminalError
+
+    if service.RATE_LIMIT:  # earlier tests in the process spent this client's bucket
+        service.RATE_LIMIT.reset()
+    service.state.client = make_client(FakeProvider([RetryableError("down", status=503)] * 10))
+    r = client.post("/ask", json={"question": "What uptime does Enterprise get?"})
+    assert r.status_code == 503 and "unavailable" in r.json()["detail"]
+    service.state.client = make_client(
+        FakeProvider([TerminalError("gone", status=404, code="model_not_found")] * 3)
+    )
+    r = client.post("/ask", json={"question": "What uptime does Enterprise get?"})
+    assert r.status_code == 503 and "not available" in r.json()["detail"]

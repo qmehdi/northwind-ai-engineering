@@ -12,11 +12,11 @@ One JSON object per line. 7,950 support tickets for Northwind Cloud.
 | `account_id` | string | Key into `accounts.json` |
 | `created_at` | ISO 8601 | Synthetic, July 2025 to June 2026 |
 | `subject`, `body` | string | What the customer wrote |
-| `answer` | string | The support agent's first reply. Used in Session 5 as the reference for the resolution agent |
+| `answer` | string | The support agent's first reply. Used in Project 4 as the reference for the resolution agent |
 | `type` | enum | Incident, Request, Problem, Change |
 | `queue` | enum | Where the ticket was routed. About 12 percent are deliberately misrouted |
-| `priority` | enum | P0 to P3. The Session 2 target |
-| `tags` | list | 3 to 7 tags from a fixed vocabulary. The Session 3 multi-label target |
+| `priority` | enum | P0 to P3. The Project 1 target |
+| `tags` | list | 3 to 7 tags from a fixed vocabulary. The Project 2 multi-label target |
 | `language` | enum | `en` or `de` |
 | `messy` | list | Flags describing deliberate noise: `typos`, `pasted_log`, `buried_problem`, `empty_subject`, `all_caps`, `very_short`, `angry`. Empty for clean tickets |
 | `product` | string | Product area. Not a target; useful for error analysis |
@@ -39,11 +39,19 @@ The text was written by a language model from briefs whose labels were fixed in 
 
 ## accounts.json
 
-240 customer accounts: `account_id`, `company`, `tier` (Starter, Pro, Enterprise), `region`, `seats`, `industry`, `features`, `sla_hours`. Session 5's `lookup_customer` and `check_entitlement` tools read this file.
+240 customer accounts: `account_id`, `company`, `tier` (Starter, Pro, Enterprise), `region`, `seats`, `industry`, `features`, `sla_hours`. The agent's `lookup_customer` and `check_entitlement` tools (Project 4) read this file. Accounts carry no people; contact persons live only in the PII overlay (`pii/`).
 
 ## policies/
 
-The Northwind policy corpus for Session 4: markdown documents with a metadata block (`doc_id`, `audience`, `effective`, `supersedes`). Some topics exist in two versions with different numbers; the older one is superseded and retrieval must prefer the current one. Documents with `audience: internal` must never be quoted to a customer. `index.json` lists them.
+The Northwind policy corpus for Project 3: markdown documents with a metadata block (`doc_id`, `audience`, `effective`, `supersedes`). Some topics exist in two versions with different numbers; the older one is superseded and retrieval must prefer the current one. Documents with `audience: internal` must never be quoted to a customer. `index.json` lists them.
+
+## pii/
+
+A fictitious PII overlay: 600 ticket-like messages (English and German, single tickets and multi-turn threads) with ground-truth spans, and the 120 fictitious people they mention. For measuring redaction, DSAR and erasure drills, and residency routing. Never training data. Format, value sources and the redactor baseline are in `pii/README.md`; datasheets for every dataset are in `docs/governance/datasheets.md`.
+
+## agents/ and use_cases.yaml
+
+The use case catalog (`use_cases.yaml`, checked by `python -m nw.agent.catalog --check`) and the agent cards (`agents/*.json`, written by `python -m nw.agent.registry --write`). Each use case carries its EU AI Act class, the Article 50 disclosure, a DPIA reference and a privacy approver.
 
 ## Distribution
 

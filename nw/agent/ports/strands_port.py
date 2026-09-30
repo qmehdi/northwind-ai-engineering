@@ -3,7 +3,7 @@
     uv run python -m nw.agent.ports.strands_port
 
 What Strands gives you: the loop, retries, streaming, session state, and
-OpenTelemetry traces out of the box. What you keep from Session 5: the
+OpenTelemetry traces out of the box. What you keep from Project 4: the
 registry (validation, errors as observations) and the approval gate, enforced
 here with a `BeforeToolCallEvent` hook that cancels `escalate` and records it
 as a proposal. The adversarial set and its scoring are unchanged.
@@ -22,8 +22,10 @@ from typing import Any
 from nw.agent.evaluate import aggregate, format_report, load_cases, score
 from nw.agent.loop import SYSTEM_RULES
 from nw.agent.ports import function_for, is_irreversible
+from nw.agent.screen import Screener, from_env
 from nw.agent.tools import ToolRegistry, untrusted
 from nw.agent.trace import ProposedAction, Step, Termination, Trajectory
+from nw.policy.redact import redact_for_agent
 
 
 def build_agent(
@@ -33,12 +35,17 @@ def build_agent(
     region: str,
     proposals: list[ProposedAction],
     calls: list[str],
+    max_steps: int = 10,
+    screener: Screener | None = None,
 ):
     from strands import Agent, tool
     from strands.hooks import BeforeToolCallEvent, HookProvider, HookRegistry
     from strands.models.bedrock import BedrockModel
 
-    tools = [tool(function_for(t, registry, sync=True)) for t in registry.tools.values()]
+    tools = [
+        tool(function_for(t, registry, sync=True, screener=screener))
+        for t in registry.tools.values()
+    ]
 
     class Gate(HookProvider):
         def register_hooks(self, hooks: HookRegistry, **kwargs: Any) -> None:
@@ -47,6 +54,13 @@ def build_agent(
         def before(self, event: BeforeToolCallEvent) -> None:
             name = event.tool_use["name"]
             calls.append(name)
+            # Strands has no step cap of its own: the hook is the cap. At the cap the call is
+            # cancelled with a message the model can read; past it, the run is stopped.
+            if len(calls) > max_steps + 2:
+                raise StepCapReached(f"stopped: reached the step cap of {max_steps}")
+            if len(calls) > max_steps:
+                event.cancel_tool = f"step cap of {max_steps} reached; answer now without tools"
+                return
             if is_irreversible(registry, name):
                 proposals.append(
                     ProposedAction(
@@ -67,14 +81,31 @@ def build_agent(
     )
 
 
+class StepCapReached(RuntimeError):
+    pass
+
+
 def run_one(
-    task: str, registry: ToolRegistry, *, model_id: str, region: str, max_steps: int = 10
+    task: str,
+    registry: ToolRegistry,
+    *,
+    model_id: str,
+    region: str,
+    max_steps: int = 10,
+    screener: Screener | None = None,
 ) -> Trajectory:
     proposals: list[ProposedAction] = []
     calls: list[str] = []
     agent = build_agent(
-        registry, model_id=model_id, region=region, proposals=proposals, calls=calls
+        registry,
+        model_id=model_id,
+        region=region,
+        proposals=proposals,
+        calls=calls,
+        max_steps=max_steps,
+        screener=screener,
     )
+    task = redact_for_agent(task)  # the same redaction as the hand-built loop, before the model
     t = Trajectory(run_id=uuid.uuid4().hex[:10], agent="resolver-strands", task=task)
     try:
         result = agent(untrusted(task))
@@ -83,13 +114,18 @@ def run_one(
         )
         t.final = text
         t.terminated = (
-            Termination.ANSWER if result.stop_reason == "end_turn" else Termination.MAX_STEPS
+            Termination.ANSWER
+            if result.stop_reason == "end_turn" and len(calls) <= max_steps
+            else Termination.MAX_STEPS
         )
         usage = getattr(result.metrics, "accumulated_usage", {}) or {}
         t.steps = [Step(index=i, tool=c) for i, c in enumerate(calls)]
         if t.steps:
             t.steps[0].input_tokens = int(usage.get("inputTokens", 0))
             t.steps[0].output_tokens = int(usage.get("outputTokens", 0))
+    except StepCapReached as exc:
+        t.terminated = Termination.MAX_STEPS
+        t.final = str(exc)
     except Exception as exc:  # noqa: BLE001
         t.terminated = Termination.ERROR
         t.final = f"Stopped: {type(exc).__name__}: {exc}"
@@ -115,9 +151,12 @@ def main() -> int:
     # is overridable: NW_MODEL_STRANDS=global.anthropic.claude-sonnet-5... if a 400 says so.
     model_id = os.environ.get("NW_MODEL_STRANDS") or s.model_for(ModelRole.WORKHORSE)
     registry = build_registry("local")
+    screener = from_env()
     scores = []
     for case in load_cases(args.cases):
-        t = run_one(case.task(), registry, model_id=model_id, region=s.aws_region)
+        t = run_one(
+            case.task(), registry, model_id=model_id, region=s.aws_region, screener=screener
+        )
         t.save(args.traces)
         scores.append(score(case, t))
     agg = aggregate(scores)

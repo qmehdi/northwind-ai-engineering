@@ -1,6 +1,6 @@
 """The vendor translation layer, tested without any network.
 
-These are not part of the Session 1 exercise; they pin the seam that keeps
+These are not part of the first part's exercise; they pin the seam that keeps
 vendors swappable (ADR 0002 in the authoring workspace)."""
 
 from types import SimpleNamespace

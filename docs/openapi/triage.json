@@ -46,6 +46,18 @@
       "maxLength": 500,
       "title": "Subject",
       "type": "string"
+     },
+     "ticket_id": {
+      "anyOf": [
+       {
+        "pattern": "^T-\\d{6}$",
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Ticket Id"
      }
     },
     "required": [

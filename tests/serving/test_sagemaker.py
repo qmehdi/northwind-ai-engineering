@@ -192,3 +192,14 @@ def test_preprocessor_turns_a_captured_request_into_the_feature():
         len(t["subject"]) + len(t["body"]) for t in TICKETS
     ]
     assert preprocessor.preprocess_handler("not json") == {"text_length": len("not json")}
+
+
+def test_base_tokenizer_downloads_are_pinned():
+    from nw.config import HF_REVISIONS
+    from nw.serving.sagemaker.inference import base_revision
+
+    assert base_revision({"base": "x/y", "base_revision": "abc"}) == "abc"
+    pinned = HF_REVISIONS["distilbert/distilbert-base-uncased"]
+    assert base_revision({"base": "distilbert-base-uncased"}) == pinned
+    with pytest.raises(ValueError):
+        base_revision({"base": "someone/unpinned-model"})

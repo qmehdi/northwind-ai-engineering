@@ -10,3 +10,5 @@ image_tag                         = "abc1234"
 github_owner                      = "example"
 github_app_installation_id        = 123
 github_oauth_token_secret_version = "projects/northwind-fixture/secrets/github-token/versions/1"
+organization_id                   = "123456789"
+tenant_members                    = { alice = "alice@example.com", bob = "bob@example.com" }

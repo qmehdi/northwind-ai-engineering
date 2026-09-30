@@ -1,6 +1,6 @@
 """Acceptance: one image serves both managed runtimes. AgentCore's HTTP contract
 (`/ping`, `/invocations`) and Agent Engine's (`/api/reasoning_engine`) call the same
-router as the Session path's `/route`, with the Session path app mounted underneath."""
+router as the agent service's `/route`, with the service app mounted underneath."""
 
 import json
 from contextlib import asynccontextmanager
@@ -112,6 +112,8 @@ def test_stream_reasoning_engine_emits_one_json_line(runtime_app):
 def test_session_path_routes_stay_mounted(runtime_app):
     app, _ = runtime_app
     with TestClient(app) as c:
-        r = c.post("/route", json={"task": "The API is down for everyone.", "ticket_id": "T-2"})
+        r = c.post(
+            "/route", json={"task": "The API is down for everyone.", "ticket_id": "T-000002"}
+        )
         assert r.status_code == 200 and r.json()["cost_usd"] == 0.0
         assert "nw_agent_runs_total" in c.get("/metrics").text

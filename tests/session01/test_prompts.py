@@ -76,6 +76,24 @@ async def test_structured_span_names_the_callers_prompt_not_the_wrapper(spans, m
     client = make_client(provider)
     out = await client.structured("is it?", Out, system=p.text)
     assert out.ok
-    assert _span_attr(spans, "nw.prompt_version") == p.version
+    version = _span_attr(spans, "nw.prompt_version")
+    assert version.startswith(p.version + "+schema.Out@"), "the caller's prompt and the schema"
     # The wrapper text the model saw is the registered structured-output instruction.
     assert prompts.STRUCTURED_INSTRUCTIONS.text in provider.calls[0]["system"]
+
+
+async def test_structured_version_changes_when_the_schema_does(spans, make_client):
+    class Out(BaseModel):
+        ok: bool
+
+    class Wider(BaseModel):
+        ok: bool
+        reason: str = ""
+
+    versions = []
+    for schema in (Out, Wider):
+        client = make_client(FakeProvider(['{"ok": true}']))
+        await client.structured("is it?", schema, system="Decide.")
+        versions.append(_span_attr(spans, "nw.prompt_version"))
+    assert versions[0] != versions[1], "a schema change is a version change"
+    assert versions[0].split("+")[0] == versions[1].split("+")[0], "same prompt"

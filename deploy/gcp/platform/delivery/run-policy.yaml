@@ -1,5 +1,8 @@
 # The live policy service, deployed by Cloud Deploy (Knative serving shape). Placeholders are
-# filled at release time; the image digest comes from the release's --images flag.
+# filled at release time; the image digest comes from the release's --images flag. Cloud Run's
+# deterministic URL is https://<service>-<project number>.<region>.run.app. The service is
+# private: only the live identity (a conditional run.invoker on <environment>-live-*) and
+# callers with run.invoker reach it; the x-api-key check stays in the application.
 apiVersion: serving.knative.dev/v1
 kind: Service
 metadata:
@@ -32,6 +35,8 @@ spec:
           env:
             - name: NW_TRACK
               value: gcp
+            - name: NW_IMAGE_DIGEST
+              value: "@IMAGE_DIGEST@"
             - name: NW_GCP_PROJECT
               value: "@PROJECT@"
             - name: NW_GCP_REGION
@@ -48,14 +53,27 @@ spec:
               value: cloudtrace
             - name: NW_METRICS_FORMAT
               value: json
+            - name: NW_TRUSTED_PROXY_HOPS
+              value: "1"
             - name: OTEL_SERVICE_NAME
               value: "@ENVIRONMENT@-live-policy"
+            # Trajectories and feedback in <environment>-live/ of the artifacts bucket
+            # (nw/agent/opstore.py); approvals/ there is the approvers identity's only.
+            - name: NW_OPS_STORE
+              value: gs://@ENVIRONMENT@-@PROJECT@-artifacts
+            - name: NW_REDACT_DETECTOR
+              value: heuristic
             - name: NW_GATEWAY_URL
-              value: https://@ENVIRONMENT@-gateway-@PROJECT@.@REGION@.run.app
+              value: https://@ENVIRONMENT@-gateway-@PROJECT_NUMBER@.@REGION@.run.app
             - name: NW_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: @ENVIRONMENT@-api-key
+                  key: latest
+            - name: NW_GATEWAY_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: @ENVIRONMENT@-live-gateway-key
                   key: latest
           startupProbe:
             httpGet:

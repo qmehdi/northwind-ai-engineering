@@ -16,7 +16,7 @@ variable "gateway_service" { type = string }
 variable "live_endpoints" { type = map(string) }
 
 locals {
-  services_regex = "^${var.environment}-.*-(triage|semantic|policy|agent)$"
+  services_regex = "^${var.environment}-.*-(triage|semantic|policy|agent|mcp)$"
   channels       = [for c in google_monitoring_notification_channel.email : c.id]
   # Constraints a platform team sets at the folder that holds every environment. Listed, not
   # applied: the course runs in one project without an organisation.
@@ -61,6 +61,118 @@ resource "google_logging_metric" "drift_alerts" {
   }
 }
 
+# Online quality (nw/quality.py and the monitors in nw/*/monitor.py): every service and agent logs
+# one `quality_alert` line per signal and minute while a signal is past its bar, with `signal`
+# (`shadow_agreement`, `p0_share`, `refusal_rate`, `judge_score`), `value`, `bar`, `window`,
+# `service` and `tenant`. The line name is the contract with the monitors; the alert below and
+# the canary check read this metric.
+resource "google_logging_metric" "quality_alerts" {
+  project     = var.project
+  name        = "${var.environment}-quality-alerts"
+  description = "quality_alert lines from every ${var.environment} service and agent"
+  filter      = "((resource.type=\"cloud_run_revision\" AND resource.labels.service_name=~\"${local.services_regex}\") OR resource.type=\"aiplatform.googleapis.com/ReasoningEngine\") AND jsonPayload.msg=\"quality_alert\""
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+    labels {
+      key         = "tenant"
+      value_type  = "STRING"
+      description = "NW_TENANT of the emitting service"
+    }
+    labels {
+      key         = "signal"
+      value_type  = "STRING"
+      description = "The quality signal that crossed its bar"
+    }
+  }
+  label_extractors = {
+    tenant = "EXTRACT(jsonPayload.tenant)"
+    signal = "EXTRACT(jsonPayload.signal)"
+  }
+}
+
+# The quality canary signals as numbers: the `metrics_snapshot` line every service writes each
+# minute (nw/metrics_export.py, NW_METRICS_FORMAT=json) carries the current value of each gauge
+# under the same field name. One distribution metric per field, labelled by service and tenant;
+# the bars are deploy/SLO.md's. `quality_level` at 2 is the monitor's own verdict (it already
+# holds the minimum samples and the interval) and is the one a canary waits on; the others say
+# which signal moved. `p0_share` and `refusal_rate` are reported, not alarmed: the bars are on
+# their ratios.
+locals {
+  quality_series = {
+    quality_level    = { services = "triage|semantic|policy|agent", bounds = [-1, 0, 1, 2, 3], bars = { level = { comparison = "COMPARISON_GE", threshold = 2, aligner = "ALIGN_PERCENTILE_99" } } }
+    shadow_agreement = { services = "triage|semantic", bounds = [0.5, 0.8, 0.9, 0.95, 0.99, 1], bars = { shadow = { comparison = "COMPARISON_LT", threshold = 0.9, aligner = "ALIGN_PERCENTILE_05" } } }
+    p0_share_ratio = { services = "triage|semantic", bounds = [0.25, 0.5, 0.75, 1, 1.5, 2, 3], bars = {
+      p0_high = { comparison = "COMPARISON_GE", threshold = 2, aligner = "ALIGN_PERCENTILE_99" }
+      p0_low  = { comparison = "COMPARISON_LE", threshold = 0.5, aligner = "ALIGN_PERCENTILE_05" }
+    } }
+    refusal_ratio = { services = "policy", bounds = [0.5, 1, 1.5, 2, 3], bars = { refusal = { comparison = "COMPARISON_GE", threshold = 2, aligner = "ALIGN_PERCENTILE_99" } } }
+    judge_score   = { services = "agent", bounds = [1, 2, 3, 3.5, 4, 5], bars = { judge = { comparison = "COMPARISON_LT", threshold = 3.5, aligner = "ALIGN_PERCENTILE_05" } } }
+  }
+  quality_bars = merge([
+    for field, q in local.quality_series : { for bar, b in q.bars : bar => merge(b, { field = field }) }
+  ]...)
+}
+
+resource "google_logging_metric" "quality" {
+  for_each    = local.quality_series
+  project     = var.project
+  name        = "${var.environment}-${replace(each.key, "_", "-")}"
+  description = "${each.key} from the metrics_snapshot lines of ${each.value.services} (nw/metrics_export.py)"
+  filter      = "((resource.type=\"cloud_run_revision\" AND resource.labels.service_name=~\"${local.services_regex}\") OR resource.type=\"aiplatform.googleapis.com/ReasoningEngine\") AND jsonPayload.msg=\"metrics_snapshot\" AND jsonPayload.${each.key}:*"
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "DISTRIBUTION"
+    unit        = "1"
+    labels {
+      key         = "service"
+      value_type  = "STRING"
+      description = "The emitting service (triage, semantic, policy, agent)"
+    }
+    labels {
+      key         = "tenant"
+      value_type  = "STRING"
+      description = "NW_TENANT of the emitting service"
+    }
+  }
+  value_extractor = "EXTRACT(jsonPayload.${each.key})"
+  label_extractors = {
+    service = "EXTRACT(jsonPayload.service)"
+    tenant  = "EXTRACT(jsonPayload.tenant)"
+  }
+  bucket_options {
+    explicit_buckets {
+      bounds = each.value.bounds
+    }
+  }
+}
+
+resource "google_monitoring_alert_policy" "quality" {
+  for_each     = local.quality_bars
+  project      = var.project
+  display_name = "${var.environment}: quality ${replace(each.key, "_", " ")} past its bar"
+  combiner     = "OR"
+  severity     = "WARNING"
+  conditions {
+    display_name = "${each.value.field} ${each.value.comparison} ${each.value.threshold}"
+    condition_threshold {
+      filter          = "metric.type=\"logging.googleapis.com/user/${google_logging_metric.quality[each.value.field].name}\""
+      comparison      = each.value.comparison
+      threshold_value = each.value.threshold
+      duration        = "600s"
+      aggregations {
+        alignment_period     = "300s"
+        per_series_aligner   = each.value.aligner
+        cross_series_reducer = "REDUCE_NONE"
+      }
+    }
+  }
+  notification_channels = local.channels
+  documentation {
+    content = "A quality canary signal (${each.value.field}, deploy/SLO.md) is past its bar for ten minutes on the service and tenant the labels name. During a canary do not advance (`make approve-gcp` waits); roll back with `gcloud deploy targets rollback`."
+  }
+}
+
 resource "google_logging_metric" "monitoring_anomalies" {
   project     = var.project
   name        = "${var.environment}-model-monitoring-anomalies"
@@ -102,6 +214,11 @@ locals {
       metric  = google_logging_metric.drift_alerts.name
       title   = "drift alert logged"
       content = "A service or agent passed its drift bar (input and prediction PSI, retrieval confidence and refusal rate, agent cap and error rates). The tenant label says whose."
+    }
+    quality = {
+      metric  = google_logging_metric.quality_alerts.name
+      title   = "online quality below its bar"
+      content = "A quality signal (the signal label names it) crossed its bar on a service or agent. During a canary this is a reason not to advance: `make approve-gcp` should wait, and the rollback is `gcloud deploy targets rollback`."
     }
     anomalies = {
       metric  = google_logging_metric.monitoring_anomalies.name
@@ -281,6 +398,8 @@ output "organization_policies" { value = local.organization_policies }
 output "metrics" {
   value = {
     drift     = google_logging_metric.drift_alerts.name
+    quality   = google_logging_metric.quality_alerts.name
+    signals   = { for k, m in google_logging_metric.quality : k => m.name }
     anomalies = google_logging_metric.monitoring_anomalies.name
     pipelines = google_logging_metric.pipeline_errors.name
     budget    = google_logging_metric.gateway_budget.name

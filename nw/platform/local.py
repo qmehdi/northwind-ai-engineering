@@ -35,7 +35,6 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -45,6 +44,8 @@ from nw.config import Settings, Track
 from nw.llm.prompts import prompt_hash
 from nw.logging import get_logger
 from nw.platform.base import (
+    STEP_BACK,
+    UNIQUE_STAGES,
     Hit,
     ModelVersion,
     PipelineRun,
@@ -53,6 +54,8 @@ from nw.platform.base import (
     RunStatus,
     Stage,
     Tenant,
+    clamp_score,
+    default_prompt,
 )
 
 log = get_logger("nw.platform.local")
@@ -146,7 +149,19 @@ class NoopCompose(ComposeRunner):
 # ----- MLflow helpers ------------------------------------------------------------------
 
 
+def _proxied_downloads() -> None:
+    """Download artifacts through the MLflow server, never from presigned object store URLs.
+
+    MLflow 3.16 advertises presigned downloads when its artifact store is S3; the URLs it signs
+    name `rustfs:9000`, which only resolves on the compose network, so a laptop client retried
+    them forever. The stack's object store is private by design: every download goes through
+    the tracking server's proxy. An explicit setting in the environment still wins.
+    """
+    os.environ.setdefault("MLFLOW_ENABLE_PROXY_MULTIPART_DOWNLOAD", "false")
+
+
 def _mlflow(uri: str) -> Any:
+    _proxied_downloads()
     import mlflow
 
     mlflow.set_tracking_uri(uri)
@@ -155,22 +170,26 @@ def _mlflow(uri: str) -> Any:
 
 
 def _client(uri: str) -> Any:
+    _proxied_downloads()
     from mlflow import MlflowClient
 
     return MlflowClient(tracking_uri=uri, registry_uri=uri)
 
 
 def _stage_of(aliases: Sequence[str], tag: str | None) -> Stage:
-    """The stage from the aliases a version holds; the `stage` tag is the fallback for the
-    states that need no alias to be true. A version tagged live or approved that no longer
-    holds that alias was superseded by a newer holder and reads as retired."""
+    """The stage of a version (the rules of `nw.platform.base`): the `live` or `approved`
+    alias when it holds one, since an alias has one holder per model; else its `stage` tag,
+    where a `live` or `approved` tag whose alias moved to a newer holder reads as stepped back
+    (live to retired, approved to candidate); else the `candidate` or `retired` alias."""
+    for stage in UNIQUE_STAGES:
+        if stage.value in aliases:
+            return stage
+    if tag in {s.value for s in Stage}:
+        stage = Stage(tag)  # type: ignore[arg-type]
+        return STEP_BACK.get(stage, stage)
     for stage in STAGE_ORDER:
         if stage.value in aliases:
             return stage
-    if tag in (Stage.LIVE.value, Stage.APPROVED.value):
-        return Stage.RETIRED
-    if tag in {s.value for s in Stage}:
-        return Stage(tag)  # type: ignore[arg-type]
     return Stage.CANDIDATE
 
 
@@ -280,6 +299,14 @@ class LocalModelRegistry:
         client = _client(self.uri)
         model_name = self.model_name(tenant, name)
         mv = client.get_model_version(model_name, version)
+        if stage in UNIQUE_STAGES:
+            previous = self.by_alias(tenant, name, stage.value)
+            if previous is not None and previous.version != str(version):
+                back = STEP_BACK[stage].value
+                client.set_model_version_tag(model_name, previous.version, "stage", back)
+                client.set_model_version_tag(
+                    model_name, previous.version, "stage_reason", f"replaced by {version}"
+                )
         for old in mv.aliases or []:
             if old in {s.value for s in Stage} and old != stage.value:
                 client.delete_registered_model_alias(model_name, old)
@@ -339,6 +366,11 @@ class LocalModelRegistry:
             client.set_model_version_tag(dst, copied.version, k, v)
         client.set_model_version_tag(dst, copied.version, "promoted_from", version.uri)
         client.set_model_version_tag(dst, copied.version, "environment", target.environment)
+        # the copy starts over as a candidate in its environment; its source stage is lineage
+        client.set_model_version_tag(dst, copied.version, "stage", Stage.CANDIDATE.value)
+        client.set_model_version_tag(
+            dst, copied.version, "source_stage", str(dict(version.tags).get("stage", ""))
+        )
         client.set_registered_model_alias(dst, Stage.CANDIDATE.value, copied.version)
         return self._to_version(name, client.get_model_version(dst, copied.version))
 
@@ -395,52 +427,41 @@ def load_pipeline(pipeline: str | Callable[..., Any]) -> tuple[str, Callable[...
 
 class LocalPipelineRunner:
     """The Kubeflow Pipelines SDK's local runner, the same SDK the Google track compiles for
-    Vertex AI Pipelines, so one definition serves two tracks. A run executes in a background
-    thread under `<pipeline_root>/<tenant>/<run_id>`: `run.json` is the record `status` reads,
-    `logs.txt` is what `logs` streams, and the runner's own task outputs sit beside them."""
+    Vertex AI Pipelines, so one definition serves two tracks. A run executes in its own child
+    process (`python -m nw.platform.local _execute <run_dir>`) under
+    `<pipeline_root>/<tenant>/<run_id>`: `run.json` is the record `status` reads, `logs.txt` is
+    the child's output, which `logs` streams, and the runner's own task outputs sit beside them.
 
-    # The run lives in a daemon thread of the submitting process, so a CLI that submits must
-    # follow it to the end or the run dies with the process (`nw.pipelines.retrain` does).
-    runs_in_process = True
+    The child owns everything process-wide the kfp runner needs (its stdout, the
+    `sys.executable` it splices into shell commands), so a submit never swaps them in the caller,
+    and the run outlives a CLI that submits and exits. A pipeline given as a Python callable
+    cannot cross a process boundary and runs in a thread of this process instead, writing its
+    failure to `logs.txt` without touching `sys.stdout`."""
+
+    runs_in_process = False
 
     def __init__(self, root: Path, runner: str = "subprocess") -> None:
         self.root = Path(root)
         self.runner = runner
         self._threads: dict[str, threading.Thread] = {}
+        self._children: dict[str, subprocess.Popen] = {}
 
     def run_dir(self, tenant: Tenant, run_id: str) -> Path:
         return self.root / tenant.prefix / run_id
 
-    def _kfp_runner(self) -> Any:
-        from kfp import local
-
-        if self.runner == "docker":
-            return local.DockerRunner()
-        return local.SubprocessRunner(use_venv=False)
+    @staticmethod
+    def _write(run_dir: Path, record: Mapping[str, Any]) -> None:
+        tmp = run_dir / "run.json.tmp"
+        tmp.write_text(json.dumps(dict(record), indent=1, default=str))
+        os.replace(tmp, run_dir / "run.json")
 
     @staticmethod
-    def _space_free_python() -> str:
-        """The SubprocessRunner splices `sys.executable` into an unquoted shell command, so
-        an interpreter under a path with a space (this workspace) never starts. A one-line
-        wrapper in the temp directory, which has no spaces, execs the real one."""
-        real = sys.executable
-        if " " not in real:
-            return real
-        wrapper_dir = Path(tempfile.gettempdir()) / "nw-kfp"
-        wrapper_dir.mkdir(parents=True, exist_ok=True)
-        wrapper = wrapper_dir / "python3"
-        wrapper.write_text(f'#!/bin/sh\nexec "{real}" "$@"\n', encoding="utf-8")
-        wrapper.chmod(0o755)
-        return str(wrapper)
-
-    def _write(self, run_dir: Path, record: Mapping[str, Any]) -> None:
-        (run_dir / "run.json").write_text(json.dumps(dict(record), indent=1))
-
-    def _read(self, run_dir: Path) -> dict[str, Any]:
+    def _read(run_dir: Path) -> dict[str, Any]:
         return json.loads((run_dir / "run.json").read_text())
 
     def submit(self, tenant: Tenant, pipeline: str, params: Mapping[str, Any]) -> PipelineRun:
-        name, func = load_pipeline(params.get("template_path") or pipeline)
+        ref = params.get("template_path") or pipeline
+        name, func = load_pipeline(ref)
         params = {k: v for k, v in params.items() if k != "template_path"}
         run_id = f"{name}-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
         run_dir = self.run_dir(tenant, run_id)
@@ -452,53 +473,25 @@ class LocalPipelineRunner:
             "params": dict(params),
             "outputs": {},
             "submitted_at": _now(),
+            "runner": self.runner,
+            "ref": None if callable(ref) else str(ref),
         }
         self._write(run_dir, record)
-
-        def execute() -> None:
-            log_path = run_dir / "logs.txt"
-            with (
-                log_path.open("w", encoding="utf-8") as fh,
-                redirect_stdout(fh),
-                redirect_stderr(fh),
-            ):
-                self._write(run_dir, {**record, "status": RunStatus.RUNNING.value})
-                real_executable = sys.executable
-                try:
-                    from kfp import local
-
-                    sys.executable = self._space_free_python()
-                    local.init(
-                        runner=self._kfp_runner(), pipeline_root=str(run_dir), raise_on_error=True
-                    )
-                    task = func(**dict(params))
-                    outputs = getattr(task, "outputs", None) or {}
-                    self._write(
-                        run_dir,
-                        {
-                            **record,
-                            "status": RunStatus.SUCCEEDED.value,
-                            "outputs": {k: str(v) for k, v in outputs.items()},
-                            "finished_at": _now(),
-                        },
-                    )
-                except Exception as exc:  # noqa: BLE001  the record carries the failure
-                    print(f"pipeline failed: {exc}")
-                    self._write(
-                        run_dir,
-                        {
-                            **record,
-                            "status": RunStatus.FAILED.value,
-                            "error": str(exc),
-                            "finished_at": _now(),
-                        },
-                    )
-                finally:
-                    sys.executable = real_executable
-
-        thread = threading.Thread(target=execute, name=run_id, daemon=True)
-        self._threads[run_id] = thread
-        thread.start()
+        if callable(ref):
+            thread = threading.Thread(
+                target=_execute_in_thread, args=(run_dir, func, record), name=run_id, daemon=True
+            )
+            self._threads[run_id] = thread
+            thread.start()
+        else:
+            with (run_dir / "logs.txt").open("w", encoding="utf-8") as log_file:
+                self._children[run_id] = subprocess.Popen(
+                    [sys.executable, "-m", "nw.platform.local", "_execute", str(run_dir)],
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    cwd=os.getcwd(),
+                    start_new_session=True,
+                )
         return PipelineRun(pipeline=name, run_id=run_id, status=RunStatus.RUNNING, url=str(run_dir))
 
     def status(self, tenant: Tenant, run: PipelineRun) -> PipelineRun:
@@ -506,6 +499,17 @@ class LocalPipelineRunner:
         if not (run_dir / "run.json").exists():
             raise KeyError(f"no run {run.run_id} for {tenant.prefix}")
         record = self._read(run_dir)
+        child = self._children.get(run.run_id)
+        finished = (RunStatus.SUCCEEDED.value, RunStatus.FAILED.value, RunStatus.STOPPED.value)
+        if child is not None and child.poll() is not None and record["status"] not in finished:
+            # the child died before it could write its outcome
+            record = {
+                **record,
+                "status": RunStatus.FAILED.value,
+                "error": f"runner process exited with code {child.returncode}",
+                "finished_at": _now(),
+            }
+            self._write(run_dir, record)
         return PipelineRun(
             pipeline=record["pipeline"],
             run_id=run.run_id,
@@ -517,6 +521,7 @@ class LocalPipelineRunner:
     def wait(self, tenant: Tenant, run: PipelineRun, timeout_s: float = 1800) -> PipelineRun:
         deadline = time.monotonic() + timeout_s
         thread = self._threads.get(run.run_id)
+        child = self._children.get(run.run_id)
         while True:
             current = self.status(tenant, run)
             if current.status in (RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.STOPPED):
@@ -527,6 +532,9 @@ class LocalPipelineRunner:
                 )
             if thread is not None:
                 thread.join(timeout=0.2)
+            elif child is not None:
+                with _suppress(subprocess.TimeoutExpired):
+                    child.wait(timeout=0.5)
             else:
                 time.sleep(0.5)
 
@@ -534,7 +542,82 @@ class LocalPipelineRunner:
         path = self.run_dir(tenant, run.run_id) / "logs.txt"
         if not path.exists():
             return iter(())
-        return iter(path.read_text(encoding="utf-8").splitlines())
+        return iter(path.read_text(encoding="utf-8", errors="replace").splitlines())
+
+
+def _suppress(*exceptions: type[BaseException]) -> Any:
+    import contextlib
+
+    return contextlib.suppress(*exceptions)
+
+
+def _finish(run_dir: Path, record: Mapping[str, Any], **fields: Any) -> None:
+    LocalPipelineRunner._write(run_dir, {**record, **fields, "finished_at": _now()})
+
+
+def _execute_in_thread(run_dir: Path, func: Callable[..., Any], record: dict[str, Any]) -> None:
+    """A callable pipeline, in this process: no kfp runner, no stream swaps."""
+    LocalPipelineRunner._write(run_dir, {**record, "status": RunStatus.RUNNING.value})
+    try:
+        task = func(**dict(record["params"]))
+        outputs = getattr(task, "outputs", None) or {}
+        _finish(
+            run_dir,
+            record,
+            status=RunStatus.SUCCEEDED.value,
+            outputs={k: str(v) for k, v in outputs.items()},
+        )
+    except Exception as exc:  # noqa: BLE001  the record carries the failure
+        with (run_dir / "logs.txt").open("a", encoding="utf-8") as fh:
+            fh.write(f"pipeline failed: {exc}\n")
+        _finish(run_dir, record, status=RunStatus.FAILED.value, error=str(exc))
+
+
+def _space_free_python() -> str:
+    """The SubprocessRunner splices `sys.executable` into an unquoted shell command, so an
+    interpreter under a path with a space (this workspace) never starts. A one-line wrapper in
+    the temp directory, which has no spaces, execs the real one."""
+    real = sys.executable
+    if " " not in real:
+        return real
+    wrapper_dir = Path(tempfile.gettempdir()) / "nw-kfp"
+    wrapper_dir.mkdir(parents=True, exist_ok=True)
+    wrapper = wrapper_dir / "python3"
+    wrapper.write_text(f'#!/bin/sh\nexec "{real}" "$@"\n', encoding="utf-8")
+    wrapper.chmod(0o755)
+    return str(wrapper)
+
+
+def execute_run(run_dir: Path) -> int:
+    """The child process of a local run: load the pipeline, run it on the kfp local runner,
+    write the outcome into `run.json`. Its stdout is the run's `logs.txt`."""
+    run_dir = Path(run_dir)
+    record = LocalPipelineRunner._read(run_dir)
+    LocalPipelineRunner._write(run_dir, {**record, "status": RunStatus.RUNNING.value})
+    try:
+        from kfp import local
+
+        _, func = load_pipeline(record["ref"])
+        sys.executable = _space_free_python()  # this process only
+        runner = local.DockerRunner() if record.get("runner") == "docker" else None
+        local.init(
+            runner=runner or local.SubprocessRunner(use_venv=False),
+            pipeline_root=str(run_dir),
+            raise_on_error=True,
+        )
+        task = func(**dict(record["params"]))
+        outputs = getattr(task, "outputs", None) or {}
+        _finish(
+            run_dir,
+            record,
+            status=RunStatus.SUCCEEDED.value,
+            outputs={k: str(v) for k, v in outputs.items()},
+        )
+        return 0
+    except Exception as exc:  # noqa: BLE001  the record carries the failure
+        print(f"pipeline failed: {exc}", flush=True)
+        _finish(run_dir, record, status=RunStatus.FAILED.value, error=str(exc))
+        return 1
 
 
 # ----- EndpointClient ----------------------------------------------------------------
@@ -772,16 +855,10 @@ class LocalPromptStore:
             if pv is None:
                 raise KeyError(f"prompt {name} has no version {version}")
             return self._to_version(name, pv)
-        try:
-            return self._to_version(
-                name, client.get_prompt_version_by_alias(full, Stage.LIVE.value)
-            )
-        except Exception:  # noqa: BLE001  nothing live: the newest
-            pass
         found = self.versions(tenant, name)
         if not found:
             raise KeyError(f"prompt {name} is not registered for {tenant.prefix}")
-        return found[-1]
+        return default_prompt(found)
 
     def set_stage(self, tenant: Tenant, name: str, version: str, stage: Stage) -> PromptVersion:
         client = _client(self.uri)
@@ -789,6 +866,12 @@ class LocalPromptStore:
         current = client.get_prompt_version(full, version)
         if current is None:
             raise KeyError(f"prompt {name} has no version {version}")
+        if stage in UNIQUE_STAGES:
+            for other in self.versions(tenant, name):
+                if other.stage == stage and other.version != str(version):
+                    client.set_prompt_version_tag(
+                        full, other.version, "stage", STEP_BACK[stage].value
+                    )
         for old in list(getattr(current, "aliases", None) or []):
             if old in {s.value for s in Stage} and old != stage.value:
                 client.delete_prompt_alias(full, old)
@@ -827,7 +910,9 @@ def make_embedder(kind: str = "hash") -> Callable[[Sequence[str]], list[list[flo
         return lambda texts: h.encode(list(texts)).tolist()
     from sentence_transformers import SentenceTransformer
 
-    model = SentenceTransformer(kind)
+    from nw.config import hf_revision
+
+    model = SentenceTransformer(kind, revision=hf_revision(kind))
     return lambda texts: model.encode(list(texts), normalize_embeddings=True).tolist()
 
 
@@ -920,8 +1005,8 @@ class LocalVectorStore:
                 Hit(
                     id=str(payload.pop("id", p.id)),
                     text=str(payload.pop("text", "")),
-                    score=float(p.score),
-                    metadata=payload,
+                    score=clamp_score(float(p.score)),
+                    metadata={**payload, "raw_score": float(p.score), "score_kind": "cosine"},
                 )
             )
         return hits
@@ -1176,28 +1261,19 @@ def cmd_canary(ctx: _Ctx, args: argparse.Namespace) -> int:
 
 
 def cmd_bootstrap(ctx: _Ctx, args: argparse.Namespace) -> int:
+    """`nw.platform.bootstrap` (register and approve the promoted artifact, `source=bootstrap`),
+    then live on the stack's serving tier."""
+    from nw.platform.bootstrap import bootstrap
+
     p, t = ctx.platform, ctx.tenant
     if p.registry.live(t, args.name) and not args.force:
         print(f"{args.name}: a live version exists for {t.prefix}; nothing to do")
         return 0
     artifact = Path(args.artifact)
-    if not artifact.exists():
-        print(f"{artifact} is missing: run `make train-triage` first")
+    if not (artifact / "metadata.json").exists():
+        print(f"{artifact} is missing: run `make train-{args.name}` first")
         return 1
-    meta = (
-        json.loads((artifact / "metadata.json").read_text())
-        if (artifact / "metadata.json").exists()
-        else {}
-    )
-    metrics = {}
-    test = (meta.get("metrics") or {}).get("test") or {}
-    for k in ("macro_f1", "p0_recall", "p0_precision", "ece", "brier_p0"):
-        if k in test:
-            metrics[f"test_{k}"] = float(test[k])
-    v = p.registry.register(t, args.name, artifact, metrics, {"source": str(artifact)})
-    p.registry.set_stage(
-        t, args.name, v.version, Stage.APPROVED, "bootstrap: the promoted local artifact"
-    )
+    v, _ = bootstrap(p.registry, t, args.name, artifact=artifact, force=True)
     p.endpoints.deploy(t, v, live=True)
     print(f"{args.name}: version {v.version} registered and live for {t.prefix}")
     return 0
@@ -1223,6 +1299,9 @@ def cmd_promote(ctx: _Ctx, args: argparse.Namespace) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw[:1] == ["_execute"] and len(raw) == 2:
+        return execute_run(Path(raw[1]))  # the child process of LocalPipelineRunner.submit
     ap = argparse.ArgumentParser(prog="nw.platform.local", description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("status", help="what is live, the weights, the agent runtime")
@@ -1241,7 +1320,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     pr.add_argument("--to", default=HIGHER_ENVIRONMENT)
     pr.add_argument("--by", default=os.environ.get("USER", "operator"))
     pr.set_defaults(fn=cmd_promote)
-    args = ap.parse_args(argv)
+    args = ap.parse_args(raw)
     return args.fn(_ctx(), args)
 
 

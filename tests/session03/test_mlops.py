@@ -121,19 +121,55 @@ def _summary(version, sha="d1", **over):
         target = s[section]
         if section == "benchmark":
             target = s["benchmark"]["int8"]
+        if section == "test" and key in s["benchmark"]["fp32"]:
+            s["benchmark"]["fp32"][key] = v  # the fp32 graph matches PyTorch
         target[key] = v
     return s
 
 
 def test_gate_first_model_needs_only_the_absolute_bars():
-    assert gate(_summary("v1"), None).passed
+    d = gate(_summary("v1"), None)
+    # int8 keeps 0.65 P0 recall, under the 0.70 floor: the served graph is fp32, and it says so.
+    assert d.passed and d.served_format == "fp32" and "fp32 graph is served" in d.notes[0]
+    assert gate(_summary("v1", benchmark__p0_recall=0.72), None).served_format == "int8"
     d = gate(_summary("v1", test__p0_recall=0.6, test__tag_micro_f1=0.4), None)
-    assert not d.passed and len(d.reasons) == 2 and "P0 recall" in d.reasons[0]
+    assert not d.passed and "P0 recall" in d.reasons[0]
     assert not gate(_summary("v1", export__max_abs_diff_fp32=1e-3), None).passed
-    slow = gate(_summary("v1", benchmark__p95_ms=250.0), None)
+    int8_only = GatePolicy(serve="int8")
+    slow = gate(_summary("v1", benchmark__p95_ms=250.0, benchmark__p0_recall=0.74), None, int8_only)
     assert not slow.passed and "p95" in slow.reasons[0]
-    lossy = gate(_summary("v1", benchmark__priority_macro_f1=0.60), None)
+    lossy = gate(
+        _summary("v1", benchmark__priority_macro_f1=0.60, benchmark__p0_recall=0.74),
+        None,
+        int8_only,
+    )
     assert not lossy.passed and "int8 priority macro-F1" in lossy.reasons[0]
+
+
+def test_int8_p0_bar_counts_tickets_not_a_rate():
+    # 31 test P0 tickets: fp32 23, int8 22 is one ticket, allowed; 20 is three, not allowed.
+    s = _summary("v1", benchmark__p0_recall=22 / 31)
+    s["test"]["p0_recall"] = s["benchmark"]["fp32"]["p0_recall"] = 23 / 31
+    s["test_counts"] = {"n_p0": 31}
+    d = gate(s, None, GatePolicy(serve="int8"))
+    assert d.passed and d.evidence["served"]["int8"]["p0_missed_vs_fp32"] == 1
+    s["benchmark"]["int8"]["p0_recall"] = 20 / 31
+    d = gate(s, None, GatePolicy(serve="int8", min_p0_recall=0.6))
+    assert not d.passed and any("misses 3 test P0 tickets" in r for r in d.reasons)
+
+
+def test_language_slices_need_enough_p0_tickets():
+    s = _summary("v1", benchmark__p0_recall=0.72)
+    s["by_language"] = {
+        "de": {"n": 39, "n_p0": 2, "priority_macro_f1": 0.30, "p0_recall": 0.0},
+        "en": {"n": 755, "n_p0": 29, "priority_macro_f1": 0.71, "p0_recall": 0.79},
+    }
+    d = gate(s, None)
+    assert d.passed and d.insufficient_evidence[0].startswith("de: 2 P0 tickets")
+    prod = _summary("v0", benchmark__p0_recall=0.72)
+    prod["by_language"] = {"de": {"n": 39, "priority_macro_f1": 0.40}}
+    d = gate(s, prod)
+    assert not d.passed and any(r.startswith("de priority macro-F1") for r in d.reasons)
 
 
 def test_gate_blocks_regressions_and_data_changes():
@@ -183,8 +219,19 @@ def test_export_then_benchmark_then_gate_moves_latest(benchmarked_tiny, tmp_path
 def test_forced_promotion_is_recorded(benchmarked_tiny, tmp_path):
     out, _ = benchmarked_tiny
     strict = GatePolicy(min_tag_micro_f1=1.01)  # nothing clears this
-    d = promote(out.parent, out.name, policy=strict, force=True, summary_path=tmp_path / "p.json")
-    assert d.passed and d.forced and d.reasons
+    with pytest.raises(SystemExit, match="--reason"):
+        promote(out.parent, out.name, policy=strict, force=True, summary_path=tmp_path / "p.json")
+    d = promote(
+        out.parent,
+        out.name,
+        policy=strict,
+        force=True,
+        summary_path=tmp_path / "p.json",
+        by="alice",
+        reason="teaching the override",
+    )
+    assert d.passed and d.forced and d.reasons and d.decided_by == "alice"
+    assert json.loads((out / "promotion.json").read_text())["reason"] == "teaching the override"
 
 
 # ----- drift --------------------------------------------------------------------------
@@ -299,4 +346,44 @@ def test_registered_model_is_the_tenants_when_a_tenant_is_set(monkeypatch, tmp_p
     monkeypatch.delenv("NW_ENVIRONMENT", raising=False)
     assert tracking.registered_model_name() == "northwind-semantic"
     monkeypatch.setenv("NW_TENANT", "alice")
-    assert tracking.registered_model_name() == "northwind-alice-semantic"
+    assert tracking.registered_model_name() == "northwind-alice-semantic-laptop"
+    assert tracking.experiment_name() == "northwind-alice-laptop-semantic"
+
+
+def test_semantic_monitor_publishes_its_own_quality_gauges_and_a_sample_aware_tag_bar():
+    from prometheus_client import REGISTRY
+
+    from nw.semantic.data import TAGS
+    from nw.semantic.monitor import SemanticDriftMonitor
+
+    profile = {
+        "text_length_bins": [0.0, 400.0, 500.0, 600.0, "inf"],
+        "text_length_hist": [0.25, 0.25, 0.25, 0.25],
+        "priority_share": {"P0": 0.04, "P1": 0.32, "P2": 0.42, "P3": 0.22},
+        "tag_share": {t: 1 / len(TAGS) for t in TAGS},
+    }
+    m = SemanticDriftMonitor(profile)
+    assert m.min_window == 200
+    for i in range(210):
+        m.observe(450, "P0" if i % 3 == 0 else "P2", [TAGS[i % len(TAGS)]], shadow_priority="P2")
+    snap = m.snapshot()
+    assert snap.quality_level == "alert" and snap.baseline.startswith("training labels")
+    assert REGISTRY.get_sample_value("nw_semantic_quality_level") == 2
+    assert snap.tag_rate_psi is not None and snap.tag_rate_psi < 0.1, "uniform tags are no drift"
+    assert not any(r.startswith("tag rate") for r in snap.reasons)
+
+
+def test_the_service_serves_the_graph_the_gate_chose(tmp_path, monkeypatch):
+    from nw.semantic import service
+    from nw.semantic.promote import served_quantized
+
+    v = tmp_path / "20260930000000-abc-def"
+    v.mkdir()
+    (v / "metadata.json").write_text("{}")
+    assert served_quantized(v) is None
+    (v / "serving.json").write_text(json.dumps({"format": "fp32", "quantized": False}))
+    assert served_quantized(v) is False
+    monkeypatch.delenv("NW_QUANTIZED", raising=False)
+    assert service._quantized(v) is False
+    monkeypatch.setenv("NW_QUANTIZED", "1")
+    assert service._quantized(v) is True, "the environment still overrides"

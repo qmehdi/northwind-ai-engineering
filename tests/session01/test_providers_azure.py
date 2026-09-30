@@ -263,7 +263,7 @@ def test_entra_token_source_caches_until_near_expiry():
 
 def test_azure_routes_claude_to_foundry_messages_and_the_rest_to_v1():
     s = _settings(azure_foundry_endpoint=ENDPOINT + "/api/projects/northwind")
-    provider = make_provider(s)
+    provider = make_provider(s).default
     assert isinstance(provider, RoleRouter)
     assert describe_route(provider, s.model_for(ModelRole.WORKHORSE)) == (
         f"foundry-openai at {ENDPOINT}/openai/v1"

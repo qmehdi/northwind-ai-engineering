@@ -117,19 +117,22 @@ def test_gate_decides_on_the_candidate_and_register_follows(
 ):
     out, _, train, *_ = pipeline_run
     version = train["version"]
-    strict = semantic_gate.run(out, version, production_summary=tmp_path / "none.json")
+    strict = semantic_gate.run(out, version, production_summary="none")
     assert strict["passed_int"] == int(strict["passed"]) and "int8_p95_ms" in strict["metrics"]
-    decision = semantic_gate.run(
-        out, version, production_summary=tmp_path / "none.json", policy=PERMISSIVE
-    )
+    decision = semantic_gate.run(out, version, production_summary="none", policy=PERMISSIVE)
     assert decision["passed"] and decision["production"] is None
     assert json.loads((out / version / "gate.json").read_text())["candidate"] == version
     assert not (out / "latest").exists(), "the pipeline gate never moves latest"
+    # The served graph travels with the artifact, as with nw.semantic.promote.
+    serving = json.loads((out / version / "serving.json").read_text())
+    assert serving["format"] == decision["served_format"]
+    assert serving["quantized"] == (decision["served_format"] == "int8")
     result = register_step.run(out, None, pipeline="semantic", registry=registry, tenant=tenant)
     assert result["version"] == version
     versions = registry.versions(tenant, "semantic")
     assert len(versions) == 1 and versions[0].name == "northwind-alice-semantic"
     assert versions[0].stage == Stage.CANDIDATE and versions[0].tags["pipeline"] == "semantic"
+    assert versions[0].tags["served_format"] == decision["served_format"]
     assert versions[0].metrics["tag_micro_f1"] == train["metrics"]["tag_micro_f1"]
 
 
@@ -148,4 +151,4 @@ def test_gate_names_a_missing_export(tmp_path, s3_file, spec, config, tiny_token
         log_every=1000,
     )
     with pytest.raises(SystemExit, match="export_report.json is missing"):
-        semantic_gate.run(out, train["version"], production_summary=tmp_path / "none.json")
+        semantic_gate.run(out, train["version"], production_summary="none")

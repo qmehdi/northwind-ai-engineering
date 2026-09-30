@@ -1,7 +1,9 @@
 // The platform owner (whoever runs `make deploy-azure`, or the instructor in a cohort): the
 // data plane rights an Owner of the resource group does not have by role. The deploy script
 // uploads the tickets and the production summaries to the lake, creates the search indexes and
-// writes gateway keys; those calls need these roles. Empty `adminObjectId` skips them.
+// writes gateway keys; those calls need these roles. It also holds the endpoint role on the
+// live online endpoints: in a cohort the instructor runs the model promotion drill (tenants
+// no longer hold that role there). Empty `adminObjectId` skips them.
 metadata owner = 'northwind'
 
 param environment string
@@ -11,6 +13,9 @@ param lakeName string
 param searchName string
 param keyVaultName string
 param foundryAccountName string
+param workspaceName string
+param liveEndpointNames array
+param endpointRoleId string
 
 var roles = [
   { scope: 'lake', id: 'ba92f5b4-2d11-453d-a403-e96b0029c9fe' } // Storage Blob Data Contributor
@@ -84,6 +89,30 @@ resource onFoundry 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
       principalId: adminObjectId
       principalType: adminPrincipalType
       description: '${environment} platform owner'
+    }
+  }
+]
+
+resource ml 'Microsoft.MachineLearningServices/workspaces@2026-05-01' existing = {
+  name: workspaceName
+}
+
+resource liveEndpoints 'Microsoft.MachineLearningServices/workspaces/onlineEndpoints@2026-05-01' existing = [
+  for n in liveEndpointNames: {
+    parent: ml
+    name: n
+  }
+]
+
+resource onLiveEndpoints 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
+  for (n, i) in liveEndpointNames: if (!empty(adminObjectId)) {
+    name: guid(liveEndpoints[i].id, adminObjectId, endpointRoleId)
+    scope: liveEndpoints[i]
+    properties: {
+      roleDefinitionId: endpointRoleId
+      principalId: adminObjectId
+      principalType: adminPrincipalType
+      description: '${environment} platform owner: the live promotion drill'
     }
   }
 ]

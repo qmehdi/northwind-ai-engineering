@@ -12,8 +12,16 @@
 #   risk_class     low, medium or high; the oversight each class carries is in nw/agent/catalog.py
 #   allowed_tools  the only tools the agent may see; anything else in code fails the check
 #   data_classes   the data the agent touches, from the list in nw/agent/catalog.py
+#   data_classes   must cover what the agent can reach: the ticket text plus every tool's
+#                  declared outputs (TOOL_OUTPUTS in nw/agent/catalog.py), through delegates too
 #   approval       draft, pending or approved; only approved use cases run
 #   approver       who approved it (a role, a team or a person); high risk needs a co_approver
+#   eu_ai_act_class  prohibited, high_risk (with annex_iii_item), transparency (Article 50)
+#                  or minimal; the course's reading of Regulation (EU) 2024/1689, not legal advice
+#   article_50_disclosure  what a person is told when the output reaches them; required for
+#                  transparency, null when no output reaches a person outside Northwind
+#   dpia_ref       the section of docs/governance/dpia.md that assesses this use case
+#   privacy_approver  who signed the DPIA; never the same as the approver
 
 use_cases:
   - id: uc-triage
@@ -22,9 +30,13 @@ use_cases:
     business_outcome: Every ticket has its customer, plan, priority and tags established before a person reads it.
     risk_class: low
     allowed_tools: [classify_urgency, classify_semantic, lookup_customer, check_entitlement]
-    data_classes: [ticket_text, customer_account, entitlements]
+    data_classes: [ticket_text, customer_account, entitlements, past_tickets]
     approval: approved
     approver: support-operations
+    eu_ai_act_class: minimal
+    article_50_disclosure: null
+    dpia_ref: docs/governance/dpia.md#uc-triage
+    privacy_approver: privacy-office
 
   - id: uc-policy
     agent: policy
@@ -35,6 +47,10 @@ use_cases:
     data_classes: [ticket_text, policy_corpus]
     approval: approved
     approver: support-operations
+    eu_ai_act_class: transparency
+    article_50_disclosure: "This reply was written by an AI system. Reply HUMAN to reach a Northwind support agent."
+    dpia_ref: docs/governance/dpia.md#uc-policy
+    privacy_approver: privacy-office
 
   - id: uc-resolution
     agent: resolution
@@ -45,6 +61,10 @@ use_cases:
     data_classes: [ticket_text, past_tickets, escalation_queue]
     approval: approved
     approver: support-operations
+    eu_ai_act_class: transparency
+    article_50_disclosure: "This reply was drafted with an AI system and checked by a Northwind support agent."
+    dpia_ref: docs/governance/dpia.md#uc-resolution
+    privacy_approver: privacy-office
 
   - id: uc-resolver
     agent: resolver
@@ -62,6 +82,10 @@ use_cases:
     data_classes: [ticket_text, customer_account, entitlements, policy_corpus, past_tickets, escalation_queue]
     approval: approved
     approver: support-operations
+    eu_ai_act_class: transparency
+    article_50_disclosure: "This reply was drafted with an AI system and checked by a Northwind support agent."
+    dpia_ref: docs/governance/dpia.md#uc-resolver
+    privacy_approver: privacy-office
 
   - id: uc-orchestrator
     agent: orchestrator
@@ -69,9 +93,14 @@ use_cases:
     business_outcome: The three specialists combined into one reply, each specialist scaling and failing on its own.
     risk_class: medium
     allowed_tools: [ask_triage, ask_policy, ask_resolution]
-    data_classes: [ticket_text]
+    # Derived reach: whatever the three specialists reach, since their replies carry it back.
+    data_classes: [ticket_text, customer_account, entitlements, policy_corpus, past_tickets, escalation_queue]
     approval: approved
     approver: support-operations
+    eu_ai_act_class: transparency
+    article_50_disclosure: "This reply was drafted with an AI system and checked by a Northwind support agent."
+    dpia_ref: docs/governance/dpia.md#uc-orchestrator
+    privacy_approver: privacy-office
 
   - id: uc-router
     agent: router
@@ -89,6 +118,10 @@ use_cases:
     data_classes: [ticket_text, customer_account, entitlements, policy_corpus, past_tickets, escalation_queue]
     approval: approved
     approver: support-operations
+    eu_ai_act_class: transparency
+    article_50_disclosure: "This reply was written by an AI system. Reply HUMAN to reach a Northwind support agent."
+    dpia_ref: docs/governance/dpia.md#uc-router
+    privacy_approver: privacy-office
 
   # Registered before it is built: the catalog exists so this conversation happens first.
   # No agent in code carries this name, and the check reports it as unbuilt, not as a failure.
@@ -101,3 +134,7 @@ use_cases:
     data_classes: [ticket_text, customer_account, policy_corpus, escalation_queue]
     approval: draft
     approver: null
+    eu_ai_act_class: transparency
+    article_50_disclosure: "This reply was written by an AI system. Reply HUMAN to reach a Northwind support agent."
+    dpia_ref: docs/governance/dpia.md#uc-refund
+    privacy_approver: null

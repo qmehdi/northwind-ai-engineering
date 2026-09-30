@@ -1,7 +1,26 @@
 """Delivery: CodePipeline V2 from GitHub through CodeConnections, CodeBuild builds the two
 serving images on arm64 and pushes them by digest, a second CodeBuild project builds the
 `nw-pipelines` image on x86_64 (SageMaker Processing runs amd64) beside it, a manual approval,
-then CodeDeploy for the Lambda canary and the runtime update (`delivery/deploy.sh`). The
+then CodeDeploy for the Lambda canary and the runtime update (`delivery/deploy.sh`).
+
+One owner for image versions: after a successful promotion `deploy.sh` writes the digest to
+the SSM parameters `/<environment>/images/policy` and `/<environment>/images/agent`, and the
+stack reads the same parameters for the Lambda's image and the live runtime's container (they
+say `asset` until the first promotion, which `scripts/deploy_aws.sh` sets). A later
+`cdk deploy` therefore keeps what the pipeline promoted. The runtime update reads the runtime's
+whole configuration and passes it back with only the container changed, because
+UpdateAgentRuntime replaces the optional fields it is not given (network, protocol, environment,
+lifecycle, authorizer, request headers). The policy repository's policy lets Lambda pull
+(`lambda.amazonaws.com`, conditioned on this account's functions), which `UpdateFunctionCode`
+needs for an image outside the CDK asset repository.
+
+Supply chain: the repositories are tag-immutable (a commit tag always names the same bytes), no
+image is pushed as `latest`, and the training image is referenced by digest through
+`/<environment>/images/pipelines` (output `PipelineImage` names the parameter). CodeBuild signs
+every pushed digest with AWS Signer through Notation (the stack's signing profile, output
+`SigningProfileArn`, platform `Notation-OCI-SHA384-ECDSA`), and the Deploy stage verifies both signatures against
+that profile before it touches the Lambda or the runtime; an unsigned or foreign digest stops
+the deploy. The
 pipelines image is pushed under the commit tag and `latest`; `PipelineImage` names `latest`,
 which is what `nw.platform.aws` puts in a tenant's pipeline definition, and the Build stage's
 `pipelines.json` records the digest it resolved to. Pull-request checks stay in GitHub Actions (ADR
@@ -34,14 +53,23 @@ from aws_cdk import aws_kms as kms
 from aws_cdk import aws_lambda as lam
 from aws_cdk import aws_logs as logs
 from aws_cdk import aws_s3 as s3
+from aws_cdk import aws_signer as signer
 from aws_cdk import aws_sns as sns
 from constructs import Construct
 
-from stacks.common import SERVICES
+from stacks.areas.data import RETENTION
+from stacks.common import SERVICES, image_parameter
 
 IMAGES = ("policy", "agent")
 # The training image: every step of both pipelines, no artifact baked in (ADR 0011).
 PIPELINES_IMAGE = "pipelines"
+NOTATION_PLUGIN = "com.amazonaws.signer.notation.plugin"
+# AWS Signer developer guide, image-signing-prerequisites (fetched 2026-09-30): the installer
+# ships Notation, the Signer plugin and the `aws-signer-ts` trust store.
+NOTATION_RPM = (
+    "https://d2hvyiie56hcat.cloudfront.net/linux/{arch}/installer/rpm/latest/"
+    "aws-signer-notation-cli_{arch}.rpm"
+)
 PIPELINES_BUILD = (
     '--build-arg APP=pipelines --build-arg ARTIFACTS="" '
     '--build-arg EXTRAS="--extra dl --extra mlops --extra pipelines"'
@@ -81,10 +109,19 @@ class Delivery(Construct):
                 image_scan_on_push=True,
                 encryption=ecr.RepositoryEncryption.KMS,
                 encryption_key=key,
+                image_tag_mutability=ecr.TagMutability.IMMUTABLE,
                 removal_policy=RemovalPolicy.DESTROY,
                 empty_on_delete=True,
                 lifecycle_rules=[ecr.LifecycleRule(max_image_count=20)],
             )
+        # No fixed name: Signer only cancels a deleted profile and never frees its name, so
+        # a fixed name would block the next deploy after a destroy.
+        self.signing_profile = signer.SigningProfile(
+            self,
+            "SigningProfile",
+            platform=signer.Platform.NOTATION_OCI_SHA384_ECDSA,
+            signature_validity=Duration.days(365),
+        )
 
         # The role a deploy assumes: here the pipeline's own account, in a higher environment
         # the lower account's pipeline role.
@@ -107,11 +144,46 @@ class Delivery(Construct):
         )
         for repo in self.repos.values():
             repo.grant_pull(self.deployer)
+        # Lambda pulls a container image with the service principal (Lambda developer guide,
+        # "Amazon ECR permissions"); scoped to this account's functions.
+        self.repos["policy"].add_to_resource_policy(
+            iam.PolicyStatement(
+                sid="LambdaECRImageRetrievalPolicy",
+                principals=[iam.ServicePrincipal("lambda.amazonaws.com")],
+                actions=["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"],
+                conditions={
+                    "StringLike": {
+                        "aws:sourceArn": f"arn:aws:lambda:{stack.region}:{stack.account}:function:*"
+                    }
+                },
+            )
+        )
+        self.deployer.add_to_policy(
+            iam.PolicyStatement(
+                sid="VerifySignatures",
+                actions=["signer:GetRevocationStatus"],
+                resources=["*"],
+            )
+        )
+        self.deployer.add_to_policy(
+            iam.PolicyStatement(
+                sid="ImageParameters",
+                actions=["ssm:GetParameter", "ssm:PutParameter"],
+                resources=[
+                    f"arn:aws:ssm:{stack.region}:{stack.account}:parameter{image_parameter(prefix, n)}"
+                    for n in IMAGES
+                ],
+            )
+        )
 
-        self.pipeline_image = f"{self.repos[PIPELINES_IMAGE].repository_uri}:latest"
+        # The training image by digest: written by the pipelines build (or images_aws.sh).
+        self.pipeline_image = image_parameter(prefix, PIPELINES_IMAGE)
         CfnOutput(self, "OutPipelineImage", value=self.pipeline_image).override_logical_id(
             "PipelineImage"
         )
+        CfnOutput(
+            self, "OutSigningProfileArn", value=self.signing_profile.signing_profile_arn
+        ).override_logical_id("SigningProfileArn")
         CfnOutput(
             self,
             "OutImageRepositories",
@@ -139,6 +211,13 @@ class Delivery(Construct):
             server_access_logs_prefix="pipeline/",
             removal_policy=RemovalPolicy.DESTROY,
             auto_delete_objects=True,
+            lifecycle_rules=[
+                s3.LifecycleRule(
+                    id="operational",
+                    expiration=Duration.days(RETENTION["operational"]),
+                    noncurrent_version_expiration=Duration.days(RETENTION["noncurrent"]),
+                )
+            ],
         )
         source = codepipeline.Artifact("source")
         built = codepipeline.Artifact("build")
@@ -158,6 +237,9 @@ class Delivery(Construct):
             environment_variables={
                 "ACCOUNT": codebuild.BuildEnvironmentVariable(value=stack.account),
                 "REGION": codebuild.BuildEnvironmentVariable(value=stack.region),
+                "SIGNING_PROFILE_ARN": codebuild.BuildEnvironmentVariable(
+                    value=self.signing_profile.signing_profile_arn
+                ),
                 **{
                     f"REPO_{n.upper()}": codebuild.BuildEnvironmentVariable(value=r.repository_uri)
                     for n, r in self.repos.items()
@@ -183,6 +265,7 @@ class Delivery(Construct):
                             "commands": [
                                 "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ACCOUNT.dkr.ecr.$REGION.amazonaws.com",
                                 "export TAG=${CODEBUILD_RESOLVED_SOURCE_VERSION:0:12}",
+                                f"curl -fsSL -o /tmp/notation.rpm {NOTATION_RPM.format(arch='arm64')} && rpm -U /tmp/notation.rpm",
                             ]
                         },
                         "build": {
@@ -197,6 +280,8 @@ class Delivery(Construct):
                                 "docker push $REPO_AGENT:$TAG",
                                 'P=$(aws ecr describe-images --repository-name $(basename $REPO_POLICY) --image-ids imageTag=$TAG --query "imageDetails[0].imageDigest" --output text)',
                                 'A=$(aws ecr describe-images --repository-name $(basename $REPO_AGENT) --image-ids imageTag=$TAG --query "imageDetails[0].imageDigest" --output text)',
+                                f'notation sign --plugin {NOTATION_PLUGIN} --id "$SIGNING_PROFILE_ARN" "$REPO_POLICY@$P"',
+                                f'notation sign --plugin {NOTATION_PLUGIN} --id "$SIGNING_PROFILE_ARN" "$REPO_AGENT@$A"',
                                 'printf \'{"policy":"%s@%s","agent":"%s@%s","tag":"%s"}\' "$REPO_POLICY" "$P" "$REPO_AGENT" "$A" "$TAG" > images.json',
                                 "cat images.json",
                             ]
@@ -208,6 +293,7 @@ class Delivery(Construct):
         )
         for name in IMAGES:
             self.repos[name].grant_pull_push(build)
+        self._grant_sign(build)
         build.add_to_role_policy(
             iam.PolicyStatement(
                 sid="DescribeImages",
@@ -238,8 +324,20 @@ class Delivery(Construct):
                     value=deploy_group.deployment_group_name
                 ),
                 "AGENT_RUNTIME_ID": codebuild.BuildEnvironmentVariable(value=agent_runtime_id),
+                "IMAGE_PARAM_POLICY": codebuild.BuildEnvironmentVariable(
+                    value=image_parameter(prefix, "policy")
+                ),
+                "IMAGE_PARAM_AGENT": codebuild.BuildEnvironmentVariable(
+                    value=image_parameter(prefix, "agent")
+                ),
                 "DEPLOYER_ROLE_ARN": codebuild.BuildEnvironmentVariable(
                     value=self.deployer.role_arn
+                ),
+                "SIGNING_PROFILE_ARN": codebuild.BuildEnvironmentVariable(
+                    value=self.signing_profile.signing_profile_arn
+                ),
+                "NOTATION_RPM": codebuild.BuildEnvironmentVariable(
+                    value=NOTATION_RPM.format(arch="arm64")
                 ),
             },
             logging=codebuild.LoggingOptions(
@@ -356,6 +454,12 @@ class Delivery(Construct):
                 "ACCOUNT": codebuild.BuildEnvironmentVariable(value=stack.account),
                 "REGION": codebuild.BuildEnvironmentVariable(value=stack.region),
                 "REPO_PIPELINES": codebuild.BuildEnvironmentVariable(value=repo.repository_uri),
+                "SIGNING_PROFILE_ARN": codebuild.BuildEnvironmentVariable(
+                    value=self.signing_profile.signing_profile_arn
+                ),
+                "IMAGE_PARAM_PIPELINES": codebuild.BuildEnvironmentVariable(
+                    value=image_parameter(prefix, PIPELINES_IMAGE)
+                ),
             },
             logging=codebuild.LoggingOptions(
                 cloud_watch=codebuild.CloudWatchLoggingOptions(
@@ -376,19 +480,21 @@ class Delivery(Construct):
                             "commands": [
                                 "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ACCOUNT.dkr.ecr.$REGION.amazonaws.com",
                                 "export TAG=${CODEBUILD_RESOLVED_SOURCE_VERSION:0:12}",
+                                f"curl -fsSL -o /tmp/notation.rpm {NOTATION_RPM.format(arch='amd64')} && rpm -U /tmp/notation.rpm",
                             ]
                         },
                         "build": {
                             "commands": [
                                 f"docker build --platform linux/amd64 {PIPELINES_BUILD} "
-                                "-t $REPO_PIPELINES:$TAG -t $REPO_PIPELINES:latest ."
+                                "-t $REPO_PIPELINES:$TAG ."
                             ]
                         },
                         "post_build": {
                             "commands": [
                                 "docker push $REPO_PIPELINES:$TAG",
-                                "docker push $REPO_PIPELINES:latest",
                                 'D=$(aws ecr describe-images --repository-name $(basename $REPO_PIPELINES) --image-ids imageTag=$TAG --query "imageDetails[0].imageDigest" --output text)',
+                                f'notation sign --plugin {NOTATION_PLUGIN} --id "$SIGNING_PROFILE_ARN" "$REPO_PIPELINES@$D"',
+                                'aws ssm put-parameter --name "$IMAGE_PARAM_PIPELINES" --type String --overwrite --value "$REPO_PIPELINES@$D"',
                                 'printf \'{"pipelines":"%s@%s","tag":"%s"}\' "$REPO_PIPELINES" "$D" "$TAG" > pipelines.json',
                                 "cat pipelines.json",
                             ]
@@ -399,6 +505,16 @@ class Delivery(Construct):
             ),
         )
         repo.grant_pull_push(project)
+        self._grant_sign(project)
+        project.add_to_role_policy(
+            iam.PolicyStatement(
+                sid="PipelinesImageParameter",
+                actions=["ssm:PutParameter"],
+                resources=[
+                    f"arn:aws:ssm:{stack.region}:{stack.account}:parameter{image_parameter(prefix, PIPELINES_IMAGE)}"
+                ],
+            )
+        )
         project.add_to_role_policy(
             iam.PolicyStatement(
                 sid="DescribeImages",
@@ -407,6 +523,22 @@ class Delivery(Construct):
             )
         )
         return project
+
+    def _grant_sign(self, project: codebuild.PipelineProject) -> None:
+        project.add_to_role_policy(
+            iam.PolicyStatement(
+                sid="SignImages",
+                actions=["signer:SignPayload", "signer:GetSigningProfile"],
+                resources=[self.signing_profile.signing_profile_arn],
+            )
+        )
+        project.add_to_role_policy(
+            iam.PolicyStatement(
+                sid="SignatureArtifacts",
+                actions=["ecr:DescribeRepositories", "ecr:ListImages"],
+                resources=[r.repository_arn for r in self.repos.values()],
+            )
+        )
 
     @staticmethod
     def _docker_build(name: str) -> str:
@@ -427,6 +559,7 @@ class Delivery(Construct):
                 sid="LambdaCanary",
                 actions=[
                     "lambda:UpdateFunctionCode",
+                    "lambda:UpdateFunctionConfiguration",  # NW_IMAGE_DIGEST beside the code
                     "lambda:PublishVersion",
                     "lambda:GetFunction",
                     "lambda:GetFunctionConfiguration",

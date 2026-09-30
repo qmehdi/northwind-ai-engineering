@@ -11,6 +11,12 @@ param location string
 param tags object
 param suffix string
 param purview bool
+@description('Every owner (tenants and live): the retention rules are per owner prefix.')
+param owners array
+@description('Days before operational blobs (captures, trajectories, feedback, monitoring output) are deleted; docs/governance retention table: 90.')
+param captureRetentionDays int = 90
+@description('Days before audit blobs (stage trails, approvals) are deleted; docs/governance retention table: 400.')
+param auditRetentionDays int = 400
 param logsWorkspaceId string
 param enableTelemetry bool
 
@@ -67,6 +73,83 @@ module lake 'br/public:avm/res/storage/storage-account:0.33.1' = {
   }
 }
 
+// Retention (deploy/azure/README.md "Retention"): lifecycle rules per owner prefix, because a
+// rule's prefix starts with a container name and cannot wildcard the owner.
+//   operational         artifacts/<environment>-<owner>/capture/, /traces/, /trajectories/,
+//                       /feedback/ and /monitoring/ (captured requests, agent trajectories and
+//                       feedback from the ops store, monitoring and drift output): deleted
+//                       `captureRetentionDays` (90) after the last write
+//   audit               artifacts/<environment>-<owner>/registry/ (the stage trail of every
+//                       model version), /audit/ and /approvals/ (the ops store's claim markers,
+//                       approval records and escalation queue): deleted `auditRetentionDays`
+//                       (400) after the last write
+// The live endpoints' data collector writes to the workspace storage instead; tracking.bicep
+// holds that rule. Rule names are letters and digits only.
+var ruleEnv = replace(environment, '-', '')
+var retentionRules = flatten(map(owners, o => [
+  {
+    name: 'capture${ruleEnv}${o}'
+    enabled: true
+    type: 'Lifecycle'
+    definition: {
+      filters: {
+        blobTypes: ['blockBlob', 'appendBlob']
+        prefixMatch: [
+          'artifacts/${environment}-${o}/capture/'
+          'artifacts/${environment}-${o}/traces/'
+          'artifacts/${environment}-${o}/trajectories/'
+          'artifacts/${environment}-${o}/feedback/'
+          'artifacts/${environment}-${o}/monitoring/'
+        ]
+      }
+      actions: {
+        baseBlob: {
+          delete: {
+            daysAfterModificationGreaterThan: captureRetentionDays
+          }
+        }
+      }
+    }
+  }
+  {
+    name: 'audit${ruleEnv}${o}'
+    enabled: true
+    type: 'Lifecycle'
+    definition: {
+      filters: {
+        blobTypes: ['blockBlob', 'appendBlob']
+        prefixMatch: [
+          'artifacts/${environment}-${o}/registry/'
+          'artifacts/${environment}-${o}/audit/'
+          'artifacts/${environment}-${o}/approvals/'
+        ]
+      }
+      actions: {
+        baseBlob: {
+          delete: {
+            daysAfterModificationGreaterThan: auditRetentionDays
+          }
+        }
+      }
+    }
+  }
+]))
+
+resource lakeAccount 'Microsoft.Storage/storageAccounts@2026-04-01' existing = {
+  name: 'nwdata${suffix}'
+  dependsOn: [lake]
+}
+
+resource lakeRetention 'Microsoft.Storage/storageAccounts/managementPolicies@2026-04-01' = {
+  parent: lakeAccount
+  name: 'default'
+  properties: {
+    policy: {
+      rules: retentionRules
+    }
+  }
+}
+
 // Azure Machine Learning does not accept a hierarchical namespace account as the workspace's
 // own storage, so the workspace gets a second, flat account for its job snapshots and outputs.
 module workspaceStorage 'br/public:avm/res/storage/storage-account:0.33.1' = {
@@ -108,6 +191,8 @@ resource purviewAccount 'Microsoft.Purview/accounts@2021-12-01' = if (purview) {
 }
 
 output lakeName string = lake.outputs.name
+// NW_OPS_STORE: the ops store's keys land in artifacts/<environment>-<owner>/<kind>/.
+output opsStore string = 'https://${lake.outputs.name}.blob.${az.environment().suffixes.storage}/artifacts'
 output lakeId string = lake.outputs.resourceId
 output lakeDfsEndpoint string = 'https://${lake.outputs.name}.dfs.${az.environment().suffixes.storage}'
 output workspaceStorageId string = workspaceStorage.outputs.resourceId

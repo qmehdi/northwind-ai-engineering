@@ -61,7 +61,8 @@ def submit(
     if run.url:
         print(run.url)
     if not wait and getattr(platform.pipelines, "runs_in_process", False):
-        # The Local track's runner executes in this process: returning would end the run.
+        # A runner that executes in this process: returning would end the run. (The Local
+        # track's runner starts a child process that outlives this CLI; `--wait` follows it.)
         print("the local runner runs in this process: following the run to its end")
         wait = True
     if wait:

@@ -10,6 +10,7 @@ ones from the environment and, when present, `deploy/aws/outputs.json` (written 
     uv run python -m nw.platform.aws prompts-catalog   # deploy/aws/prompts/catalog.json
     uv run python -m nw.platform.aws describe           # what build(settings) resolved
     uv run python -m nw.platform.aws pipeline-upsert triage   # create or update the pipeline
+    uv run python -m nw.platform.aws bootstrap triage         # register and approve latest
 
 Names follow `Tenant.prefix`: the model package group `northwind-alice-triage`, the endpoint
 `northwind-alice-triage`, the pipeline `northwind-alice-triage`, the prompt
@@ -34,6 +35,8 @@ from typing import Any
 from nw.config import Settings, Track
 from nw.llm.prompts import prompt_hash
 from nw.platform.base import (
+    STEP_BACK,
+    UNIQUE_STAGES,
     Hit,
     ModelVersion,
     PipelineRun,
@@ -42,6 +45,8 @@ from nw.platform.base import (
     RunStatus,
     Stage,
     Tenant,
+    clamp_score,
+    default_prompt,
 )
 
 LIVE = "live"
@@ -80,8 +85,19 @@ class AwsPlatformConfig:
     environment: str = "northwind"
     data_bucket: str = ""
     artifacts_bucket: str = ""
-    serving_role_arn: str = ""
-    runtime_role_arn: str = ""
+    serving_role_arn: str = ""  # the live serving role (output `ServingRoleArn`)
+    runtime_role_arn: str = ""  # the shared runtime role, a fallback for solo stacks
+    # Per tenant (cohort mode): `northwind-<t>-serving` for a solo-style direct deploy
+    # (`ServingRoleArns`), `northwind-<t>-agentcore` for the tenant's runtime (`RuntimeRoleArns`),
+    # and the secret holding the tenant's API key (`TenantApiKeys`); all `owner=arn` pairs.
+    serving_role_arns: dict[str, str] = field(default_factory=dict)
+    runtime_role_arns: dict[str, str] = field(default_factory=dict)
+    tenant_api_keys: dict[str, str] = field(default_factory=dict)
+    # AgentCore networking: `VPC` puts the runtime in the stack's subnets behind its security
+    # group (the egress control); `PUBLIC` is the solo default.
+    agent_network_mode: str = "PUBLIC"
+    agent_subnets: tuple[str, ...] = ()
+    agent_security_group: str = ""
     registry_id: str = ""
     gateway_url: str | None = None
     knowledge_bases: dict[str, str] = field(default_factory=dict)  # owner -> knowledge base id
@@ -89,11 +105,16 @@ class AwsPlatformConfig:
     images: dict[str, str] = field(default_factory=dict)  # project -> inference image URI
     direct_deploy: bool = False  # solo: the client creates endpoints itself
     # The pipeline definition: the nw-pipelines image in ECR (NW_AWS_PIPELINE_IMAGE or
-    # NW_AWS_IMAGE_PIPELINES, else the stack's `PipelineImage` output) and the role its jobs
-    # run as (NW_AWS_PIPELINE_ROLE_ARN; default the tenant's execution role
-    # `<prefix>-sagemaker` in the image's account).
+    # NW_AWS_IMAGE_PIPELINES, else the stack's `PipelineImage` output, which names the SSM
+    # parameter `/<environment>/images/pipelines` that delivery keeps at the signed digest; a
+    # value starting with `/` is resolved there) and the role its jobs run as
+    # (NW_AWS_PIPELINE_ROLE_ARN; default the tenant's execution role `<prefix>-sagemaker` in the
+    # image's account).
     pipeline_image: str = ""
     pipeline_role_arn: str = ""
+    # The ops bucket (output `OpsStore`): approvals, escalations, trajectories and feedback
+    # under `<environment>-<owner>/` (nw.agent.opstore). Set on every deployed agent runtime.
+    ops_store: str = ""
 
     @classmethod
     def from_settings(cls, settings: Settings, outputs: Path = OUTPUTS) -> AwsPlatformConfig:
@@ -118,7 +139,27 @@ class AwsPlatformConfig:
             artifacts_bucket=env.get("NW_AWS_ARTIFACTS_BUCKET") or out.get("ArtifactsBucket", ""),
             serving_role_arn=env.get("NW_AWS_SERVING_ROLE_ARN") or out.get("ServingRoleArn", ""),
             runtime_role_arn=env.get("NW_AWS_RUNTIME_ROLE_ARN") or out.get("RuntimeRoleArn", ""),
+            serving_role_arns=dict(
+                _pairs(env.get("NW_AWS_SERVING_ROLE_ARNS") or out.get("ServingRoleArns", ""))
+            ),
+            runtime_role_arns=dict(
+                _pairs(env.get("NW_AWS_RUNTIME_ROLE_ARNS") or out.get("RuntimeRoleArns", ""))
+            ),
+            tenant_api_keys=dict(
+                _pairs(env.get("NW_AWS_TENANT_API_KEYS") or out.get("TenantApiKeys", ""))
+            ),
+            agent_network_mode=(
+                env.get("NW_AWS_AGENT_NETWORK_MODE") or out.get("AgentNetworkMode") or "PUBLIC"
+            ).upper(),
+            agent_subnets=tuple(
+                x
+                for x in (env.get("NW_AWS_AGENT_SUBNETS") or out.get("AgentSubnets", "")).split(",")
+                if x
+            ),
+            agent_security_group=env.get("NW_AWS_AGENT_SECURITY_GROUP")
+            or out.get("AgentSecurityGroup", ""),
             registry_id=env.get("NW_AWS_REGISTRY_ID") or out.get("RegistryId", ""),
+            ops_store=env.get("NW_OPS_STORE") or out.get("OpsStore", ""),
             gateway_url=getattr(settings, "gateway_url", None) or out.get("GatewayUrl") or None,
             knowledge_bases=kbs,
             data_sources=dict(_pairs(env.get("NW_AWS_DATA_SOURCES", ""))),
@@ -133,6 +174,29 @@ class AwsPlatformConfig:
 
     def under(self) -> str:
         return self.environment.replace("-", "_")
+
+    def serving_role_for(self, tenant: Tenant) -> str:
+        return self.serving_role_arns.get(tenant.name) or self.serving_role_arn
+
+    def runtime_role_for(self, tenant: Tenant) -> str:
+        return self.runtime_role_arns.get(tenant.name) or self.runtime_role_arn
+
+    def network_configuration(self) -> dict[str, Any]:
+        """AgentCore's `networkConfiguration`: VPC mode in the stack's subnets and security
+        group when the stack says so, else public."""
+        if self.agent_network_mode == "VPC":
+            if not (self.agent_subnets and self.agent_security_group):
+                raise ValueError(
+                    "AgentNetworkMode is VPC but AgentSubnets or AgentSecurityGroup is missing"
+                )
+            return {
+                "networkMode": "VPC",
+                "networkModeConfig": {
+                    "subnets": list(self.agent_subnets),
+                    "securityGroups": [self.agent_security_group],
+                },
+            }
+        return {"networkMode": "PUBLIC"}
 
 
 def _read_outputs(path: Path) -> dict[str, str]:
@@ -156,11 +220,18 @@ def _pairs(text: str) -> Iterator[tuple[str, str]]:
 
 
 class SageMakerRegistry:
-    """Model package groups per tenant and project; approval status is the stage.
+    """Model package groups per tenant and project; approval status is the stage, with the
+    metadata `nw:stage` telling live from approved (both are `Approved` in SageMaker):
+    `PendingManualApproval` is candidate, `Approved` is approved (or live when `nw:stage=live`),
+    `Rejected` is retired. The stage rules of `nw.platform.base` hold: approving a version steps
+    the previous approved one back to candidate, making one live retires the previous live one.
 
     LIVE is a promotion: the approved package is re-registered, already approved, in the
     `<environment>-live-<name>` group, which the platform's approval Lambda deploys to the live
-    endpoint with a canary. The tenant's own package keeps `nw:stage=live` in its metadata."""
+    endpoint with a canary. The tenant's own package keeps `nw:stage=live` in its metadata.
+
+    This is the only registration path on AWS: the pipelines' register step and `bootstrap`
+    both call `register`, so every package carries the same metadata."""
 
     def __init__(self, sagemaker: Any, s3: Any, config: AwsPlatformConfig) -> None:
         self.sm = sagemaker
@@ -187,6 +258,14 @@ class SageMakerRegistry:
         stamp = time.strftime("%Y%m%d-%H%M%S")
         key = f"tenants/{tenant.name}/{name}/{stamp}/model.tar.gz"
         self.s3.put_object(Bucket=self.cfg.artifacts_bucket, Key=key, Body=_tarball(artifact))
+        # The Model Monitor baseline beside the model, where the approval deployer copies it
+        # from for the live endpoint's schedule (`baseline/statistics.json`, `constraints.json`).
+        for file_name, body in _baseline(artifact).items():
+            self.s3.put_object(
+                Bucket=self.cfg.artifacts_bucket,
+                Key=f"tenants/{tenant.name}/{name}/{stamp}/baseline/{file_name}",
+                Body=body,
+            )
         metrics_key = f"tenants/{tenant.name}/{name}/{stamp}/metrics.json"
         self.s3.put_object(
             Bucket=self.cfg.artifacts_bucket,
@@ -197,6 +276,10 @@ class SageMakerRegistry:
         metadata = {**{k: str(v) for k, v in tags.items() if k != "image"}}
         metadata.update({f"metric:{k}": f"{v:.6g}" for k, v in metrics.items()})
         metadata["nw:tenant"] = tenant.name
+        metadata["nw:stage"] = Stage.CANDIDATE.value
+        sha = _model_sha256(artifact)
+        if sha:  # the deployer injects it as NW_MODEL_SHA256; the handler verifies before loading
+            metadata["model_sha256"] = sha
         response = self.sm.create_model_package(
             ModelPackageGroupName=tenant.resource(name),
             ModelPackageDescription=f"{name} trained by {tenant.name} at {stamp}",
@@ -223,11 +306,9 @@ class SageMakerRegistry:
             tags={**tags, "arn": arn},
         )
 
-    def set_stage(
-        self, tenant: Tenant, name: str, version: str, stage: Stage, reason: str
-    ) -> ModelVersion:
-        arn = self._arn(tenant, name, version)
-        described = self.sm.describe_model_package(ModelPackageName=arn)
+    def _write_stage(
+        self, arn: str, described: Mapping[str, Any], stage: Stage, reason: str
+    ) -> None:
         metadata = dict(described.get("CustomerMetadataProperties") or {})
         metadata["nw:stage"] = stage.value
         self.sm.update_model_package(
@@ -236,6 +317,27 @@ class SageMakerRegistry:
             ApprovalDescription=reason[:1024],
             CustomerMetadataProperties=metadata,
         )
+
+    def set_stage(
+        self, tenant: Tenant, name: str, version: str, stage: Stage, reason: str
+    ) -> ModelVersion:
+        arn = self._arn(tenant, name, version)
+        if stage in UNIQUE_STAGES:
+            for other in self.versions(tenant, name):
+                if other.stage == stage and other.tags.get("arn") != arn:
+                    other_arn = other.tags["arn"]
+                    self._write_stage(
+                        other_arn,
+                        self.sm.describe_model_package(ModelPackageName=other_arn),
+                        STEP_BACK[stage],
+                        f"replaced by {arn.rsplit('/', 1)[-1]}: {reason}",
+                    )
+        described = self.sm.describe_model_package(ModelPackageName=arn)
+        self._write_stage(arn, described, stage, reason)
+        metadata = {
+            **dict(described.get("CustomerMetadataProperties") or {}),
+            "nw:stage": stage.value,
+        }
         if stage == Stage.LIVE:
             live_group = f"{self.cfg.environment}-{LIVE}-{name}"
             self.sm.create_model_package(
@@ -253,16 +355,22 @@ class SageMakerRegistry:
         return self._version(name, self.sm.describe_model_package(ModelPackageName=arn))
 
     def versions(self, tenant: Tenant, name: str) -> Sequence[ModelVersion]:
+        """Every package of the tenant's group, oldest first (the contract's order)."""
         out: list[ModelVersion] = []
         token: str | None = None
         while True:
             kw = {"NextToken": token} if token else {}
-            page = self.sm.list_model_packages(
-                ModelPackageGroupName=tenant.resource(name),
-                SortBy="CreationTime",
-                SortOrder="Descending",
-                **kw,
-            )
+            try:
+                page = self.sm.list_model_packages(
+                    ModelPackageGroupName=tenant.resource(name),
+                    SortBy="CreationTime",
+                    SortOrder="Ascending",
+                    **kw,
+                )
+            except Exception as exc:  # noqa: BLE001  a group that was never created
+                if _error_code(exc) in ("ValidationException", "ResourceNotFound"):
+                    return out
+                raise
             for summary in page["ModelPackageSummaryList"]:
                 out.append(
                     self._version(
@@ -275,8 +383,9 @@ class SageMakerRegistry:
                 return out
 
     def live(self, tenant: Tenant, name: str) -> ModelVersion | None:
-        for v in self.versions(tenant, name):
-            if v.stage in (Stage.LIVE, Stage.APPROVED):
+        """The live version, never an approved one (the contract's `live`)."""
+        for v in reversed(list(self.versions(tenant, name))):
+            if v.stage == Stage.LIVE:
                 return v
         return None
 
@@ -310,6 +419,8 @@ class SageMakerRegistry:
         stage = STAGE_OF.get(described.get("ModelApprovalStatus", ""), Stage.CANDIDATE)
         if metadata.get("nw:stage") == Stage.LIVE.value and stage == Stage.APPROVED:
             stage = Stage.LIVE
+        if metadata.get("nw:stage") == Stage.RETIRED.value and stage == Stage.APPROVED:
+            stage = Stage.RETIRED
         containers = described.get("InferenceSpecification", {}).get("Containers", [{}])
         metrics = {
             k[len("metric:") :]: float(v) for k, v in metadata.items() if k.startswith("metric:")
@@ -330,6 +441,53 @@ class SageMakerRegistry:
         )
 
 
+MODEL_FILES = ("model.joblib", "model.int8.onnx", "model_int8.onnx")
+
+
+def _model_sha256(artifact: Path) -> str:
+    """The SHA-256 of the file the inference handler loads (`model.joblib` for triage), or the
+    one `metadata.json` recorded, or empty."""
+    import hashlib
+
+    if artifact.is_dir():
+        for name in MODEL_FILES:
+            if (artifact / name).is_file():
+                return hashlib.sha256((artifact / name).read_bytes()).hexdigest()
+        meta = artifact / "metadata.json"
+        if meta.is_file():
+            try:
+                return str(json.loads(meta.read_text()).get("model_sha256") or "")
+            except ValueError:
+                return ""
+    return ""
+
+
+def _baseline(artifact: Path) -> dict[str, bytes]:
+    """`statistics.json` and `constraints.json` for Model Monitor: the artifact's own
+    `baseline/` when it has one, else built from its `data_profile.json`; empty when neither."""
+    if not artifact.is_dir():
+        return {}
+    names = ("statistics.json", "constraints.json")
+    own = artifact / "baseline"
+    if all((own / n).is_file() for n in names):
+        return {n: (own / n).read_bytes() for n in names}
+    profile = artifact / "data_profile.json"
+    if not profile.is_file():
+        return {}
+    import tempfile
+
+    from nw.serving.sagemaker.baseline import write_baseline
+
+    with tempfile.TemporaryDirectory(prefix="nw-baseline-") as tmp:
+        paths = write_baseline(profile, Path(tmp))
+        return {p.name: p.read_bytes() for p in paths}
+
+
+def _error_code(exc: BaseException) -> str:
+    response = getattr(exc, "response", None) or {}
+    return str((response.get("Error") or {}).get("Code") or type(exc).__name__)
+
+
 def _inference_spec(image: str, uri: str) -> dict[str, Any]:
     return {
         "Containers": [{"Image": image, "ModelDataUrl": uri}],
@@ -347,13 +505,17 @@ def _tarball(artifact: Path) -> bytes:
     if artifact.is_dir():
         import tempfile
 
-        from nw.serving.sagemaker.package import package
+        from nw.serving.sagemaker.package import kind_of, package
 
         try:
+            kind_of(artifact)  # the only question a FileNotFoundError may answer here
+        except FileNotFoundError:
+            servable = False
+        else:
+            servable = True
+        if servable:  # a packaging error propagates: no tarball without inference.py
             with tempfile.TemporaryDirectory(prefix="nw-pkg-") as tmp:
                 return package(artifact, Path(tmp)).read_bytes()
-        except FileNotFoundError:
-            pass  # not a triage or semantic artifact: plain archive below
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         if artifact.is_dir():
@@ -370,7 +532,9 @@ def _tarball(artifact: Path) -> bytes:
 
 def _sagemaker_definition(pipeline: str, config: Any) -> str:
     """The definition JSON from `nw.pipelines.sagemaker`, built without an AWS call."""
-    from nw.pipelines.sagemaker import definition
+    # From `definitions`, not the package: importing the CLI submodule
+    # `nw.pipelines.sagemaker.definition` rebinds that package attribute to the module.
+    from nw.pipelines.sagemaker.definitions import definition
 
     return json.dumps(definition(pipeline, config))
 
@@ -381,6 +545,7 @@ _NOT_SAGEMAKER_PARAMS = {
     "tenant",
     "environment",
     "register_model",
+    "platform_env",
     "template_path",
     "image_uri",
     "role_arn",
@@ -392,8 +557,13 @@ _NOT_SAGEMAKER_PARAMS = {
 class SageMakerPipelines:
     """Upsert, start, follow and read the logs of the tenant's pipeline `<prefix>-<pipeline>`
     (`northwind-alice-triage`). `submit` upserts the definition from `nw.pipelines.sagemaker`
-    first (create when missing, update when present), so a pipeline always runs the code of
-    the commit that submitted it; `upsert` alone is `make pipeline-upsert-aws`."""
+    first (create when missing, update when present); `upsert` alone is
+    `make pipeline-upsert-aws`.
+
+    Both ship the checkout's code (`nw.pipelines.source`): the bundle goes to
+    `s3://<artifacts>/tenants/<tenant>/source/nw-source-<sha>.tar.gz` (skipped when that object
+    exists), becomes the default of the definition's `SourceUri` and the value `submit` passes,
+    so every step runs the learner's `nw/` and a scheduled run the last upserted code."""
 
     def __init__(
         self,
@@ -404,6 +574,9 @@ class SageMakerPipelines:
         sleep: Callable[[float], None] = time.sleep,
         poll_s: float = 15.0,
         definitions: Callable[[str, Any], str] = _sagemaker_definition,
+        s3: Any = None,
+        bundler: Callable[[], Any] | None = None,
+        ssm: Any = None,
     ) -> None:
         self.sm = sagemaker
         self.cw = logs
@@ -411,6 +584,39 @@ class SageMakerPipelines:
         self.sleep = sleep
         self.poll_s = poll_s
         self.definitions = definitions
+        self.s3 = s3
+        self.bundler = bundler
+        self.ssm = ssm
+
+    def pipeline_image(self, image: str) -> str:
+        """The image URI; a value starting with `/` is the SSM parameter delivery keeps at the
+        signed digest (the stack's `PipelineImage` output), read here."""
+        if not image.startswith("/"):
+            return image
+        if self.ssm is None:
+            raise ValueError(f"the pipelines image is the SSM parameter {image}: no SSM client")
+        return str(self.ssm.get_parameter(Name=image)["Parameter"]["Value"])
+
+    def ship_source(self, tenant: Tenant) -> str:
+        """Upload the checkout's source bundle; returns its S3 URI."""
+        from nw.pipelines.source import default_bundle
+
+        if self.s3 is None or not self.cfg.artifacts_bucket:
+            raise ValueError(
+                "cannot ship the source bundle: no S3 client or artifacts bucket "
+                "(NW_AWS_ARTIFACTS_BUCKET); the steps would run the image's code"
+            )
+        bundle = (self.bundler or default_bundle)()
+        key = f"tenants/{tenant.name}/source/{bundle.name}"
+        try:
+            self.s3.head_object(Bucket=self.cfg.artifacts_bucket, Key=key)
+        except Exception as exc:  # noqa: BLE001  absent: upload it
+            if _error_code(exc) not in ("404", "NoSuchKey", "NotFound"):
+                raise
+            self.s3.put_object(
+                Bucket=self.cfg.artifacts_bucket, Key=key, Body=bundle.path.read_bytes()
+            )
+        return f"s3://{self.cfg.artifacts_bucket}/{key}"
 
     def pipeline_config(
         self, tenant: Tenant, params: Mapping[str, Any] | None = None, pipeline: str | None = None
@@ -420,13 +626,14 @@ class SageMakerPipelines:
         `role_arn`, `serving_image_uri`, `bucket`)."""
         from nw.pipelines.sagemaker.definitions import SageMakerConfig
 
-        p = params or {}
+        p = dict(params or {})
         image = p.get("image_uri") or self.cfg.pipeline_image
         if not image:
             raise ValueError(
                 "no nw-pipelines image: set NW_AWS_PIPELINE_IMAGE (or NW_AWS_IMAGE_PIPELINES) "
                 "to the image URI in ECR"
             )
+        image = self.pipeline_image(str(image))
         role = p.get("role_arn") or self.cfg.pipeline_role_arn
         if not role:
             account = str(image).split(".", 1)[0]
@@ -440,7 +647,10 @@ class SageMakerPipelines:
             serving_image_uri=p.get("serving_image_uri") or None,
             bucket=str(p.get("bucket") or self.cfg.artifacts_bucket or "nw-bucket"),
             region=self.cfg.region,
-            defaults=self.deployed_defaults(tenant, pipeline),
+            defaults={
+                **self.deployed_defaults(tenant, pipeline),
+                **({"source_uri": str(p["source_uri"])} if p.get("source_uri") else {}),
+            },
         )
 
     def deployed_defaults(self, tenant: Tenant, pipeline: str | None = None) -> dict[str, str]:
@@ -465,6 +675,11 @@ class SageMakerPipelines:
         from nw.pipelines import canonical
 
         kind = canonical(pipeline)
+        params = dict(params or {})
+        if not (params.get("image_uri") or self.cfg.pipeline_image):
+            self.pipeline_config(tenant, params, kind)  # raises the message naming the variable
+        if not params.get("source_uri"):
+            params["source_uri"] = self.ship_source(tenant)
         config = self.pipeline_config(tenant, params, kind)
         name = tenant.resource(kind)
         body = {
@@ -509,6 +724,9 @@ class SageMakerPipelines:
 
         kind = canonical(pipeline)
         name = tenant.resource(kind)
+        params = dict(params)
+        if not params.get("source_uri"):
+            params["source_uri"] = self.ship_source(tenant)
         self.upsert(tenant, kind, params)
         response = self.sm.start_pipeline_execution(
             PipelineName=name,
@@ -627,7 +845,7 @@ class SageMakerEndpoints:
         self.sm.create_model(
             ModelName=model_name,
             PrimaryContainer={"ModelPackageName": arn},
-            ExecutionRoleArn=self.cfg.serving_role_arn,
+            ExecutionRoleArn=self.cfg.serving_role_for(tenant),
         )
         self.sm.create_endpoint_config(
             EndpointConfigName=model_name,
@@ -690,8 +908,11 @@ class SageMakerEndpoints:
 
 
 class BedrockPrompts:
-    """A prompt per tenant and name, a numbered version per registration, the stage as a tag on
-    the version's ARN, and the registry's sha256_12 on every version."""
+    """A prompt per tenant and name, a numbered version per distinct text, the stage as a tag on
+    the version's ARN, and the registry's sha256_12 on every version. Registering a text that is
+    already a version returns that version (no new version, the contract's idempotency); a
+    stage moves the way `nw.platform.base` says (one live, one approved, the holder steps back);
+    `get(name)` is the live version, else the approved one, else the newest."""
 
     def __init__(self, agent: Any, config: AwsPlatformConfig) -> None:
         self.agent = agent
@@ -702,12 +923,16 @@ class BedrockPrompts:
     ) -> PromptVersion:
         sha = prompt_hash(text)
         prompt_name = _prompt_name(tenant, name)
+        existing = self._find(prompt_name)
+        if existing:
+            for known in self._versions_of(name, existing):
+                if known.sha256_12 == sha:
+                    return known  # the same text is the same version
         variant = {
             "name": "default",
             "templateType": "TEXT",
             "templateConfiguration": {"text": {"text": text}},
         }
-        existing = self._find(prompt_name)
         all_tags = {
             **{k: str(v) for k, v in tags.items()},
             "nw:prompt": name,
@@ -750,12 +975,25 @@ class BedrockPrompts:
     def get(self, tenant: Tenant, name: str, version: str | None = None) -> PromptVersion:
         prompt_id = self._require(tenant, name)
         if version is None:
-            version = self._live_version(prompt_id) or self._latest_version(prompt_id)
+            found = self._versions_of(name, prompt_id)
+            if not found:
+                version = "DRAFT"
+            else:
+                return default_prompt(found)
         fetched = self.agent.get_prompt(promptIdentifier=prompt_id, promptVersion=version)
         return self._to_version(name, fetched)
 
     def set_stage(self, tenant: Tenant, name: str, version: str, stage: Stage) -> PromptVersion:
         prompt_id = self._require(tenant, name)
+        if stage in UNIQUE_STAGES:
+            for other in self._versions_of(name, prompt_id):
+                if other.stage == stage and other.version != version:
+                    held = self.agent.get_prompt(
+                        promptIdentifier=prompt_id, promptVersion=other.version
+                    )
+                    self.agent.tag_resource(
+                        resourceArn=held["arn"], tags={"nw:stage": STEP_BACK[stage].value}
+                    )
         fetched = self.agent.get_prompt(promptIdentifier=prompt_id, promptVersion=version)
         self.agent.tag_resource(resourceArn=fetched["arn"], tags={"nw:stage": stage.value})
         if stage == Stage.LIVE:
@@ -764,12 +1002,22 @@ class BedrockPrompts:
         return self._to_version(name, fetched, stage=stage)
 
     def versions(self, tenant: Tenant, name: str) -> Sequence[PromptVersion]:
-        prompt_id = self._require(tenant, name)
+        """Every numbered version, oldest first."""
+        return self._versions_of(name, self._require(tenant, name))
+
+    def _versions_of(self, name: str, prompt_id: str) -> list[PromptVersion]:
+        numbered = sorted(
+            (
+                s["version"]
+                for s in self._version_summaries(prompt_id)
+                if s.get("version") != "DRAFT"
+            ),
+            key=lambda v: int(v) if str(v).isdigit() else 0,
+        )
         out: list[PromptVersion] = []
-        for summary in self._version_summaries(prompt_id):
-            if summary.get("version") == "DRAFT":
-                continue
-            out.append(self.get(tenant, name, summary["version"]))
+        for number in numbered:
+            fetched = self.agent.get_prompt(promptIdentifier=prompt_id, promptVersion=number)
+            out.append(self._to_version(name, fetched))
         return out
 
     # helpers
@@ -802,23 +1050,6 @@ class BedrockPrompts:
             if not token:
                 return out
 
-    def _latest_version(self, prompt_id: str) -> str:
-        numbered = [
-            s["version"]
-            for s in self._version_summaries(prompt_id)
-            if s.get("version", "DRAFT").isdigit()
-        ]
-        if not numbered:
-            return "DRAFT"
-        return max(numbered, key=int)
-
-    def _live_version(self, prompt_id: str) -> str | None:
-        for summary in self._version_summaries(prompt_id):
-            if summary.get("version") == "DRAFT":
-                tags = self.agent.list_tags_for_resource(resourceArn=summary["arn"]).get("tags", {})
-                return tags.get("nw:live_version")
-        return None
-
     def _to_version(
         self, name: str, fetched: Mapping[str, Any], *, stage: Stage | None = None
     ) -> PromptVersion:
@@ -844,8 +1075,13 @@ def _prompt_name(tenant: Tenant, name: str) -> str:
 
 class BedrockKnowledgeBase:
     """Upsert writes the documents (and their `.metadata.json` sidecars) under the tenant's
-    data-source prefix and starts an ingestion job; search is the Retrieve API. Vectors passed
-    in are ignored: the knowledge base embeds with its own model."""
+    data-source prefix and starts one ingestion job for the batch, followed to the end within
+    `timeout_s`; search is the Retrieve API. Vectors passed in are ignored: the knowledge base
+    embeds with its own model. The ingestion job reads the whole data source, which is how
+    Bedrock syncs; batch the upserts, do not call it per document.
+
+    Scores: Retrieve's `score` is already a 0 to 1 relevance (higher is better); it is clamped
+    onto the contract's scale and kept as `raw_score`."""
 
     def __init__(
         self,
@@ -856,6 +1092,7 @@ class BedrockKnowledgeBase:
         *,
         sleep: Callable[[float], None] = time.sleep,
         poll_s: float = 10.0,
+        timeout_s: float = 1800.0,
     ) -> None:
         self.agent = agent
         self.runtime = runtime
@@ -863,6 +1100,7 @@ class BedrockKnowledgeBase:
         self.cfg = config
         self.sleep = sleep
         self.poll_s = poll_s
+        self.timeout_s = timeout_s
 
     def upsert(
         self,
@@ -906,12 +1144,18 @@ class BedrockKnowledgeBase:
             hit_id = str(
                 meta.get("chunk_id") or source.rsplit("/", 1)[-1].removesuffix(".txt") or len(hits)
             )
+            raw = float(result.get("score", 0.0) or 0.0)
             hits.append(
                 Hit(
                     id=hit_id,
                     text=result.get("content", {}).get("text", ""),
-                    score=float(result.get("score", 0.0)),
-                    metadata={**meta, "source": source},
+                    score=clamp_score(raw),
+                    metadata={
+                        **meta,
+                        "source": source,
+                        "raw_score": raw,
+                        "score_kind": "relevance",
+                    },
                 )
             )
         return hits
@@ -977,7 +1221,13 @@ class BedrockKnowledgeBase:
         job = self.agent.start_ingestion_job(
             knowledgeBaseId=kb, dataSourceId=ds, clientToken=str(uuid.uuid4())
         )["ingestionJob"]
+        deadline = time.monotonic() + self.timeout_s
         while job["status"] not in ("COMPLETE", "FAILED", "STOPPED"):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"ingestion {job['ingestionJobId']} still {job['status']} after "
+                    f"{self.timeout_s:.0f} s; it keeps running in the knowledge base"
+                )
             self.sleep(self.poll_s)
             job = self.agent.get_ingestion_job(
                 knowledgeBaseId=kb, dataSourceId=ds, ingestionJobId=job["ingestionJobId"]
@@ -1014,7 +1264,16 @@ class AgentCoreRuntime:
             "NW_APP": "nw.agent.agentcore:app",
             "NW_AGENT_ROLE": "resolver",
             "PORT": "8080",
+            # AgentCore authorises every invocation with IAM; the contract routes defer to it.
+            "NW_RUNTIME_AUTH": "platform",
+            "NW_REDACT_DETECTOR": "heuristic",
+            **({"NW_OPS_STORE": self.cfg.ops_store} if self.cfg.ops_store else {}),
         }
+        key_secret = self.cfg.tenant_api_keys.get(tenant.name)
+        if key_secret:
+            variables["NW_API_KEY_SECRET_ARN"] = key_secret
+        role = self.cfg.runtime_role_for(tenant)
+        network = self.cfg.network_configuration()
         found = self._lookup(name)
         artifact = {"containerConfiguration": {"containerUri": image}}
         if found:
@@ -1022,8 +1281,8 @@ class AgentCoreRuntime:
             response = self.control.update_agent_runtime(
                 agentRuntimeId=runtime_id,
                 agentRuntimeArtifact=artifact,
-                roleArn=self.cfg.runtime_role_arn,
-                networkConfiguration={"networkMode": "PUBLIC"},
+                roleArn=role,
+                networkConfiguration=network,
                 protocolConfiguration={"serverProtocol": "HTTP"},
                 environmentVariables=variables,
                 description=f"{tenant.name} resolver, agent version {version}",
@@ -1032,8 +1291,8 @@ class AgentCoreRuntime:
             response = self.control.create_agent_runtime(
                 agentRuntimeName=name,
                 agentRuntimeArtifact=artifact,
-                roleArn=self.cfg.runtime_role_arn,
-                networkConfiguration={"networkMode": "PUBLIC"},
+                roleArn=role,
+                networkConfiguration=network,
                 protocolConfiguration={"serverProtocol": "HTTP"},
                 environmentVariables=variables,
                 description=f"{tenant.name} resolver, agent version {version}",
@@ -1173,7 +1432,9 @@ def build(settings: Settings, config: AwsPlatformConfig | None = None) -> Platfo
     return Platform(
         track=Track.AWS,
         registry=registry,
-        pipelines=SageMakerPipelines(sagemaker, session.client("logs"), cfg),
+        pipelines=SageMakerPipelines(
+            sagemaker, session.client("logs"), cfg, s3=s3, ssm=session.client("ssm")
+        ),
         endpoints=SageMakerEndpoints(sagemaker, session.client("sagemaker-runtime"), registry, cfg),
         prompts=BedrockPrompts(session.client("bedrock-agent"), cfg),
         vectors=BedrockKnowledgeBase(
@@ -1225,6 +1486,10 @@ def main(argv: list[str] | None = None) -> int:
         for name in names:
             print(f"{name}: {runner.upsert(tenant, name)}")
         return 0
+    if command == "bootstrap":
+        from nw.platform.bootstrap import main as bootstrap_main
+
+        return bootstrap_main(argv[1:], track="aws")
     if command == "describe":
         settings = Settings(_env_file=None)
         cfg = AwsPlatformConfig.from_settings(settings)
@@ -1233,7 +1498,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     print(
         "usage: python -m nw.platform.aws prompts-catalog [path] | describe"
-        " | pipeline-upsert [triage|semantic ...]",
+        " | pipeline-upsert [triage|semantic ...] | bootstrap [triage|semantic ...] [--force]",
         file=sys.stderr,
     )
     return 2

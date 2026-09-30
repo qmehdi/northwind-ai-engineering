@@ -5,8 +5,14 @@
 The trap in this session is class imbalance. P0 is about 4 percent of tickets.
 A classifier trained naively scores high accuracy and almost never predicts P0.
 The fixes, in the order the guide walks through them: class weights, then a
-P0 threshold chosen on the validation split, then probability calibration so
-the threshold means what it says.
+P0 threshold chosen on held-out data, then probability calibration so the
+threshold means what it says.
+
+The validation split is cut in two by ticket id, stratified by priority: the calibration
+half fits the sigmoid, the threshold half chooses the P0 threshold. One split doing both
+jobs would tune the threshold to the calibrator's own fit. The test split is only ever
+measured. `data/golden/triage_slices.jsonl` adds a held-out gate set of P0 and German
+tickets, so the per-language bars in the gate have enough P0 tickets to mean something.
 """
 
 from __future__ import annotations
@@ -15,7 +21,6 @@ import argparse
 import datetime as dt
 import hashlib
 import json
-import subprocess
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -32,10 +37,19 @@ from sklearn.metrics import (
 )
 from sklearn.pipeline import Pipeline
 
+from nw.evalstats import fmt_rate, proportion
 from nw.triage.data_check import profile as profile_data
 from nw.triage.data_check import validate
 from nw.triage.features import PRIORITIES, build_features
 from nw.triage.model import TriageModel
+
+GATE_SLICES = Path("data/golden/triage_slices.jsonl")
+# The slices were written for this dataset (same generator, labels and splits); a model
+# trained on other data is not measured on them.
+SLICES_FOR_DATA = "308ad1151d5c"
+# Candidate thresholds, highest first: 0.95 down to 0.01. The floor sits below 0.05 because
+# a calibrated P0 probability for a real outage can be that low on a four percent class.
+THRESHOLD_GRID: tuple[float, ...] = tuple(round(0.95 - i * 0.01, 2) for i in range(95))
 
 
 def load_tickets(path: Path) -> list[dict[str, Any]]:
@@ -57,16 +71,63 @@ def labels(rows: list[dict[str, Any]]) -> np.ndarray:
 def build_pipeline(class_weight: str | dict | None = "balanced", C: float = 4.0) -> Pipeline:
     """Features, then a linear classifier. Linear is deliberate: it trains in seconds on a
     laptop, its coefficients are readable, and on short texts it is hard to beat by much."""
-    clf = LogisticRegression(max_iter=2000, C=C)  # Step 3: what about the 4 percent?
+    clf = LogisticRegression(max_iter=2000, C=C)  # Class weights: what about the 4 percent?
     return Pipeline([("features", build_features()), ("clf", clf)])
 
 
 def choose_p0_threshold(
     proba_p0: np.ndarray, y: np.ndarray, target_recall: float = 0.90, min_precision: float = 0.25
 ) -> float:
-    """Lowest threshold that reaches the target P0 recall on the validation split while
-    keeping precision above the floor; if no threshold does, the one with the best F1."""
-    return 0.5  # Step 4: sweep thresholds on the validation split
+    """Highest threshold that reaches the target P0 recall on held-out data while keeping
+    precision above the floor, scanning `THRESHOLD_GRID` from 0.95 down to 0.01; if no
+    threshold does both, the one with the best F1. The highest passing threshold is the one
+    with the fewest false alarms at the recall the business asked for."""
+    return 0.5  # threshold on its own half of validation
+
+
+def threshold_report(
+    proba_p0: np.ndarray,
+    y: np.ndarray,
+    threshold: float,
+    target_recall: float = 0.90,
+    min_precision: float = 0.25,
+) -> dict[str, Any]:
+    """What the chosen threshold achieves on the rows it was chosen on, and whether it met
+    the target. A fallback to best F1 is recorded as `target_met: false`, never silent."""
+    is_p0 = y == "P0"
+    pred = proba_p0 >= threshold
+    tp = int((pred & is_p0).sum())
+    recall = proportion(tp, int(is_p0.sum()))
+    precision = proportion(tp, int(pred.sum()))
+    met = (recall["rate"] or 0.0) >= target_recall and (precision["rate"] or 0.0) >= min_precision
+    return {
+        "threshold": float(threshold),
+        "target_recall": target_recall,
+        "min_precision": min_precision,
+        "target_met": bool(met),
+        "recall": recall,
+        "precision": precision,
+        "rows": len(y),
+    }
+
+
+def calibration_split(
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Validation cut in two halves, stratified by priority, ordered by a hash of the ticket
+    id so the cut is stable across runs and machines: (calibration, threshold)."""
+    cal: list[dict[str, Any]] = []
+    thr: list[dict[str, Any]] = []
+    for p in PRIORITIES:
+        group = sorted(
+            (r for r in rows if r.get("priority") == p),
+            key=lambda r: hashlib.sha256(
+                str(r.get("ticket_id", r.get("body", ""))).encode()
+            ).hexdigest(),
+        )
+        cal += group[0::2]
+        thr += group[1::2]
+    return cal, thr
 
 
 def expected_calibration_error(proba_max: np.ndarray, correct: np.ndarray, bins: int = 10) -> float:
@@ -80,8 +141,15 @@ def expected_calibration_error(proba_max: np.ndarray, correct: np.ndarray, bins:
 
 
 def evaluate(
-    model: TriageModel, rows: list[dict[str, Any]], *, by_language: bool = True
+    model: TriageModel,
+    rows: list[dict[str, Any]],
+    *,
+    by_language: bool = True,
+    predictions: bool = False,
 ) -> dict[str, Any]:
+    """Point metrics, the P0 counts behind them with 95 percent Wilson intervals, and per
+    language the same. With `predictions`, the per-row predicted priorities in row order and
+    a hash of the row ids: what a paired test against another model on the same rows needs."""
     y = labels(rows)
     proba = model.predict_proba(rows)
     pred = np.asarray([model.decide(p)[0] for p in proba])
@@ -92,28 +160,61 @@ def evaluate(
         lang = np.asarray([r.get("language", "en") for r in rows])
         for code in sorted(set(lang)):
             m = lang == code
+            tp = int(((pred[m] == "P0") & is_p0[m]).sum())
             langs[code] = {
                 "n": int(m.sum()),
+                "n_p0": int(is_p0[m].sum()),
                 "macro_f1": float(
                     f1_score(y[m], pred[m], average="macro", labels=PRIORITIES, zero_division=0)
                 ),
                 "p0_recall": float(recall_score(is_p0[m], pred[m] == "P0", zero_division=0))
                 if is_p0[m].any()
                 else None,
+                "p0_recall_ci": proportion(tp, int(is_p0[m].sum())),
             }
-    return {
+    tp = int(((pred == "P0") & is_p0).sum())
+    out: dict[str, Any] = {
         "by_language": langs,
         "n": len(rows),
+        "n_p0": int(is_p0.sum()),
         "accuracy": float((pred == y).mean()),
         "macro_f1": float(f1_score(y, pred, average="macro", labels=PRIORITIES)),
         "macro_f1_argmax": float(f1_score(y, argmax, average="macro", labels=PRIORITIES)),
         "p0_recall": float(recall_score(is_p0, pred == "P0", zero_division=0)),
         "p0_precision": float(precision_score(is_p0, pred == "P0", zero_division=0)),
+        "p0_recall_ci": proportion(tp, int(is_p0.sum())),
+        "p0_precision_ci": proportion(tp, int((pred == "P0").sum())),
         "p0_recall_argmax": float(recall_score(is_p0, argmax == "P0", zero_division=0)),
         "confusion": confusion_matrix(y, pred, labels=PRIORITIES).tolist(),
         "brier_p0": float(brier_score_loss(is_p0, proba[:, 0])),
         "ece": expected_calibration_error(proba.max(axis=1), (argmax == y).astype(float)),
     }
+    if predictions:
+        out["predictions"] = {
+            "ids_sha256_12": ids_sha(rows),
+            "pred": "".join(str(PRIORITIES.index(p)) for p in pred),
+            "truth": "".join(str(PRIORITIES.index(p)) for p in y),
+        }
+    return out
+
+
+def ids_sha(rows: list[dict[str, Any]]) -> str:
+    """Twelve hex characters over the ordered row ids: two prediction strings are paired
+    only when this matches."""
+    ids = "\n".join(str(r.get("ticket_id", i)) for i, r in enumerate(rows))
+    return hashlib.sha256(ids.encode()).hexdigest()[:12]
+
+
+def load_gate_slices(data: Path, path: Path | str | None = "auto") -> list[dict[str, Any]]:
+    """The golden gate slices for `data`. `auto` uses `GATE_SLICES` when it exists and `data`
+    is the dataset the slices were written for; a path forces it; None turns it off."""
+    if path is None:
+        return []
+    if path == "auto":
+        if not GATE_SLICES.exists() or data_hash(data) != SLICES_FOR_DATA:
+            return []
+        path = GATE_SLICES
+    return load_tickets(Path(path))
 
 
 def majority_baseline(rows: list[dict[str, Any]]) -> dict[str, float]:
@@ -133,12 +234,11 @@ def data_hash(path: Path) -> str:
 
 
 def git_sha() -> str:
-    try:
-        return subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=True
-        ).stdout.strip()
-    except Exception:  # noqa: BLE001
-        return "nogit"
+    """The commit of the code that is running: NW_GIT_SHA, GITHUB_SHA, git, then the image
+    label (`nw.platform.lineage`), so a container without `.git` does not record `nogit`."""
+    from nw.platform.lineage import git_sha as lineage_sha
+
+    return lineage_sha()
 
 
 def train(
@@ -151,6 +251,7 @@ def train(
     min_precision: float = 0.25,
     seed: int = 0,
     promote: bool = True,
+    gate_slices: Path | str | None = "auto",
 ) -> tuple[TriageModel, dict[str, Any]]:
     """Validate, train, evaluate, record the run, write the model card, then run the
     promotion gate. With `promote=False` the run is a registered candidate only."""
@@ -164,15 +265,19 @@ def train(
     data_profile = profile_data(rows, data_hash(data), findings)
     splits = by_split(rows)
     train_rows, val_rows, test_rows = splits["train"], splits["val"], splits["test"]
+    cal_rows, thr_rows = calibration_split(val_rows)
     pipeline = build_pipeline(class_weight=class_weight)
     pipeline.fit(train_rows, labels(train_rows))
 
-    final, classes = pipeline, list(pipeline.named_steps["clf"].classes_)  # Step 5
+    final, classes = pipeline, list(pipeline.named_steps["clf"].classes_)  # calibrate
 
     provisional = TriageModel(pipeline=final, classes=classes, p0_threshold=0.5, metadata={})
-    val_proba = provisional.predict_proba(val_rows)
+    thr_proba = provisional.predict_proba(thr_rows)
     threshold = choose_p0_threshold(
-        val_proba[:, 0], labels(val_rows), target_recall=target_recall, min_precision=min_precision
+        thr_proba[:, 0], labels(thr_rows), target_recall=target_recall, min_precision=min_precision
+    )
+    chosen = threshold_report(
+        thr_proba[:, 0], labels(thr_rows), threshold, target_recall, min_precision
     )
 
     version = f"{dt.datetime.now(dt.UTC).strftime('%Y%m%d%H%M%S')}-{git_sha()}-{data_hash(data)}"
@@ -188,6 +293,8 @@ def train(
             "git_sha": git_sha(),
             "n_train": len(train_rows),
             "n_val": len(val_rows),
+            "n_calibration": len(cal_rows),
+            "n_threshold": len(thr_rows),
             "n_test": len(test_rows),
             "class_weight": class_weight,
             "calibrated": calibrate,
@@ -196,17 +303,33 @@ def train(
             "seed": seed,
         },
     )
+    slices = load_gate_slices(data, gate_slices)
     report = {
         "baseline_majority": majority_baseline(test_rows),
         "val": evaluate(model, val_rows),
-        "test": evaluate(model, test_rows),
+        "test": evaluate(model, test_rows, predictions=True),
         "p0_threshold": threshold,
+        "threshold": chosen,
     }
+    if slices:
+        # The held-out gate set: the test split plus the golden slices, never trained,
+        # calibrated or thresholded on. The per-language bars read this block.
+        report["gate_set"] = evaluate(model, test_rows + slices) | {
+            "source": f"test split + {GATE_SLICES}",
+            "slices_sha256_12": ids_sha(slices),
+        }
     model.metadata["metrics"] = report
     target = out / version
     model.save(target)
     (target / "report.json").write_text(json.dumps(report, indent=1))
-    (target / "data_profile.json").write_text(json.dumps(asdict(data_profile), indent=1))
+    # The drift baseline for predictions is what the model predicts on held-out data, not
+    # the label shares: a threshold rule predicts P0 more often than P0 occurs, by design.
+    val_pred = [model.decide(p)[0] for p in model.predict_proba(val_rows)]
+    profile_out = asdict(data_profile) | {
+        "predicted_share": {p: val_pred.count(p) / max(len(val_pred), 1) for p in PRIORITIES},
+        "predicted_share_source": f"validation predictions of {version}",
+    }
+    (target / "data_profile.json").write_text(json.dumps(profile_out, indent=1))
     from nw.triage.model_card import write as write_card
     from nw.triage.tracking import record_run
 
@@ -233,6 +356,25 @@ def format_report(report: dict[str, Any]) -> str:
         f"| Brier (P0) | n/a | {t['brier_p0']:.4f} |",
         f"| ECE | n/a | {t['ece']:.4f} |",
         f"| P0 threshold | n/a | {report['p0_threshold']:.2f} |",
+        "",
+        f"P0 recall on test {fmt_rate(t['p0_recall_ci'])}; "
+        f"precision {fmt_rate(t['p0_precision_ci'])}.",
+    ]
+    chosen = report.get("threshold")
+    if chosen:
+        lines.append(
+            f"Threshold {chosen['threshold']:.2f} chosen on {chosen['rows']} threshold-half rows: "
+            f"recall {fmt_rate(chosen['recall'])}, target {chosen['target_recall']:.2f} "
+            + ("met." if chosen["target_met"] else "NOT MET: fell back to the best-F1 threshold.")
+        )
+    gate_set = report.get("gate_set")
+    if gate_set:
+        for lang, r in sorted(gate_set["by_language"].items()):
+            lines.append(
+                f"Gate set {lang}: {r['n']} rows, P0 recall {fmt_rate(r['p0_recall_ci'])}, "
+                f"macro-F1 {r['macro_f1']:.3f}."
+            )
+    lines += [
         "",
         "Confusion matrix on test (rows true, columns predicted, P0 to P3):",
         "",

@@ -13,7 +13,8 @@ so the saving is a number and not a slide.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, replace
 from typing import Any
 
 from nw.agent.loop import run_agent
@@ -43,12 +44,78 @@ async def route(
     *,
     policy: RoutingPolicy | None = None,
     screener: Screener | None = None,
+    max_steps: int | None = None,
+    budget_usd: float | None = None,
+    max_total_tokens: int | None = None,
+    requested_by: str | None = None,
 ) -> Trajectory:
     """`screener` runs in front of any branch that calls a model. The P0 branch makes no
-    model call, so the ticket text never reaches one and is not screened there."""
-    policy = policy or RoutingPolicy()
+    model call, so the ticket text never reaches one and is not screened there.
+
+    The request's caps only ever lower the policy's: `max_steps` and `budget_usd` cap both
+    loops, `max_total_tokens` is the run's token budget. The tools are bound to `account_id`
+    for the whole route, and the P0 branch's proposal is saved like any other, so a person
+    approves it with the same command (`nw.agent.approve`)."""
+    if not TICKET_RE.match(ticket_id):
+        raise ValueError(f"not a ticket id: {ticket_id!r}")
+    policy = capped(policy or RoutingPolicy(), max_steps=max_steps, budget_usd=budget_usd)
     task = f"Ticket {ticket_id} from account {account_id}\nSubject: {subject}\n\n{body}"
-    return await run_agent(task, registry, client, screener=screener)  # Step 3: route
+    from nw.agent.northwind import bind_account
+
+    with bind_account(account_id):
+        return await _route(
+            ticket_id,
+            account_id,
+            subject,
+            body,
+            task,
+            registry,
+            client,
+            policy=policy,
+            screener=screener,
+            max_total_tokens=max_total_tokens,
+            requested_by=requested_by,
+        )
+
+
+TICKET_RE = re.compile(r"^T-\d{6}$")
+
+
+def capped(
+    policy: RoutingPolicy, *, max_steps: int | None = None, budget_usd: float | None = None
+) -> RoutingPolicy:
+    """The policy with the request's caps applied; a request can lower a cap, never raise it."""
+    changes: dict[str, Any] = {}
+    if max_steps is not None:
+        changes["economy_max_steps"] = min(policy.economy_max_steps, max_steps)
+        changes["workhorse_max_steps"] = min(policy.workhorse_max_steps, max_steps)
+    if budget_usd is not None:
+        changes["economy_budget_usd"] = min(policy.economy_budget_usd, budget_usd)
+        changes["workhorse_budget_usd"] = min(policy.workhorse_budget_usd, budget_usd)
+    return replace(policy, **changes) if changes else policy
+
+
+async def _route(
+    ticket_id: str,
+    account_id: str,
+    subject: str,
+    body: str,
+    task: str,
+    registry: ToolRegistry,
+    client: LLMClient,
+    *,
+    policy: RoutingPolicy,
+    screener: Screener | None,
+    max_total_tokens: int | None,
+    requested_by: str | None,
+) -> Trajectory:
+    run_kw: dict[str, Any] = {
+        "screener": screener,
+        "max_total_tokens": max_total_tokens,
+        "account_id": account_id,
+        "requested_by": requested_by,
+    }
+    return await run_agent(task, registry, client, **run_kw)  # Route cheap first
 
 
 def _read_triage(content: str) -> tuple[str, float]:

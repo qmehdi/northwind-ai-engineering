@@ -45,6 +45,15 @@ class ModelRole(StrEnum):
     ECONOMY = "economy"
 
 
+class Residency(StrEnum):
+    """Where a call's data may be processed. `default` is the track's own region; `eu` keeps
+    prompts and completions inside the EU (an account with `region: eu` in
+    `data/accounts.json`, the promise in `data/policies/gdpr-data-residency.md`)."""
+
+    DEFAULT = "default"
+    EU = "eu"
+
+
 # Track defaults (ADR 0010: open-weight Workhorse and Economy, Claude as Judge). Verify
 # these IDs against the provider's model list before each delivery: `make preflight` does
 # one round trip per role and prints which provider and endpoint each role resolves to.
@@ -89,7 +98,9 @@ class ModelRole(StrEnum):
 DEFAULT_MODELS: dict[Track, dict[ModelRole, str]] = {
     Track.AWS: {
         ModelRole.WORKHORSE: "openai.gpt-oss-120b-1:0",
-        ModelRole.JUDGE: "anthropic.claude-opus-5",
+        # Opus 5 has no in-region on-demand row in us-east-1 (model card, 2026-09-30): the US geo
+        # profile serves it, the same one deploy/aws grants.
+        ModelRole.JUDGE: "us.anthropic.claude-opus-5",
         ModelRole.ECONOMY: "us.amazon.nova-micro-v1:0",
     },
     Track.GCP: {
@@ -114,6 +125,57 @@ DEFAULT_MODELS: dict[Track, dict[ModelRole, str]] = {
     },
 }
 
+# EU residency (06 H5): the model id per role that keeps processing in the EU, per track,
+# fetched 2026-09-30. None means the track has no EU-resident model for the role today; the
+# client then refuses the call (`ResidencyError`) instead of sending EU data elsewhere, and
+# `NW_MODEL_EU_<ROLE>` names one when the operator has deployed it.
+# - Bedrock, from `aws_eu_region` (eu-central-1, Frankfurt), model cards at
+#   docs.aws.amazon.com/bedrock/latest/userguide/model-cards.html: gpt-oss-120b in-region in
+#   eu-central-1 (no geo profile exists); Claude Opus 5 through the EU geo profile
+#   `eu.anthropic.claude-opus-5` on bedrock-runtime ("keeps data within EU regions"); Nova
+#   Micro through `eu.amazon.nova-micro-v1:0` (Frankfurt routes to Frankfurt, Stockholm,
+#   Ireland, Paris).
+# - Google: Claude Opus 5 on the `eu` multi-region endpoint (aiplatform.eu.rep.googleapis.com,
+#   platform.claude.com/docs/en/build-with-claude/claude-on-vertex-ai and the Opus 5 model page,
+#   "ML processing: Europe Multi-region"). gpt-oss-120b-maas and gpt-oss-20b-maas process in the
+#   US multi-region only (model pages, updated 2026-09-28), so Workhorse and Economy have no EU
+#   managed id: deploy gpt-oss from Model Garden to an EU endpoint and set NW_MODEL_EU_*.
+# - Microsoft Foundry, Data Zone Standard in the EU data zone (learn.microsoft.com/azure/foundry/
+#   foundry-models/concepts/models-sold-directly-by-azure-region-availability and
+#   models-from-partners, fetched 2026-09-30): neither gpt-oss-120b, mistral-small-2503 nor any
+#   Claude model has an EU data zone deployment (Claude's Data Zone Standard is US only).
+#   Mistral-Large-3 does (francecentral, germanywestcentral, swedencentral and others), so it
+#   serves Workhorse and Economy on the EU resource (`NW_AZURE_FOUNDRY_EU_ENDPOINT`), deployed
+#   with SKU `DataZoneStandard` under its own name. The Judge has no EU model.
+# - Local: nothing leaves the laptop, so the Ollama roles serve EU accounts as they are; the
+#   Judge stays on the fake provider for EU calls even when a cloud key is set.
+EU_MODELS: dict[Track, dict[ModelRole, str | None]] = {
+    Track.AWS: {
+        ModelRole.WORKHORSE: "openai.gpt-oss-120b-1:0",
+        ModelRole.JUDGE: "eu.anthropic.claude-opus-5",
+        ModelRole.ECONOMY: "eu.amazon.nova-micro-v1:0",
+    },
+    Track.GCP: {
+        ModelRole.WORKHORSE: None,
+        ModelRole.JUDGE: "claude-opus-5",
+        ModelRole.ECONOMY: None,
+    },
+    Track.AZURE: {
+        ModelRole.WORKHORSE: "Mistral-Large-3",
+        ModelRole.JUDGE: None,
+        ModelRole.ECONOMY: "Mistral-Large-3",
+    },
+    Track.LOCAL: {
+        ModelRole.WORKHORSE: "gpt-oss:20b",
+        ModelRole.JUDGE: "fake-judge",
+        ModelRole.ECONOMY: "gpt-oss:20b",
+    },
+}
+
+# Through a LiteLLM gateway the EU deployments are separate gateway models, named with this
+# prefix before the EU id (`eu/openai.gpt-oss-120b-1:0`), so one gateway serves both zones.
+GATEWAY_EU_PREFIX = "eu/"
+
 # The Judge on the Local track when a cloud key is present (NW_ANTHROPIC_API_KEY, or a
 # gateway that routes the name to Claude). Without one the role stays on the fake provider
 # and the harness runs judge-free.
@@ -126,6 +188,41 @@ FAKE_MODELS: dict[ModelRole, str] = {
     ModelRole.JUDGE: "fake-judge",
     ModelRole.ECONOMY: "fake-economy",
 }
+FAKE_EU_MODELS: dict[ModelRole, str] = {role: f"{m}-eu" for role, m in FAKE_MODELS.items()}
+
+# Hugging Face models the course loads by name, pinned to a commit (06 M15): a name alone
+# follows `main`, so a push to the model repo would change what an image serves. Commit ids
+# fetched from the Hub API on 2026-09-30 (`/api/models/<id>/revision/main`). Pass
+# `revision=hf_revision(name)` to every `from_pretrained`, `SentenceTransformer` and
+# `CrossEncoder` that loads by name; a local directory needs no revision.
+HF_REVISIONS: dict[str, str] = {
+    "sentence-transformers/all-MiniLM-L6-v2": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+    "cross-encoder/ms-marco-MiniLM-L6-v2": "233902d25c440f23af6f7d6e94d2946bac0bee0a",
+    "distilbert/distilbert-base-uncased": "12040accade4e8a0f71eabdb258fecc2e7e948be",
+}
+# Old names the Hub redirects to the ids above.
+HF_ALIASES: dict[str, str] = {
+    "cross-encoder/ms-marco-MiniLM-L-6-v2": "cross-encoder/ms-marco-MiniLM-L6-v2",
+    "distilbert-base-uncased": "distilbert/distilbert-base-uncased",
+}
+
+
+def hf_revision(name: str) -> str | None:
+    """The pinned commit for a Hub model id, None for a local path. An unpinned Hub id raises:
+    add it to `HF_REVISIONS` with the commit you tested, or pin it with
+    `NW_HF_REVISION_<ID>` (non-alphanumerics as `_`, upper case)."""
+    if not name or Path(name).exists() or name.startswith((".", "/", "~")):
+        return None
+    env = "NW_HF_REVISION_" + "".join(c if c.isalnum() else "_" for c in name).upper()
+    if os.environ.get(env):
+        return os.environ[env]
+    canonical = HF_ALIASES.get(name, name)
+    if canonical in HF_REVISIONS:
+        return HF_REVISIONS[canonical]
+    raise ValueError(
+        f"no pinned revision for Hugging Face model {name!r}: add it to nw.config.HF_REVISIONS "
+        f"or set {env}"
+    )
 
 
 def is_claude(model: str) -> bool:
@@ -134,8 +231,9 @@ def is_claude(model: str) -> bool:
     return "claude" in model.lower()
 
 
-# Field names that hold credentials. Never printed, never hashed.
-SECRET_MARKERS = ("key", "secret", "token", "password")
+# Field names that hold credentials. Never printed, never hashed. A connection string carries
+# an instrumentation key (App Insights) or a password (a database), so it counts as one.
+SECRET_MARKERS = ("key", "secret", "token", "password", "connection_string")
 
 
 # Names that match a marker but hold no credential: a vault's name is not a secret.
@@ -180,8 +278,14 @@ def is_secret(name: str) -> bool:
     return any(m in name.lower() for m in SECRET_MARKERS)
 
 
+# The dotenv file Settings reads: `.env` in the working directory, another path with
+# `NW_ENV_FILE`, none when it is empty. The test suite sets it empty, so a learner's own `.env`
+# (a gateway key, a lighter model) never changes what the tests see.
+ENV_FILE: str | None = os.environ.get("NW_ENV_FILE", ".env") or None
+
+
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="NW_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_prefix="NW_", env_file=ENV_FILE, extra="ignore")
 
     track: Track = Track.LOCAL
     # `fake` answers every role from the fake provider, on any track; `auto` routes by
@@ -201,6 +305,8 @@ class Settings(BaseSettings):
 
     aws_region: str = "us-east-1"
     aws_profile: str | None = None
+    # The region EU-resident calls go to (every EU role is served from Frankfurt).
+    aws_eu_region: str = "eu-central-1"
 
     gcp_project: str | None = None
     gcp_region: str = "global"
@@ -212,6 +318,8 @@ class Settings(BaseSettings):
     # The region of the OpenAI-compatible managed API for open models (gpt-oss). Claude
     # keeps `gcp_region`; gpt-oss-20b is served only from us-central1.
     gcp_maas_region: str = "us-central1"
+    # The Claude endpoint for EU-resident calls: the `eu` multi-region.
+    gcp_eu_region: str = "eu"
 
     # Azure track (ADR 0013). Each has an env override and `deploy/azure/outputs.json` fills
     # the rest (`nw.platform.azure.AzureConfig`). The Foundry endpoint is the resource's
@@ -226,6 +334,9 @@ class Settings(BaseSettings):
     # An API key for the Foundry resource (from Key Vault, injected by reference). Unset means
     # Microsoft Entra ID through DefaultAzureCredential, which is the default.
     azure_foundry_key: str | None = None
+    # A second Foundry resource in an EU region holding the Data Zone Standard (EU) deployments
+    # that EU-resident calls use. Unset means EU calls on the azure track are refused.
+    azure_foundry_eu_endpoint: str | None = None
     azure_search_endpoint: str | None = None
     azure_key_vault: str | None = None
     azure_acr: str | None = None
@@ -251,9 +362,20 @@ class Settings(BaseSettings):
     model_fallback_judge: str | None = None
     model_fallback_economy: str | None = None
 
+    # The EU-resident model per role, overriding `EU_MODELS` (an operator's own EU deployment).
+    # EU calls never fall back to a model outside the zone, so there is no EU fallback.
+    model_eu_workhorse: str | None = None
+    model_eu_judge: str | None = None
+    model_eu_economy: str | None = None
+    # Off turns residency routing off: every call uses the default ids whatever the account.
+    residency_routing: bool = True
+
     max_concurrency: int = Field(default=8, ge=1)
     spend_cap_usd: float = Field(default=10.0, ge=0)
     request_timeout_s: float = Field(default=60.0, gt=0)
+    # The whole call, every retry, back-off and the fallback included. Without it one call can
+    # take attempts x timeout plus the back-offs, twice over with a fallback (about 11 minutes).
+    call_deadline_s: float = Field(default=180.0, gt=0)
     # The circuit breaker per model: open after this many consecutive failures, for this long.
     breaker_failures: int = Field(default=3, ge=1)
     breaker_open_s: float = Field(default=30.0, gt=0)
@@ -261,6 +383,9 @@ class Settings(BaseSettings):
 
     # Read here only so `describe()` can say whether it is set. `nw.auth` reads the key.
     api_key: str | None = None
+    # `NW_AUTH_DISABLED=1` lets a service start without a key off the local track; read by
+    # `nw.auth` from the environment, shown here so `describe()` reports it.
+    auth_disabled: bool = False
 
     _from_outputs: set[str] = PrivateAttr(default_factory=set)
 
@@ -280,7 +405,9 @@ class Settings(BaseSettings):
                 self._from_outputs.add(name)
         return self
 
-    def model_for(self, role: ModelRole) -> str:
+    def model_for(self, role: ModelRole, residency: Residency = Residency.DEFAULT) -> str:
+        if residency is Residency.EU and self.residency_routing:
+            return self.eu_model_for(role)
         override = {
             ModelRole.WORKHORSE: self.model_workhorse,
             ModelRole.JUDGE: self.model_judge,
@@ -294,11 +421,61 @@ class Settings(BaseSettings):
             return LOCAL_CLOUD_JUDGE
         return DEFAULT_MODELS[self.track][role]
 
+    def eu_model_for(self, role: ModelRole) -> str:
+        """The EU-resident id for a role: the `NW_MODEL_EU_<ROLE>` override, the fake EU id under
+        `NW_PROVIDER=fake`, else `EU_MODELS` for the track, prefixed for a LiteLLM gateway.
+        Raises `ResidencyError` when the track has none: an EU call is refused, never sent
+        to a model outside the zone."""
+        override = {
+            ModelRole.WORKHORSE: self.model_eu_workhorse,
+            ModelRole.JUDGE: self.model_eu_judge,
+            ModelRole.ECONOMY: self.model_eu_economy,
+        }[role]
+        if override:
+            return override
+        if self.provider is ProviderMode.FAKE:
+            return FAKE_EU_MODELS[role]
+        model = EU_MODELS[self.track][role]
+        if model is None:
+            from nw.llm.errors import ResidencyError
+
+            raise ResidencyError(
+                f"no EU-resident model for the {role.value} role on the {self.track.value} "
+                f"track; set NW_MODEL_EU_{role.name} to an EU deployment"
+            )
+        if self.gateway_url and self.track is not Track.LOCAL:
+            return GATEWAY_EU_PREFIX + model
+        return model
+
+    def judge_unavailable(self) -> str | None:
+        """Why a judged run cannot score here, or None. On the Local track without a Claude
+        route the Judge resolves to `fake-judge`; outside `NW_PROVIDER=fake` that would score
+        real answers with canned verdicts, so a judged harness stops before any model call."""
+        if self.provider is ProviderMode.FAKE:
+            return None
+        if self.model_for(ModelRole.JUDGE).startswith("fake-"):
+            return (
+                "no Judge route on this track: set ANTHROPIC_API_KEY in .env and restart the "
+                "stack (or NW_ANTHROPIC_API_KEY), set NW_MODEL_JUDGE, or run without the Judge "
+                "(--no-judge, NO_JUDGE=1)"
+            )
+        return None
+
     @property
     def has_cloud_key(self) -> bool:
-        """Whether a Local-track process can reach a cloud Judge: a gateway or an
-        Anthropic API key."""
-        return bool(self.gateway_url or self.anthropic_api_key)
+        """Whether a Local-track process can reach a cloud Judge: its own Anthropic API key, or
+        a gateway that serves Claude. The Local gateway serves Claude only when it was started
+        with `ANTHROPIC_API_KEY` (compose reads it from the same `.env`); a gateway without it
+        answers `claude-opus-5` with 400, so the Judge stays on the fake provider."""
+        if self.anthropic_api_key:
+            return True
+        if not self.gateway_url:
+            return False
+        if self.track is not Track.LOCAL:
+            return True
+        return bool(
+            os.environ.get("ANTHROPIC_API_KEY") or _read_dotenv(ENV_FILE).get("ANTHROPIC_API_KEY")
+        )
 
     @property
     def uses_apim(self) -> bool:
@@ -318,9 +495,12 @@ class Settings(BaseSettings):
             return False
         return bool(self.gateway_url) or self.uses_apim
 
-    def fallback_for(self, role: ModelRole) -> str | None:
+    def fallback_for(self, role: ModelRole, residency: Residency = Residency.DEFAULT) -> str | None:
         """The fallback model for a role, or None. A fallback equal to the primary is no
-        fallback at all and is reported as None."""
+        fallback at all and is reported as None. EU calls have none: the configured fallbacks
+        are not known to be EU-resident."""
+        if residency is Residency.EU and self.residency_routing:
+            return None
         fallback = {
             ModelRole.WORKHORSE: self.model_fallback_workhorse,
             ModelRole.JUDGE: self.model_fallback_judge,
@@ -344,7 +524,7 @@ class Settings(BaseSettings):
         self,
         *,
         env: Mapping[str, str] | None = None,
-        env_file: str | Path | None = ".env",
+        env_file: str | Path | None = ENV_FILE,
     ) -> list[dict[str, Any]]:
         """Every setting with its effective value and where it came from: `env`, `.env`,
         `outputs` (`deploy/azure/outputs.json`), `init` (a value passed to the constructor) or

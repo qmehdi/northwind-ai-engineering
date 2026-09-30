@@ -84,13 +84,20 @@ def test_use_case_validation():
         allowed_tools=["search_policies"],
         data_classes=["ticket_text"],
     )
+    gov = dict(
+        eu_ai_act_class="minimal", dpia_ref="docs/governance/dpia.md#uc-x", privacy_approver="p"
+    )
     assert cat.UseCase(**base).approval is cat.Approval.DRAFT
     with pytest.raises(ValidationError, match="approved without an approver"):
-        cat.UseCase(**base, approval="approved")
+        cat.UseCase(**base, **gov, approval="approved")
     with pytest.raises(ValidationError, match="co_approver"):
-        cat.UseCase(**{**base, "risk_class": "high"}, approval="approved", approver="a")
+        cat.UseCase(**{**base, "risk_class": "high"}, **gov, approval="approved", approver="a")
     cat.UseCase(
-        **{**base, "risk_class": "high"}, approval="approved", approver="a", co_approver="b"
+        **{**base, "risk_class": "high"},
+        **gov,
+        approval="approved",
+        approver="a",
+        co_approver="b",
     )
     with pytest.raises(ValidationError, match="not a lifecycle role"):
         cat.UseCase(**{**base, "owner": "wizard"})
@@ -141,3 +148,87 @@ def test_cli(monkeypatch, capsys):
     assert "product_owner" in json.loads(capsys.readouterr().out)["roles"]
     assert cat.main([]) == 0
     assert "| uc-resolver | resolver |" in capsys.readouterr().out
+
+
+def test_governance_fields_are_enforced():
+    base = dict(
+        id="uc-x",
+        agent="x",
+        owner="product_owner",
+        business_outcome="A sentence long enough to count.",
+        risk_class="medium",
+        allowed_tools=["search_policies"],
+        data_classes=["ticket_text"],
+        approval="approved",
+        approver="support-operations",
+        eu_ai_act_class="minimal",
+        dpia_ref="docs/governance/dpia.md#uc-x",
+        privacy_approver="privacy-office",
+    )
+    cat.UseCase(**base)
+    for field, message in [
+        ("eu_ai_act_class", "without an eu_ai_act_class"),
+        ("dpia_ref", "without a dpia_ref"),
+        ("privacy_approver", "without a privacy_approver"),
+    ]:
+        with pytest.raises(ValidationError, match=message):
+            cat.UseCase(**{**base, field: None})
+    with pytest.raises(ValidationError, match="must not be the business approver"):
+        cat.UseCase(**{**base, "privacy_approver": "support-operations"})
+    with pytest.raises(ValidationError, match="never approved"):
+        cat.UseCase(**{**base, "eu_ai_act_class": "prohibited"})
+    with pytest.raises(ValidationError, match="annex_iii_item"):
+        cat.UseCase(**{**base, "eu_ai_act_class": "high_risk", "risk_class": "high"})
+    with pytest.raises(ValidationError, match="risk_class high"):
+        cat.UseCase(**{**base, "eu_ai_act_class": "high_risk", "annex_iii_item": "4(a)"})
+    with pytest.raises(ValidationError, match="only for high_risk"):
+        cat.UseCase(**{**base, "annex_iii_item": "4(a)"})
+    with pytest.raises(ValidationError, match="article_50_disclosure"):
+        cat.UseCase(**{**base, "eu_ai_act_class": "transparency"})
+    cat.UseCase(**{**base, "eu_ai_act_class": "transparency", "article_50_disclosure": "AI."})
+
+
+def test_every_approved_use_case_resolves_its_dpia_section(catalog):
+    for uc in catalog.use_cases:
+        assert uc.dpia_ref and cat.dpia_problem(uc.dpia_ref) is None, uc.id
+    assert "no section" in cat.dpia_problem("docs/governance/dpia.md#uc-nowhere")
+    assert "no file" in cat.dpia_problem("docs/governance/missing.md#uc-x")
+
+
+def test_reach_is_derived_from_tools_and_delegates(catalog, agents):
+    reach, undeclared = cat.reachable_classes("orchestrator", agents)
+    assert not undeclared
+    assert reach == cat.DATA_CLASSES  # the specialists' reach flows back through ask_*
+    assert cat.reachable_classes("policy", agents)[0] == {"ticket_text", "policy_corpus"}
+    narrow = catalog.model_copy(deep=True)
+    narrow.get("orchestrator").data_classes = ["ticket_text"]
+    r = cat.check(narrow, {"orchestrator": agents["orchestrator"], **agents})
+    assert any(
+        "orchestrator: reaches data classes uc-orchestrator does not declare" in p
+        for p in r.problems
+    )
+
+
+def test_a_tool_with_no_declared_outputs_fails_the_check(catalog, agents):
+    policy = agents["policy"]
+    widened = cat.AgentDefinition(
+        policy.name,
+        policy.kind,
+        policy.system,
+        [*policy.specs, ToolSpec(name="read_mailbox", description="x", input_schema={})],
+        policy.roles,
+        policy.endpoints,
+    )
+    r = cat.check(catalog, {"policy": widened})
+    assert any("no declared output data classes: read_mailbox" in p for p in r.problems)
+    declared = cat.AgentDefinition(
+        policy.name,
+        policy.kind,
+        policy.system,
+        policy.specs,
+        policy.roles,
+        policy.endpoints,
+        outputs={"search_policies": frozenset({"customer_account"})},
+    )
+    r = cat.check(catalog, {"policy": declared})
+    assert any("does not declare: customer_account" in p for p in r.problems)

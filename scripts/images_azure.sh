@@ -13,6 +13,13 @@
 #   nw-mcp                   the MCP server, an internal Container App
 #   nw-pipelines             the image every Azure ML pipeline step and the schedule run in
 #
+# Every pushed digest is signed with cosign and the platform's Key Vault key
+# (`azurekms://<vault>.vault.azure.net/<NW_AZURE_SIGNING_KEY>`, signing needs Key Vault Crypto
+# User on the key: the builder identity, or the platform owner); `make release-azure` verifies
+# the signature before it creates a revision. The signature goes to the registry next to the
+# image, not to the public transparency log (the image names stay private). NW_SIGN=0 skips
+# signing (a laptop without cosign); such an image cannot be released.
+#
 # IMAGES="policy agent" limits the build to those names.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -30,13 +37,22 @@ image_tag() {
   fi
 }
 TAG="$(image_tag)"
+# The full commit the image is built from: the Dockerfile keeps it as NW_IMAGE_GIT_SHA, the lineage
+# a registered model and /version report (nw.platform.lineage).
+GIT_SHA="$(git rev-parse HEAD 2>/dev/null || true)"
 WANTED="${IMAGES:-triage semantic policy agent mcp pipelines}"
+SIGN="${NW_SIGN:-1}"
+if [ "$SIGN" = "1" ] && ! command -v cosign >/dev/null 2>&1; then
+  echo "cosign is not installed (brew install cosign, or github.com/sigstore/cosign releases);" >&2
+  echo "NW_SIGN=0 pushes unsigned images, which make release-azure refuses" >&2
+  exit 1
+fi
 az acr login -n "$ACR"
 build() { # name app artifacts hf [extras]; extras default to the Dockerfile's
   case " $WANTED " in *" $1 "*) ;; *) return 0 ;; esac
   local extras=()
   if [ -n "${5:-}" ]; then extras=(--build-arg "EXTRAS=$5"); fi
-  docker buildx build --platform linux/amd64 --build-arg "APP=$2" --build-arg "ARTIFACTS=$3" --build-arg "HF_MODELS=$4" \
+  docker buildx build --platform linux/amd64 --build-arg "GIT_SHA=$GIT_SHA" --build-arg "APP=$2" --build-arg "ARTIFACTS=$3" --build-arg "HF_MODELS=$4" \
     ${extras[@]+"${extras[@]}"} -t "$REG/nw-$1:$TAG" -t "$REG/nw-$1:latest" --push .
 }
 build triage    nw.triage.service:app   "triage" 0
@@ -49,7 +65,15 @@ PIPELINE_EXTRAS="--extra dl --extra mlops --extra pipelines"
 if grep -q '^platform-azure' pyproject.toml; then PIPELINE_EXTRAS="$PIPELINE_EXTRAS --extra platform-azure"; fi
 build pipelines pipelines               "" 0 "$PIPELINE_EXTRAS"
 echo "pushed to $REG with tags $TAG and latest: $WANTED"
+VAULT="${NW_AZURE_KEY_VAULT:-$("${PARAMS_PY[@]}" get NW_AZURE_KEY_VAULT)}"
+KEY="${NW_AZURE_SIGNING_KEY:-$("${PARAMS_PY[@]}" get NW_AZURE_SIGNING_KEY)}"
 for s in $WANTED; do
-  echo "nw-$s@$(az acr repository show -n "$ACR" --image "nw-$s:$TAG" --query digest -o tsv 2>/dev/null || echo '<digest unavailable>')"
+  DIGEST="$(az acr repository show -n "$ACR" --image "nw-$s:$TAG" --query digest -o tsv)"
+  echo "nw-$s@$DIGEST"
+  if [ "$SIGN" = "1" ]; then
+    AZURE_AUTH_METHOD=cli cosign sign --yes --tlog-upload=false \
+      --key "azurekms://$VAULT.vault.azure.net/$KEY" "$REG/nw-$s@$DIGEST" >/dev/null
+    echo "  signed with azurekms://$VAULT.vault.azure.net/$KEY"
+  fi
 done
 echo "Next: make deploy-azure (the apps move from the placeholder to tag $TAG) or make release-azure (the live canary)."

@@ -9,6 +9,10 @@ variable "region" { type = string }
 variable "environment" { type = string }
 variable "labels" { type = map(string) }
 variable "artifacts_bucket" { type = string }
+variable "clouddeploy_folder" {
+  type        = string
+  description = "Managed folder in the artifacts bucket for Cloud Deploy sources and renders (modules/data)"
+}
 variable "live_service_account" { type = string }
 variable "github_owner" { type = string }
 variable "github_repo" { type = string }
@@ -38,6 +42,11 @@ resource "google_artifact_registry_repository" "images" {
   format        = "DOCKER"
   description   = "Course images of ${var.environment}: nw-triage, nw-semantic, nw-policy, nw-agent, nw-mcp"
   labels        = merge(var.labels, { area = "delivery" })
+  # A tag names one image forever: scripts/images_gcp.sh tags by git SHA (a dirty tree adds a
+  # hash of the diff) and never pushes `latest`.
+  docker_config {
+    immutable_tags = true
+  }
   cleanup_policies {
     id     = "keep-recent"
     action = "KEEP"
@@ -79,6 +88,20 @@ resource "google_service_account" "deployer" {
   display_name = "${var.environment} Cloud Deploy execution"
 }
 
+# Pull requests run code from the pull request's head, so they build as an account that can
+# only write its own build logs: no registry, no release, no bucket, no actAs.
+resource "google_service_account" "pr_checks" {
+  project      = var.project
+  account_id   = "${var.environment}-pr-checks"
+  display_name = "${var.environment} Cloud Build pull request checks (unprivileged)"
+}
+
+resource "google_project_iam_member" "pr_checks" {
+  project = var.project
+  role    = "roles/logging.logWriter"
+  member  = "serviceAccount:${google_service_account.pr_checks.email}"
+}
+
 resource "google_project_iam_member" "builder" {
   for_each = toset(["roles/logging.logWriter", "roles/artifactregistry.writer", "roles/clouddeploy.releaser"])
   project  = var.project
@@ -93,16 +116,14 @@ resource "google_project_iam_member" "deployer" {
   member   = "serviceAccount:${google_service_account.deployer.email}"
 }
 
-resource "google_storage_bucket_iam_member" "builder_artifacts" {
-  bucket = var.artifacts_bucket
-  role   = "roles/storage.objectAdmin"
-  member = "serviceAccount:${google_service_account.builder.email}"
-}
-
-resource "google_storage_bucket_iam_member" "deployer_artifacts" {
-  bucket = var.artifacts_bucket
-  role   = "roles/storage.objectAdmin"
-  member = "serviceAccount:${google_service_account.deployer.email}"
+# The release source (`--gcs-source-staging-dir`) and Cloud Deploy's renders live under
+# clouddeploy/ in the artifacts bucket; neither identity touches anything else there.
+resource "google_storage_managed_folder_iam_member" "delivery" {
+  for_each       = { builder = google_service_account.builder.email, deployer = google_service_account.deployer.email }
+  bucket         = var.artifacts_bucket
+  managed_folder = var.clouddeploy_folder
+  role           = "roles/storage.objectUser"
+  member         = "serviceAccount:${each.value}"
 }
 
 # A release runs as the deployer, so the builder (and the Cloud Deploy service agent) must be
@@ -164,8 +185,8 @@ resource "google_cloudbuild_trigger" "pull_request" {
   project         = var.project
   location        = var.region
   name            = "${var.environment}-pull-request"
-  description     = "Checks on every pull request against ${var.github_branch}"
-  service_account = google_service_account.builder.id
+  description     = "Checks on every pull request against ${var.github_branch}, as the unprivileged pull request account"
+  service_account = google_service_account.pr_checks.id
   filename        = "deploy/gcp/platform/delivery/cloudbuild-pr.yaml"
   repository_event_config {
     repository = google_cloudbuildv2_repository.course[0].id
@@ -203,11 +224,25 @@ resource "google_cloudbuild_trigger" "main" {
     _PIPELINE    = "${var.environment}-live"
     _LIVE_SA     = var.live_service_account
     _DEPLOYER_SA = google_service_account.deployer.email
+    _BUILDER_SA  = google_service_account.builder.email
+    _STAGING     = "gs://${var.artifacts_bucket}/clouddeploy/source"
   }
   tags = ["northwind", "main"]
 }
 
+# ----- signing ------------------------------------------------------------------------------------
+# cloudbuild-main.yaml signs every image digest it pushes with cosign keyless as the builder
+# service account (Fulcio certificate, Rekor entry) and verifies the signature before it creates
+# the release; `make release-gcp` submits that same build, so nothing reaches live that the
+# builder did not sign. Admission-time enforcement (Binary Authorization with a Cloud KMS
+# attestor on the live services) is the production step the course names and does not build:
+# its attestor needs a public key the credential-free plan cannot read.
+
 # ----- Cloud Deploy: one target, a canary, a manual approval ----------------------------------------
+# Order on this target: the approval gates the rollout (require_approval, before any traffic
+# moves); the rollout then deploys the canary at canary_percent and pauses at the stable phase
+# until it is advanced (`make approve-gcp` does both: approve, then advance). AWS and Azure put
+# the human after the canary; here the same person approves and later advances.
 # A higher environment is a second target in this pipeline with its own execution service
 # account in the other project (README, "Lower and higher environments"); the course deploys
 # one.
@@ -263,9 +298,11 @@ resource "google_clouddeploy_delivery_pipeline" "live" {
 }
 
 output "images_repository" { value = google_artifact_registry_repository.images.name }
+output "images_repository_id" { value = google_artifact_registry_repository.images.repository_id }
 output "remote_registry" { value = "${var.region}-docker.pkg.dev/${var.project}/${google_artifact_registry_repository.remote.repository_id}" }
 output "pipeline" { value = google_clouddeploy_delivery_pipeline.live.name }
 output "target" { value = google_clouddeploy_target.live.name }
 output "builder_service_account" { value = google_service_account.builder.email }
 output "deployer_service_account" { value = google_service_account.deployer.email }
+output "pr_service_account" { value = google_service_account.pr_checks.email }
 output "triggers" { value = local.github ? { pull_request = google_cloudbuild_trigger.pull_request[0].name, main = google_cloudbuild_trigger.main[0].name } : {} }

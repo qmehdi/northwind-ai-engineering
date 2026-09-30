@@ -18,7 +18,7 @@ from typing import Any
 
 import torch
 
-from nw.pipelines.steps import localize, write_result
+from nw.pipelines.steps import local_path, localize, write_result
 from nw.semantic.model import ModelSpec
 from nw.semantic.train import train
 
@@ -26,8 +26,8 @@ STEP = "semantic_train"
 
 
 def run(
-    data: Path,
-    out: Path,
+    data: Path | str,
+    out: Path | str,
     *,
     epochs: int = 2,
     batch_size: int = 16,
@@ -41,6 +41,7 @@ def run(
     tokenizer: Any = None,
     log_every: int = 20,
 ) -> dict[str, Any]:
+    out = local_path(out)
     run_dir, meta = train(
         localize(data),
         Path(out),
@@ -74,8 +75,10 @@ def run(
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--data", type=Path, default=Path("data/tickets.jsonl"))
-    ap.add_argument("--out", type=Path, default=Path("artifacts/semantic"))
+    ap.add_argument("--data", default="data/tickets.jsonl", help="a path, gs:// or s3:// URI")
+    ap.add_argument(
+        "--out", default="artifacts/semantic", help="the artifact tree: a path or gs:// URI"
+    )
     ap.add_argument("--epochs", type=int, default=2)
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--accumulate", type=int, default=2)

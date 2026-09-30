@@ -45,13 +45,34 @@ def text_length(ticket: dict[str, Any]) -> int:
     return len(str(ticket.get("subject") or "")) + len(str(ticket.get("body") or ""))
 
 
+def base_revision(meta: dict[str, Any]) -> str:
+    """The Hub commit of the base model: the artifact's own `base_revision`, else the course pin
+    (`nw.config.HF_REVISIONS`, importable in a course image, not in a prebuilt container).
+    Never `main`: an unpinned download is refused."""
+    if meta.get("base_revision"):
+        return str(meta["base_revision"])
+    try:
+        from nw.config import hf_revision
+    except ImportError as exc:
+        raise ValueError(
+            "artifact has no tokenizer/ and no base_revision; refusing an unpinned download"
+        ) from exc
+    revision = hf_revision(str(meta["base"]))
+    if not revision:
+        raise ValueError(f"no pinned revision for {meta['base']!r}")
+    return revision
+
+
 class TriagePredictor:
     kind = "triage"
 
     def __init__(self, model_dir: Path) -> None:
         from nw.triage.model import TriageModel
 
-        self.model = TriageModel.load(model_dir)
+        # The registry's hash of model.joblib, when the deployer injected it, is checked before
+        # the pickle runs; otherwise the hash the training run wrote into metadata.json.
+        expected = (os.environ.get("NW_MODEL_SHA256") or "").strip().lower() or None
+        self.model = TriageModel.load(model_dir, expected_sha256=expected)
         self.version = self.model.version
 
     def predict(self, tickets: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -77,9 +98,12 @@ class SemanticPredictor:
         self.tags = list(meta["tags"])
         self.max_length = int(meta.get("max_length", 256))
         tok_dir = model_dir / "tokenizer"
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            str(tok_dir) if tok_dir.is_dir() else meta["base"]
-        )
+        if tok_dir.is_dir():
+            self.tokenizer = AutoTokenizer.from_pretrained(str(tok_dir))
+        else:  # the base model's tokenizer from the Hub, pinned to a commit
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                meta["base"], revision=base_revision(meta)
+            )
         self.file = "model.int8.onnx" if (model_dir / "model.int8.onnx").exists() else "model.onnx"
         opts = ort.SessionOptions()
         threads = os.environ.get("NW_ONNX_THREADS")
@@ -88,7 +112,8 @@ class SemanticPredictor:
         self.session = ort.InferenceSession(
             str(model_dir / self.file), opts, providers=["CPUExecutionProvider"]
         )
-        self.thresholds = np.load(model_dir / "tag_thresholds.npy")
+        # A plain float array: never let a crafted .npy unpickle an object array.
+        self.thresholds = np.load(model_dir / "tag_thresholds.npy", allow_pickle=False)
 
     def predict(self, tickets: list[dict[str, Any]]) -> list[dict[str, Any]]:
         texts = [

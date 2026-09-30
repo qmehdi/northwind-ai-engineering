@@ -24,7 +24,15 @@ def suppress_known(stack: Stack) -> None:
                     "of the one vector bucket, S3 GetObject under tenants/*/policies/*), the approval "
                     "deployer (application-autoscaling has no resource ARNs, endpoints under the prefix), "
                     "the CodeBuild projects and CodePipeline (CDK-managed artifact and log statements), "
-                    "and S3 grants on prefixes (bucket/prefix/*)."
+                    "S3 grants on prefixes (bucket/prefix/*), the learner roles (Bedrock prompts are "
+                    "created on prompt/* with an aws:RequestTag condition because their ids are generated, "
+                    "AgentCore CreateAgentRuntime on runtime/* because the runtime id is generated and the "
+                    "runtime can only run as the tenant's own role, List and Describe calls that have no "
+                    "resource ARNs, record ARNs under the one registry), the Deny statements that guard "
+                    "instance types and MLflow deletes (a deny on * is the narrowing), the domain cleanup "
+                    "function (EFS and EC2 Describe calls, deletes conditioned on the SageMaker tag and the "
+                    "VPC), the Bedrock invocation logging and prefix list lookups (account-level APIs with "
+                    "no resource ARNs) and the budget stop policy (a deny on *)."
                 ),
             },
             {
@@ -58,8 +66,20 @@ def suppress_known(stack: Stack) -> None:
                 "reason": "Deletion protection would break `make destroy-aws`; the keys database holds virtual keys that gateway_keys.sh recreates.",
             },
             {
-                "id": "AwsSolutions-EC23",
-                "reason": "The model gateway's load balancer is public by design (the learners call it from their laptops); every request needs a virtual key. TLS needs a domain the course does not own; the README says where to add the certificate.",
+                "id": "AwsSolutions-CFR1",
+                "reason": "The model gateway's distribution serves the cohort wherever the learners are; every request needs a virtual key.",
+            },
+            {
+                "id": "AwsSolutions-CFR2",
+                "reason": "AWS WAF on the gateway distribution is priced in deploy/COSTS-platform.md and not deployed (a documented course simplification); the ALB answers only CloudFront with the secret origin header, and every request needs a virtual key.",
+            },
+            {
+                "id": "AwsSolutions-CFR4",
+                "reason": "The gateway distribution uses CloudFront's default certificate (HTTPS with no domain), whose minimum viewer protocol CloudFront fixes; an organisation with a domain attaches an ACM certificate and sets TLSv1.2_2021 (README, Networking).",
+            },
+            {
+                "id": "AwsSolutions-CFR5",
+                "reason": "The CloudFront to ALB leg is HTTP (TLSv1.2 is the only protocol listed for when it moves to HTTPS): an ALB certificate needs a domain the course does not own. The ALB accepts only CloudFront's origin-facing prefix list and the secret X-Origin-Verify header; the README says how an organisation with a domain switches the origin to HTTPS only.",
             },
             {
                 "id": "AwsSolutions-ECS2",

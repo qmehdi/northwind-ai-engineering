@@ -6,7 +6,9 @@
 The same `gate` as `nw.semantic.promote`, fed by the export report and the benchmark the
 previous steps wrote, with the bars as arguments. Nothing moves `latest`: the register step
 and a human approval do that. The decision is written into the version directory and into
-`steps/semantic_gate.json`, whose `passed_int` a SageMaker ConditionStep compares.
+`steps/semantic_gate.json`, whose `passed_int` a SageMaker ConditionStep compares. The champion
+and the production summary follow `triage_evaluate`: `--champion registry` compares against the
+live version, a named summary that does not exist fails the step, `none` means a first model.
 """
 
 from __future__ import annotations
@@ -18,7 +20,15 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from nw.pipelines.steps import add_flag, localize, truthy, write_json, write_result
+from nw.pipelines.champion import CHAMPIONS, choose, tenant_for_steps
+from nw.pipelines.steps import (
+    add_flag,
+    local_path,
+    truthy,
+    write_json,
+    write_result,
+)
+from nw.platform.base import ModelRegistry, Tenant
 from nw.semantic.artifacts import newest_candidate
 from nw.semantic.promote import (
     PRODUCTION_SUMMARY,
@@ -27,28 +37,44 @@ from nw.semantic.promote import (
     format_decision,
     gate,
     summary,
+    write_serving,
 )
 
 STEP = "semantic_gate"
 
 
 def run(
-    out: Path,
+    out: Path | str,
     version: str | None = None,
     *,
-    production_summary: Path = PRODUCTION_SUMMARY,
+    production_summary: str | Path | None = None,
     policy: GatePolicy | None = None,
     force: bool = False,
+    champion: str = "summary",
+    registry: ModelRegistry | None = None,
+    tenant: Tenant | None = None,
 ) -> dict[str, Any]:
-    out = Path(out)
+    out = local_path(out)
     version = version or newest_candidate(out).name
     candidate = summary(out / version)
-    production = current_production(out, localize(production_summary, ".json"))
+    production, champion_source = choose(
+        "semantic",
+        out,
+        production_summary,
+        champion,
+        summarise=summary,
+        default=PRODUCTION_SUMMARY,
+        current=current_production,
+        registry=registry,
+        tenant=tenant,
+    )
     if production and production["version"] == candidate["version"]:
         production = None
     decision = gate(candidate, production, policy)
     if force and not decision.passed:
         decision.passed, decision.forced = True, True
+    if decision.passed:  # the graph to serve travels with the artifact, as in nw.semantic.promote
+        write_serving(out / version, decision)
     result = {
         "step": STEP,
         "pipeline": "semantic",
@@ -63,7 +89,8 @@ def run(
             "int8_priority_macro_f1": candidate["benchmark"]["int8"]["priority_macro_f1"],
             "max_abs_diff_fp32": candidate["export"]["max_abs_diff_fp32"],
         },
-        "production_summary": str(production_summary),
+        "production_summary": str(production_summary or PRODUCTION_SUMMARY),
+        "champion_source": champion_source,
     }
     write_json(out / version / "gate.json", result)
     write_result(out, STEP, result)
@@ -102,9 +129,16 @@ def policy_from(args: argparse.Namespace) -> GatePolicy:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--out", type=Path, default=Path("artifacts/semantic"))
+    ap.add_argument("--out", default="artifacts/semantic", help="the run's tree: a path or URI")
     ap.add_argument("--version", default=None, help="artifact version; default is the newest")
-    ap.add_argument("--production-summary", type=Path, default=PRODUCTION_SUMMARY)
+    ap.add_argument(
+        "--production-summary",
+        default=None,
+        help=f"a path or URI that must exist, or `none`; default {PRODUCTION_SUMMARY} if present",
+    )
+    ap.add_argument("--champion", choices=CHAMPIONS, default="summary")
+    ap.add_argument("--tenant", default=None, help="whose live version is the champion")
+    ap.add_argument("--environment", default=None)
     add_flag(ap, "--force", "pass the gate anyway, recorded as forced")
     ap.add_argument(
         "--strict", action="store_true", help="exit 1 on a failed gate instead of recording it"
@@ -117,6 +151,10 @@ def main(argv: list[str] | None = None) -> int:
         production_summary=args.production_summary,
         policy=policy_from(args),
         force=truthy(args.force),
+        champion=args.champion,
+        tenant=tenant_for_steps(args.tenant, args.environment)
+        if args.champion == "registry"
+        else None,
     )
     return 1 if args.strict and not result["passed"] else 0
 

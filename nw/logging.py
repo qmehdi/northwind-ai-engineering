@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import re
 import sys
 import time
 import uuid
@@ -45,10 +46,24 @@ def new_correlation_id() -> str:
     return uuid.uuid4().hex[:16]
 
 
+# What a caller may send as `x-correlation-id`: short, and only characters that are safe in a
+# log line, a span attribute, a header and a file name. Anything else is replaced, so a
+# client cannot inject fake log fields, newlines or a path through the header.
+CORRELATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+
+def valid_correlation_id(value: str | None) -> str | None:
+    """`value` when it is a well-formed correlation ID, else None."""
+    if value and CORRELATION_ID_RE.fullmatch(value):
+        return value
+    return None
+
+
 @contextmanager
 def bind_correlation_id(value: str | None = None) -> Iterator[str]:
-    """Set the correlation ID for the duration of a block."""
-    cid = value or new_correlation_id()
+    """Set the correlation ID for the duration of a block. A missing or malformed value (a
+    header is caller input) gets a fresh ID instead."""
+    cid = valid_correlation_id(value) or new_correlation_id()
     token = _correlation_id.set(cid)
     try:
         yield cid

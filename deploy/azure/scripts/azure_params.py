@@ -79,11 +79,17 @@ def params(path: str) -> None:
         "retrainEnabled": e.get("NW_RETRAIN_ENABLED", "false") == "true",
         "endpointScope": e["NW_ENDPOINT_SCOPE"],
         "apiKey": e["NW_API_KEY_VALUE"],
+        "apiKeys": json.loads(e.get("NW_API_KEYS", "{}") or "{}"),
+        "tenantTokensPerMonth": int(e.get("NW_TENANT_TOKENS_PER_MONTH", "6000000")),
+        "egressControl": e.get("NW_EGRESS_CONTROL", "true") != "false",
+        "euFoundry": e.get("NW_AZURE_EU", "true") != "false",
+        "euLocation": e.get("NW_AZURE_EU_LOCATION", "swedencentral"),
         "adminObjectId": e.get("NW_ADMIN_OBJECT_ID", ""),
         "adminPrincipalType": e.get("NW_ADMIN_PRINCIPAL_TYPE", "User"),
         "githubRepository": e.get("NW_GITHUB_REPOSITORY", ""),
         "azureDevOpsIssuer": e.get("NW_ADO_ISSUER", ""),
         "azureDevOpsSubject": e.get("NW_ADO_SUBJECT", ""),
+        "azureDevOpsBuilderSubject": e.get("NW_ADO_BUILDER_SUBJECT", ""),
         "endpointTraffic": json.loads(e.get("NW_ENDPOINT_TRAFFIC", "{}") or "{}"),
         "liveApps": json.loads(e.get("NW_LIVE_APPS", "{}") or "{}"),
     }
@@ -92,6 +98,7 @@ def params(path: str) -> None:
     if values["gatewayKind"] == "litellm":
         values["litellmMasterKey"] = e["NW_LITELLM_MASTER_KEY"]
         values["postgresPassword"] = e["NW_POSTGRES_PASSWORD"]
+        values["litellmSaltKey"] = e["NW_LITELLM_SALT_KEY"]
         values["gatewayKeys"] = json.loads(e["NW_GATEWAY_KEYS"])
     doc = {
         "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
@@ -135,9 +142,10 @@ def show_tenants() -> None:
             "retrain_schedule",
             "search_index",
             "gateway_key_secret",
+            "api_key_secret",
             "artifacts_prefix",
         ):
-            value = ", ".join(t[k]) if isinstance(t[k], list) else t[k]
+            value = ", ".join(t[k]) if isinstance(t.get(k), list) else t.get(k, "")
             print(f"  {k:22} {value}")
         for a in apps:
             if a["owner"] == t["tenant"]:

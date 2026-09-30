@@ -1,0 +1,12 @@
+{"text": "Bitte überweisen Sie auf DE89 3704 0044 0532 0130 00, Kontoinhaberin ist Anke Morvhagen.", "spans": [{"start": 25, "end": 52, "label": "IBAN", "value": "DE89 3704 0044 0532 0130 00"}, {"start": 73, "end": 87, "label": "NAME", "value": "Anke Morvhagen"}]}
+{"text": "Rufen Sie mich unter 030 23125 456 an oder mobil 0171 3920084.", "spans": [{"start": 21, "end": 34, "label": "PHONE", "value": "030 23125 456"}, {"start": 49, "end": 61, "label": "PHONE", "value": "0171 3920084"}]}
+{"text": "You can reach me on (312) 555-0110 or 415-555-0193.", "spans": [{"start": 20, "end": 34, "label": "PHONE", "value": "(312) 555-0110"}, {"start": 38, "end": 50, "label": "PHONE", "value": "415-555-0193"}]}
+{"text": "Invoice #NW-88214 was charged twice on account NW-10007.", "spans": [{"start": 9, "end": 17, "label": "INVOICE", "value": "NW-88214"}, {"start": 47, "end": 55, "label": "ACCOUNT", "value": "NW-10007"}]}
+{"text": "Please send the corrected invoice INV-20481 to lena.lindholt@example.net.", "spans": [{"start": 34, "end": 43, "label": "INVOICE", "value": "INV-20481"}, {"start": 47, "end": 72, "label": "EMAIL", "value": "lena.lindholt@example.net"}]}
+{"text": "Our developer pasted our key nw_test_7mma69cck66zzir8ywbqcdpe into the ticket.", "spans": [{"start": 29, "end": 61, "label": "KEY", "value": "nw_test_7mma69cck66zzir8ywbqcdpe"}]}
+{"text": "Traffic moved to 192.0.2.201 and 2001:db8::17 after the change.", "spans": [{"start": 17, "end": 28, "label": "IP", "value": "192.0.2.201"}, {"start": 33, "end": 45, "label": "IP", "value": "2001:db8::17"}]}
+{"text": "Card 4111 1111 1111 1111 was declined.", "spans": [{"start": 5, "end": 24, "label": "CARD", "value": "4111 1111 1111 1111"}]}
+{"text": "Ship the hardware to Fiktivallee 87, 10115 Musterstadt, attention Jonas Kastwald.", "spans": [{"start": 21, "end": 35, "label": "ADDRESS", "value": "Fiktivallee 87"}, {"start": 37, "end": 54, "label": "ADDRESS", "value": "10115 Musterstadt"}, {"start": 66, "end": 80, "label": "NAME", "value": "Jonas Kastwald"}]}
+{"text": "The owner is Priya Sallwald, phone +1 617 555 0159.", "spans": [{"start": 13, "end": 27, "label": "NAME", "value": "Priya Sallwald"}, {"start": 35, "end": 50, "label": "PHONE", "value": "+1 617 555 0159"}]}
+{"text": "Our SLA is 99.95 percent since 2025-03-01; response within 30 days, see sla-2025.", "spans": []}
+{"text": "Ticket T-200001 was answered in 15 minutes by the Support Engineer team.", "spans": []}

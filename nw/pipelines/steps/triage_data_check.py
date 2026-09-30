@@ -14,13 +14,14 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from nw.pipelines.steps import localize, write_json, write_result
+from nw.pipelines.steps import local_path, localize, write_json, write_result
 from nw.triage.data_check import check_file, format_profile
 
 STEP = "triage_data_check"
 
 
-def run(data: Path, out: Path) -> dict[str, Any]:
+def run(data: Path | str, out: Path | str) -> dict[str, Any]:
+    out = local_path(out)
     profile = check_file(localize(data))
     write_json(Path(out) / "data_profile.json", asdict(profile))
     result = {
@@ -39,8 +40,10 @@ def run(data: Path, out: Path) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--data", type=Path, default=Path("data/tickets.jsonl"))
-    ap.add_argument("--out", type=Path, default=Path("artifacts/triage"))
+    ap.add_argument("--data", default="data/tickets.jsonl", help="a path, gs:// or s3:// URI")
+    ap.add_argument(
+        "--out", default="artifacts/triage", help="the artifact tree: a path or gs:// URI"
+    )
     args = ap.parse_args(argv)
     return 0 if run(args.data, args.out)["ok"] else 1
 

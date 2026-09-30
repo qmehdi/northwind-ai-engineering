@@ -49,7 +49,7 @@ class TriageModel:
 
     def decide(self, proba: np.ndarray) -> tuple[str, str]:
         """The decision rule. Returns (priority, rule name)."""
-        return PRIORITIES[int(np.argmax(proba))], "argmax"  # Step 4: protect P0
+        return PRIORITIES[int(np.argmax(proba))], "argmax"  # threshold step: protect P0
 
     def predict(self, tickets: list[dict[str, Any]]) -> list[TriageResult]:
         out = []
@@ -81,11 +81,22 @@ class TriageModel:
         return directory
 
     @classmethod
-    def load(cls, directory: Path) -> TriageModel:
+    def load(cls, directory: Path, *, expected_sha256: str | None = None) -> TriageModel:
+        """Load an artifact, but only one whose bytes are known. `joblib.load` runs pickle,
+        which executes whatever the file says, so the file's SHA-256 must match a hash
+        recorded somewhere else first: `expected_sha256` from the registry entry when the
+        caller has one (the stronger check, the hash does not travel with the file), else
+        the `model_sha256` the training run wrote into `metadata.json`. No hash, no load."""
         meta = json.loads((directory / "metadata.json").read_text())
         model_path = directory / "model.joblib"
+        expected = expected_sha256 or meta.get("model_sha256")
+        if not expected:
+            raise ValueError(
+                f"{model_path}: no expected SHA-256 (registry entry or metadata.json "
+                "model_sha256); refusing to unpickle an unverified file"
+            )
         actual = sha256_of(model_path)
-        if meta.get("model_sha256") and meta["model_sha256"] != actual:
+        if expected != actual:
             raise ValueError(f"{model_path}: checksum mismatch, artifact is corrupt or mixed")
         return cls(
             pipeline=joblib.load(model_path),

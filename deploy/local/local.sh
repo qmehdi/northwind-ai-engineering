@@ -1,9 +1,12 @@
 #!/bin/sh
 # The Local track's operations, behind the Makefile's local-* targets (ADR 0011).
-#   deploy/local/local.sh up | down | pull | status | wait | higher-up | bootstrap
+#   deploy/local/local.sh up | down | pull | status | wait | higher-up | bootstrap | secrets
 # Environment: OBSERVABILITY=0 leaves the collector, Jaeger, Prometheus and Grafana out;
-# GPU=1 adds docker-compose.gpu.yml and the gpu profile; NW_IMAGE_TAG tags the course images
+# GPU=1 adds docker-compose.gpu.yml and the gpu profile; SMALL=1 adds docker-compose.small.yml
+# (qwen3:4b instead of gpt-oss:20b, for a 16 GB Mac); NW_IMAGE_TAG tags the course images
 # (default dev); NW_REGISTRY is the local registry (default localhost:5050).
+# `up` first runs deploy/local/secrets.sh: the stack's secrets are generated into .env (untracked)
+# on the first start; nothing in the repository holds a usable one.
 set -eu
 cd "$(dirname "$0")/../.."
 
@@ -11,6 +14,7 @@ FILES="-f docker-compose.yml"
 PROFILES="--profile platform"
 if [ "${OBSERVABILITY:-1}" = "1" ]; then PROFILES="$PROFILES --profile observability"; fi
 if [ "${GPU:-0}" = "1" ]; then FILES="$FILES -f docker-compose.gpu.yml"; PROFILES="$PROFILES --profile gpu"; fi
+if [ "${SMALL:-0}" = "1" ]; then FILES="$FILES -f docker-compose.small.yml"; fi
 # Images the course builds itself, pushed to the local registry so every service pulls a tag.
 BUILT="triage semantic policy resolver agent agent-triage agent-policy agent-resolution mcp mlflow rustfs-init evidently drift-reports serving-stable serving-canary"
 
@@ -42,6 +46,7 @@ status() {
 
 case "${1:-}" in
   up)
+    deploy/local/secrets.sh
     compose up -d registry
     wait_healthy 60 registry
     compose build triage                       # the serving image derives from it
@@ -54,12 +59,20 @@ case "${1:-}" in
       --build-arg "EXTRAS=--extra dl --extra mlops --extra pipelines" -t nw-pipelines:latest .
     compose up -d
     echo; echo "waiting for the platform (the first start also pulls llama-guard3:1b and gpt-oss:20b in the background)"
-    wait_healthy 240 postgres rustfs mlflow qdrant ollama litellm proxy evidently triage
+    # The triage service is ready only with a model; a fresh fork has none until the pre-work's
+    # first training run, so the platform alone is waited for then.
+    if [ -e artifacts/triage/latest ]; then
+      wait_healthy 240 postgres rustfs mlflow qdrant ollama litellm proxy evidently triage
+    else
+      wait_healthy 240 postgres rustfs mlflow qdrant ollama litellm proxy evidently
+      echo "no artifacts/triage/latest yet: the course services report not ready until make train-triage, then make local-bootstrap"
+    fi
     if [ -e artifacts/triage/latest ]; then
       echo; echo "registering artifacts/triage/latest as the live triage model"
       uv run python -m nw.platform.local bootstrap || echo "bootstrap failed; run make local-bootstrap after make train-triage"
     fi
     echo; status
+    echo; echo "every port is on 127.0.0.1 only; your gateway key is NW_GATEWAY_KEY in .env, the tenants' in deploy/local/litellm/tenant-keys.tsv"
     ;;
   down)
     compose --profile higher down
@@ -78,6 +91,9 @@ case "${1:-}" in
   bootstrap)
     uv run python -m nw.platform.local bootstrap
     ;;
+  secrets)
+    deploy/local/secrets.sh
+    ;;
   *)
-    echo "usage: $0 up|down|pull|status|wait|higher-up|bootstrap"; exit 2 ;;
+    echo "usage: $0 up|down|pull|status|wait|higher-up|bootstrap|secrets"; exit 2 ;;
 esac

@@ -98,8 +98,36 @@ def test_without_a_key_the_bucket_is_per_client_address():
         assert c.post("/work").status_code == 200
     assert c.post("/work").status_code == 429
     assert _limited("ip") == before + 1, "the label is the constant `ip`, never the address"
-    assert c.post("/work", headers={"x-forwarded-for": "203.0.113.9, 10.0.0.1"}).status_code == 200
+    # A forged X-Forwarded-For does not buy a fresh bucket: with no trusted proxy it is ignored.
+    spoofed = {"x-forwarded-for": "203.0.113.9, 10.0.0.1"}
+    assert c.post("/work", headers=spoofed).status_code == 429
     assert {s.split(":", 1)[0] for s in buckets._buckets} == {"ip"}
+
+
+def test_behind_a_trusted_proxy_the_address_it_appended_is_used(monkeypatch):
+    monkeypatch.setenv("NW_TRUSTED_PROXY_HOPS", "1")
+    clock = Clock()
+    c, buckets = make("", clock)
+    # The proxy appends the real peer last; whatever the client wrote before it is not trusted.
+    for forged in ("1.1.1.1", "2.2.2.2", "3.3.3.3"):
+        headers = {"x-forwarded-for": f"{forged}, 198.51.100.7"}
+        assert c.post("/work", headers=headers).status_code == 200
+    headers = {"x-forwarded-for": "4.4.4.4, 198.51.100.7"}
+    assert c.post("/work", headers=headers).status_code == 429
+    other = {"x-forwarded-for": "4.4.4.4, 198.51.100.8"}
+    assert c.post("/work", headers=other).status_code == 200
+    assert "ip:198.51.100.7" in buckets._buckets
+
+
+def test_failed_key_checks_are_limited_per_address(monkeypatch):
+    monkeypatch.setenv("NW_AUTH_FAIL_BURST", "3")
+    monkeypatch.setenv("NW_AUTH_FAIL_RPS", "0.001")
+    clock = Clock()
+    c, _ = make("s3cret", clock, rps=100.0, burst=100)
+    codes = [c.post("/work", headers={"x-api-key": f"guess-{i}"}).status_code for i in range(5)]
+    assert codes == [401, 401, 401, 429, 429]
+    ok = c.post("/work", headers={"x-api-key": "s3cret"})
+    assert ok.status_code == 200, "the right key is never locked out"
 
 
 def test_defaults_and_off_switch(monkeypatch):

@@ -1,6 +1,7 @@
 # Retrain Project 2 on demand: validate the data, train a candidate, export it, benchmark
-# it against Project 1, run the promotion gate against the committed production summary,
-# and publish the model card and the artifact. Promotion to serving is the deploy step;
+# it against Project 1, run the promotion gate against the committed production summary
+# (the absolute bars apply to the graph that will be served: int8 when it clears them, else
+# fp32, recorded in serving.json), and publish the model card and the artifact. Promotion to serving is the deploy step;
 # this workflow never changes what is served on its own.
 #
 # On demand only: a GitHub-hosted CPU runner trains the 2,000 ticket subset at roughly
@@ -19,6 +20,11 @@ on:
         description: "Promote despite a failed gate (recorded as forced in the summary)"
         type: boolean
         default: false
+      reason:
+        description: "Why; required with force, recorded on the decision"
+        default: "manual retrain"
+permissions:
+  contents: read
 jobs:
   retrain:
     runs-on: ubuntu-latest
@@ -26,8 +32,10 @@ jobs:
     env:
       TOKENIZERS_PARALLELISM: "false"
     steps:
-      - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
       - run: uv sync --locked --extra dev --extra dl
       - name: Validate the data
         run: uv run python -m nw.triage.data_check
@@ -45,22 +53,24 @@ jobs:
         run: uv run python -m nw.semantic.export | tee export.log
       - name: Benchmark against Project 1
         run: uv run python -m nw.semantic.benchmark --triage "$TRIAGE" | tee benchmark.log
-      - name: Promotion gate against the committed production summary
+      - name: Promotion gate against the committed production summary (picks the served graph)
         id: gate
+        env:
+          NW_ACTOR: ${{ github.actor }}
+          REASON: ${{ inputs.reason }}
         run: |
           uv run python -m nw.semantic.promote --summary data/golden/semantic_production.json \
-            ${{ inputs.force && '--force' || '' }} | tee gate.log
+            --reason "$REASON" ${{ inputs.force && '--force' || '' }} | tee gate.log
         continue-on-error: true
       - name: Summary
         run: |
           { echo "## Retrain Project 2"; echo; echo '```'; grep -E "^(parameters|epoch .* val|test:)" train.log; echo; cat benchmark.log; echo; cat gate.log; echo '```'; echo; cat artifacts/semantic/latest/MODEL_CARD.md 2>/dev/null || cat artifacts/semantic/*/MODEL_CARD.md; } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: semantic-candidate
           path: |
             artifacts/semantic/*/
             !artifacts/semantic/latest
-            !artifacts/semantic/*/model.onnx
             !artifacts/semantic/*/checkpoint.pt
           retention-days: 30
       - name: Fail the job if the gate failed

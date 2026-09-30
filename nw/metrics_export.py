@@ -12,13 +12,22 @@ platform's log pipeline turn the line into metrics:
   `PutMetricData` call, no extra IAM.
 - `NW_METRICS_FORMAT=json` (set by Terraform, and the default): a plain JSON line with
   `msg` `metrics_snapshot` and numeric fields. Log-based metrics in
-  `deploy/gcp/session/main.tf` extract them with `EXTRACT(jsonPayload.<field>)`.
+  `deploy/gcp/modules/observability/main.tf` extract them with `EXTRACT(jsonPayload.<field>)`.
 
 Counters are exported as the change since the previous line, so a Sum over a minute is
 that minute's count. The p95 is computed from the histogram buckets of the same interval.
-Gauges (drift level) are the value at the time of the line. The allowlist in `SERIES` is
-the whole set: a service exports at most `MAX_FIELDS` numbers whatever its registry
-holds, so the cardinality in the cloud is bounded by construction, not by discipline.
+Gauges (drift level and the quality canary signals) are the value at the time of the line.
+The allowlist in `SERIES` is the whole set: a service exports at most `MAX_FIELDS` numbers
+whatever its registry holds, so the cardinality in the cloud is bounded by construction, not
+by discipline.
+
+The quality canary signals (`Series.quality`, set by the monitors in `nw/*/monitor.py`) are
+what a release bakes on besides 5xx and latency: the quality level of every service
+(`QualityLevel`, 0 ok, 1 watch, 2 alert, -1 warming up), the predicted P0 share and its
+ratio to the validation share and the shadow agreement for triage and semantic
+(`P0Share`, `P0ShareRatio`, `ShadowAgreement`), the refusal rate and its ratio to the
+baseline for policy (`RefusalRate`, `RefusalRatio`), and the mean Judge score of sampled
+live turns for the agent (`JudgeScore`).
 
 On Lambda the sandbox is frozen between invocations, so the timer only advances while a
 request is in flight: the line for an interval is written during the first request after
@@ -46,7 +55,7 @@ log = get_logger("nw.metrics_export")
 
 NAMESPACE = "Northwind"
 MESSAGE = "metrics_snapshot"
-MAX_FIELDS = 12
+MAX_FIELDS = 16
 TERMINATIONS = ("answer", "max_steps", "budget", "error")
 
 
@@ -61,6 +70,15 @@ class Series:
     cost: str | None = None  # a cumulative family summed over its label sets
     terminations: str | None = None  # a counter with a `terminated` label
     tool_calls: str | None = None  # a counter with an `outcome` label
+    quality: Mapping[str, str] | None = None  # field name to a gauge family, current value
+
+
+_TRIAGE_QUALITY = {
+    "quality_level": "nw_triage_quality_level",
+    "p0_share": "nw_triage_predicted_p0_share",
+    "p0_share_ratio": "nw_triage_p0_share_ratio",
+    "shadow_agreement": "nw_triage_shadow_agreement",
+}
 
 
 SERIES: dict[str, Series] = {
@@ -69,12 +87,14 @@ SERIES: dict[str, Series] = {
         {"outcome": ("not_ready",)},
         "nw_triage_latency_seconds",
         "nw_triage_drift_level",
+        quality=_TRIAGE_QUALITY,
     ),
     "semantic": Series(
         "nw_semantic_requests_total",
         {"outcome": ("not_ready",)},
         "nw_semantic_latency_seconds",
         "nw_semantic_drift_level",
+        quality={k: v.replace("nw_triage_", "nw_semantic_") for k, v in _TRIAGE_QUALITY.items()},
     ),
     "policy": Series(
         "nw_policy_requests_total",
@@ -82,6 +102,11 @@ SERIES: dict[str, Series] = {
         "nw_policy_latency_seconds",
         "nw_policy_drift_level",
         cost="nw_policy_spend_usd_total",
+        quality={
+            "quality_level": "nw_policy_quality_level",
+            "refusal_rate": "nw_policy_refusal_rate",
+            "refusal_ratio": "nw_policy_refusal_ratio",
+        },
     ),
     "agent": Series(
         "nw_agent_runs_total",
@@ -91,6 +116,7 @@ SERIES: dict[str, Series] = {
         cost="nw_agent_cost_usd_total",
         terminations="nw_agent_terminations_total",
         tool_calls="nw_agent_tool_calls_total",
+        quality={"quality_level": "nw_agent_quality_level", "judge_score": "nw_agent_judge_score"},
     ),
 }
 
@@ -106,8 +132,17 @@ FIELDS: dict[str, str] = {
     "drift_level": "None",
     **{f"runs_{t}": "Count" for t in TERMINATIONS},
     "tool_errors": "Count",
+    # The quality canary signals: current values, never deltas.
+    "quality_level": "None",
+    "p0_share": "None",
+    "p0_share_ratio": "None",
+    "shadow_agreement": "None",
+    "refusal_rate": "None",
+    "refusal_ratio": "None",
+    "judge_score": "None",
 }
-assert len(FIELDS) == MAX_FIELDS
+# The per-service bound: the base twelve plus the service's own quality signals.
+assert all(12 + len(s.quality or {}) <= MAX_FIELDS for s in SERIES.values())
 
 
 def emf_name(field: str) -> str:
@@ -203,6 +238,9 @@ class Exporter:
                 raw[f"runs_{t}"] = matching(s.terminations, "terminated", (t,))
         if s.tool_calls:
             raw["tool_errors"] = matching(s.tool_calls, "outcome", ("error",))
+        for key, family in (s.quality or {}).items():
+            got = samples.get(family)
+            raw[key] = got[0][1] if got else None
         return raw
 
     def snapshot(self) -> dict[str, float]:
@@ -211,8 +249,9 @@ class Exporter:
         prev = self.previous
         self.previous = cur
         out: dict[str, float] = {}
+        quality = set(self.series.quality or {})
         for key in FIELDS:
-            if key in ("latency_p95_ms", "drift_level") or key not in cur:
+            if key in ("latency_p95_ms", "drift_level") or key in quality or key not in cur:
                 continue
             out[key] = round(max(cur[key] - prev.get(key, 0.0), 0.0), 6)
         delta_buckets = {
@@ -223,6 +262,9 @@ class Exporter:
             out["latency_p95_ms"] = p95
         if cur["drift_level"] is not None:
             out["drift_level"] = cur["drift_level"]
+        for key in quality:
+            if cur.get(key) is not None:
+                out[key] = cur[key]
         assert set(out) <= set(FIELDS) and len(out) <= MAX_FIELDS
         return out
 

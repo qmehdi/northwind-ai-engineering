@@ -2,14 +2,14 @@
  "name": "resolver",
  "kind": "resolver",
  "track": "local",
- "agent_version": "e15e6982168c",
+ "agent_version": "21bb61e80729",
  "prompt": "system@e645e8a6b564",
  "prompt_hash": "e645e8a6b564",
- "tools_version": "e0d56e06da2b",
+ "tools_version": "221e83eb6be1",
  "tools": [
   {
    "name": "check_entitlement",
-   "version": "7e89ec15b10c",
+   "version": "4efbf5863254",
    "requires_approval": false
   },
   {
@@ -34,7 +34,7 @@
   },
   {
    "name": "lookup_customer",
-   "version": "53aae0c9171c",
+   "version": "4235bba67e0e",
    "requires_approval": false
   },
   {
@@ -63,6 +63,21 @@
   "past_tickets",
   "escalation_queue"
  ],
+ "reachable_data_classes": [
+  "customer_account",
+  "entitlements",
+  "escalation_queue",
+  "past_tickets",
+  "policy_corpus",
+  "ticket_text"
+ ],
+ "governance": {
+  "eu_ai_act_class": "transparency",
+  "annex_iii_item": null,
+  "article_50_disclosure": "This reply was drafted with an AI system and checked by a Northwind support agent.",
+  "dpia_ref": "docs/governance/dpia.md#uc-resolver",
+  "privacy_approver": "privacy-office"
+ },
  "endpoints": [
   "POST /run",
   "GET /version",
@@ -70,12 +85,12 @@
   "GET /metrics"
  ],
  "evaluation": {
-  "baseline": "data/golden/agent_baseline.json",
-  "agent_version": null,
-  "written_at": "2026-09-28T00:00:00+00:00",
-  "cases": 15,
-  "success": 15,
-  "cost_usd_per_resolution": 0.10826333333333334,
+  "baseline": "data/golden/baselines/agent-offline.json",
+  "agent_version": "21bb61e80729",
+  "written_at": "2026-09-30T05:25:14.492027+00:00",
+  "cases": 35,
+  "success": 35,
+  "cost_usd_per_resolution": 0.0,
   "tiers": {
    "tool": {
     "bar": {
@@ -83,14 +98,66 @@
      "max_error_rate_per_tool": 0.2,
      "min_calls": 3
     },
-    "measured": null
+    "measured": {
+     "n": 35,
+     "passed": 35,
+     "pass_rate": 1.0,
+     "calls": 43,
+     "invalid_argument_rate": 0.0,
+     "error_rate": 0.0,
+     "per_tool": {
+      "classify_urgency": {
+       "calls": 8,
+       "errors": 0,
+       "invalid": 0,
+       "error_rate": 0.0
+      },
+      "search_policies": {
+       "calls": 19,
+       "errors": 0,
+       "invalid": 0,
+       "error_rate": 0.0
+      },
+      "escalate": {
+       "calls": 7,
+       "errors": 0,
+       "invalid": 0,
+       "error_rate": 0.0
+      },
+      "check_entitlement": {
+       "calls": 5,
+       "errors": 0,
+       "invalid": 0,
+       "error_rate": 0.0
+      },
+      "find_similar_tickets": {
+       "calls": 3,
+       "errors": 0,
+       "invalid": 0,
+       "error_rate": 0.0
+      },
+      "lookup_customer": {
+       "calls": 1,
+       "errors": 0,
+       "invalid": 0,
+       "error_rate": 0.0
+      }
+     }
+    }
    },
    "turn": {
     "bar": {
      "min_pass_rate": 0.8,
      "min_judge_mean": 3.5
     },
-    "measured": null
+    "measured": {
+     "n": 35,
+     "passed": 35,
+     "pass_rate": 1.0,
+     "judged": 35,
+     "judge_mean": 5.0,
+     "tool_precision": 1.0
+    }
    },
    "session": {
     "bar": {
@@ -98,22 +165,37 @@
      "max_extra_steps": 2.0,
      "max_cap_rate": 0.2
     },
-    "measured": null
+    "measured": {
+     "n": 35,
+     "passed": 35,
+     "pass_rate": 1.0,
+     "cap_rate": 0.0,
+     "mean_steps": 2.2285714285714286,
+     "unapproved_executions": 0
+    }
    },
    "system": {
     "bar": {
      "min_escalation_correct_rate": 1.0,
      "max_cost_ratio": 1.5
     },
-    "measured": null
+    "measured": {
+     "n": 35,
+     "passed": 35,
+     "pass_rate": 1.0,
+     "escalation_correct_rate": 1.0,
+     "escalation_rate": 0.2,
+     "resolved_without_escalation_rate": 1.0,
+     "cost_usd_per_resolution": 0.0
+    }
    }
   },
-  "note": "the baseline predates the tiers; measured values arrive with the next --write-baseline"
+  "note": null
  },
  "approval": {
   "state": "approved",
   "approver": "support-operations"
  },
  "runtime_id": null,
- "written_at": "2026-09-29T07:06:51.442389+00:00"
+ "written_at": "2026-09-30T10:03:30.571726+00:00"
 }

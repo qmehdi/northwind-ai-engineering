@@ -91,3 +91,54 @@ def test_unknown_scheme_is_refused_by_fetch(tmp_path):
     with pytest.raises(ValueError):
         fetch("ftp://x/y", tmp_path)
     assert is_uri("s3://b/k") and is_uri("models:/m/1") and not is_uri("artifacts/triage")
+
+
+class _FakeS3:
+    """A bucket whose listing a hostile writer controls."""
+
+    def __init__(self, keys):
+        self.keys = keys
+        self.written = []
+
+    def get_paginator(self, name):
+        keys = self.keys
+
+        class _P:
+            def paginate(self, **kw):
+                return [{"Contents": [{"Key": k} for k in keys]}]
+
+        return _P()
+
+    def download_file(self, bucket, key, dest):
+        self.written.append(dest)
+        Path(dest).write_text("{}")
+
+
+def _with_fake_boto3(monkeypatch, s3):
+    import sys
+    import types
+
+    monkeypatch.setitem(sys.modules, "boto3", types.SimpleNamespace(client=lambda *a, **k: s3))
+
+
+@pytest.mark.parametrize(
+    "bad_key", ["models/v1/../../escaped.json", "models/v1/../../../tmp/x", "models/v1//etc/x"]
+)
+def test_a_key_outside_the_target_is_refused(tmp_path, monkeypatch, bad_key):
+    s3 = _FakeS3(["models/v1/metadata.json", bad_key])
+    _with_fake_boto3(monkeypatch, s3)
+    target = tmp_path / "into"
+    with pytest.raises(ValueError, match="refusing object key"):
+        fetch("s3://bucket/models/v1/", target)
+    assert all(Path(p).resolve().is_relative_to(target.resolve()) for p in s3.written)
+    assert not (tmp_path / "escaped.json").exists()
+
+
+def test_the_registry_hash_travels_on_the_source(tmp_path):
+    art = _artifact(tmp_path / "a")
+    src = model_source(
+        fallback=tmp_path / "none",
+        env={"NW_MODEL_URI": f"file://{art}", "NW_MODEL_SHA256": "ABC123"},
+        into=tmp_path / "into",
+    )
+    assert src.fetched and src.expected_sha256 == "abc123"

@@ -2,14 +2,19 @@
 
 The cohort shares one deployment and one bill. A loop in one participant's notebook must
 not empty the spend cap for everyone, and an unauthenticated client hammering `/ask`
-must not turn the cold-start budget into a bill. There is no API gateway in front of the
-Session path (see docs/adr/0002), so the limit lives here, next to the key check.
+must not turn the cold-start budget into a bill. The services are reached directly, not through
+an API gateway (see docs/SECURITY.md), so the limit lives here, next to the key check.
 
-One bucket per key id (`request.state.api_key_id`, set by `nw.auth`), or per client IP
-when the service runs without a key. Each bucket holds `NW_RATE_LIMIT_BURST` tokens
-(default 30) and refills at `NW_RATE_LIMIT_RPS` (default 10). A request takes one
-token; with none left it gets 429 and a `Retry-After` in whole seconds. Probes and
-`/metrics` are exempt: the platform never waits. `NW_RATE_LIMIT_RPS=0` turns it off.
+One bucket per key id (`request.state.api_key_id`, set by `nw.auth`), or per client address
+when the request carries no key (a service running open, the platform-authenticated predict
+route). The address is the TCP peer, or with `NW_TRUSTED_PROXY_HOPS=N` the N-th address from
+the right of `X-Forwarded-For`: the one the outermost proxy you run appended, which a client
+cannot forge. The leftmost entry is whatever the client sent and is never trusted.
+
+Each bucket holds `NW_RATE_LIMIT_BURST` tokens (default 30) and refills at `NW_RATE_LIMIT_RPS`
+(default 10). A request takes one token; with none left it gets 429 and a `Retry-After` in
+whole seconds. Probes and `/metrics` are exempt: the platform never waits.
+`NW_RATE_LIMIT_RPS=0` turns it off.
 
 The buckets are per process. Two Lambda instances or two Cloud Run instances each allow
 the full rate, which is the accepted imprecision of doing this in the service: the cap
@@ -29,11 +34,12 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from prometheus_client import Counter
 
-from nw.auth import OPEN_PATHS
 from nw.logging import get_logger, log_fields
 
 log = get_logger("nw.ratelimit")
 
+# Probes and the scraper, never limited; `exempt_paths(app)` is the app's own copy.
+EXEMPT_PATHS = frozenset({"/healthz", "/readyz", "/metrics"})
 DEFAULT_RPS = 10.0
 DEFAULT_BURST = 30
 MAX_SUBJECTS = 10_000  # buckets kept before the least recently seen is dropped
@@ -67,6 +73,10 @@ class TokenBuckets:
         self._max = max_subjects
         self._buckets: OrderedDict[str, Bucket] = OrderedDict()
 
+    def reset(self) -> None:
+        """Forget every subject: each starts again with a full bucket (tests, an operator)."""
+        self._buckets.clear()
+
     def take(self, subject: str) -> float:
         now = self._clock()
         bucket = self._buckets.get(subject)
@@ -88,6 +98,35 @@ class TokenBuckets:
         return len(self._buckets)
 
 
+def trusted_hops(env: dict[str, str] | None = None) -> int:
+    e = os.environ if env is None else env
+    try:
+        return max(0, int(e.get("NW_TRUSTED_PROXY_HOPS") or 0))
+    except ValueError:
+        return 0
+
+
+def client_address(request: Request, hops: int | None = None) -> str:
+    """The client address to bucket by. With `hops` trusted proxies in front (a load balancer,
+    Cloud Run's front end), the address the outermost of them appended to `X-Forwarded-For`;
+    with none, the TCP peer. A header shorter than the trusted chain falls back to the peer."""
+    hops = trusted_hops() if hops is None else hops
+    peer = request.client.host if request.client else "unknown"
+    if hops <= 0:
+        return peer
+    chain = [h.strip() for h in request.headers.get("x-forwarded-for", "").split(",") if h.strip()]
+    return chain[-hops] if len(chain) >= hops else peer
+
+
+def exempt_paths(app: FastAPI) -> set[str]:
+    """The paths this app never limits: the probes, `/metrics`, and what the app added."""
+    paths = getattr(app.state, "nw_rate_exempt", None)
+    if paths is None:
+        paths = set(EXEMPT_PATHS)
+        app.state.nw_rate_exempt = paths
+    return paths
+
+
 def subject_of(request: Request) -> tuple[str, str]:
     """(bucket subject, metric label). The key id when the request carried a known key,
     else the client address. The metric label for an address is the constant `ip`: the
@@ -95,11 +134,7 @@ def subject_of(request: Request) -> tuple[str, str]:
     key_id = getattr(request.state, "api_key_id", None)
     if key_id:
         return f"key:{key_id}", key_id
-    forwarded = request.headers.get("x-forwarded-for", "")
-    host = forwarded.split(",")[0].strip() if forwarded else ""
-    if not host:
-        host = request.client.host if request.client else "unknown"
-    return f"ip:{host}", "ip"
+    return f"ip:{client_address(request)}", "ip"
 
 
 def settings_from_env() -> tuple[float, int]:
@@ -115,10 +150,12 @@ def install_rate_limit(
     rps: float | None = None,
     burst: int | None = None,
     clock: Callable[[], float] = time.monotonic,
-    exempt: frozenset[str] | set[str] = OPEN_PATHS,
+    exempt: frozenset[str] | set[str] | None = None,
+    only: frozenset[str] | set[str] | None = None,
 ) -> TokenBuckets | None:
     """Add the limiter to `app`. Register it before `install_api_key` so it runs after the
     key check and sees the key id (Starlette runs the last-added middleware first).
+    `exempt` adds paths to the app's exempt set; `only` limits the limiter to those paths.
     Returns the buckets, or None when the limiter is off."""
     env_rps, env_burst = settings_from_env()
     rps = env_rps if rps is None else rps
@@ -127,10 +164,17 @@ def install_rate_limit(
         log.info("rate limiting off", extra=log_fields(env="NW_RATE_LIMIT_RPS"))
         return None
     buckets = TokenBuckets(rps, burst, clock=clock)
+    # `exempt` is kept as given and asked with `in`, so a container with its own rule (every
+    # path but a few) works as well as a set of paths.
+    extra = exempt if exempt is not None else frozenset()
+    scope = frozenset(only) if only is not None else None
 
     @app.middleware("http")
     async def rate_limit(request: Request, call_next):
-        if request.url.path in exempt or request.method == "OPTIONS":
+        path = request.url.path
+        if scope is not None and path not in scope:
+            return await call_next(request)
+        if path in exempt_paths(app) or path in extra or request.method == "OPTIONS":
             return await call_next(request)
         subject, label = subject_of(request)
         wait = buckets.take(subject)

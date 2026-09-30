@@ -30,7 +30,9 @@ class Price:
     cache_write_per_mtok: float
 
 
-_SONNET = Price(2.00, 10.00, 0.20, 2.50)
+# Claude Sonnet 5 first-party list price, 3 and 15 USD per MTok as ADR 0010 states; the
+# 2 and 10 launch price ended 2026-08-31 (audit 2026-09-29, 03 L1).
+_SONNET = Price(3.00, 15.00, 0.30, 3.75)
 _OPUS = Price(5.00, 25.00, 0.50, 6.25)
 _HAIKU = Price(1.00, 5.00, 0.10, 1.25)
 # Bedrock global endpoint price for Sonnet 5 from 2026-09-01 (launch pricing ended
@@ -47,7 +49,14 @@ _GPT_OSS_20B_GOOGLE = Price(0.07, 0.25, 0.007, 0.07)
 # Mistral Small 3.1 has no prompt caching on Foundry.
 _GPT_OSS_120B_AZURE = Price(0.15, 0.60, 0.15, 0.15)
 _MISTRAL_SMALL_AZURE = Price(0.10, 0.30, 0.10, 0.10)
+# Mistral Large 3, the EU Workhorse and Economy on Foundry (Data Zone Standard, EU). 0.50 and
+# 1.50 USD per MTok is the Global Standard rate as reported on 2026-06-02 by a third-party
+# price tracker; confirm the Data Zone meter on the Azure pricing page in the delivery week.
+_MISTRAL_LARGE_3_AZURE = Price(0.50, 1.50, 0.50, 0.50)
 _FREE = Price(0.0, 0.0, 0.0, 0.0)
+# The fake provider's Workhorse: a fixed synthetic rate so the meter tests do not move when a
+# vendor price does.
+_FAKE_WORKHORSE = Price(2.00, 10.00, 0.20, 2.50)
 
 PRICES: dict[str, Price] = {
     # first-party and Vertex IDs
@@ -59,6 +68,10 @@ PRICES: dict[str, Price] = {
     "anthropic.claude-sonnet-5": _SONNET_BEDROCK,
     "anthropic.claude-opus-5": _OPUS,
     "anthropic.claude-haiku-4-5": _HAIKU,
+    # The geo profiles: the US and EU Judge on Bedrock. Priced at Anthropic's rate like the
+    # in-region id above; a geo premium, if Bedrock charges one, is not modelled.
+    "eu.anthropic.claude-opus-5": _OPUS,
+    "us.anthropic.claude-opus-5": _OPUS,
     # Bedrock open-weight and Nova ids, plain and under the geo profiles
     "openai.gpt-oss-120b-1:0": _GPT_OSS_120B_BEDROCK,
     "us-gov.openai.gpt-oss-120b-1:0": _GPT_OSS_120B_BEDROCK,
@@ -74,20 +87,29 @@ PRICES: dict[str, Price] = {
     # model id); claude-opus-5 above is Anthropic's rate, which is what Foundry bills.
     "gpt-oss-120b": _GPT_OSS_120B_AZURE,
     "mistral-small-2503": _MISTRAL_SMALL_AZURE,
+    "Mistral-Large-3": _MISTRAL_LARGE_3_AZURE,
     # Ollama tags on the Local track
     "gpt-oss:120b": _FREE,
     "gpt-oss:20b": _FREE,
+    "qwen3:4b": _FREE,  # SMALL=1 on a 16 GB Mac
     # fake provider used by tests: priced like the real roles so tests exercise the meter
-    "fake-workhorse": _SONNET,
+    "fake-workhorse": _FAKE_WORKHORSE,
     "fake-judge": _OPUS,
     "fake-economy": _HAIKU,
+    "fake-workhorse-eu": _FAKE_WORKHORSE,
+    "fake-judge-eu": _OPUS,
+    "fake-economy-eu": _HAIKU,
 }
+
+# A LiteLLM gateway names the EU deployments `eu/<id>` (`nw.config.GATEWAY_EU_PREFIX`).
+_GATEWAY_EU_PREFIX = "eu/"
 
 FALLBACK = _SONNET
 
 
 def price_for(model: str) -> tuple[Price, bool]:
     """Return the price and whether it was a fallback."""
+    model = model.removeprefix(_GATEWAY_EU_PREFIX)
     if model in PRICES:
         return PRICES[model], False
     return FALLBACK, True

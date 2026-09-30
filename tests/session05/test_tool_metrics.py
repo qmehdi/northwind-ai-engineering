@@ -75,7 +75,13 @@ def test_service_counts_tool_calls_latency_and_terminations(make_agent_app):
     lat0 = _sample("nw_agent_tool_latency_seconds_count", tool="lookup_customer")
     ans0 = _sample("nw_agent_terminations_total", terminated="answer")
     with TestClient(app) as c:
-        r = c.post("/run", json={"task": "Ticket T-100001 from account NW-10000: breach?"})
+        r = c.post(
+            "/run",
+            json={
+                "task": "Ticket T-100001 from account NW-10000: breach?",
+                "account_id": "NW-10000",
+            },
+        )
         assert r.status_code == 200 and r.json()["terminated"] == "answer"
         text = c.get("/metrics").text
     assert _sample("nw_agent_tool_calls_total", tool="lookup_customer", outcome="ok") == ok0 + 1

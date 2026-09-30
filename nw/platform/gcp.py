@@ -12,17 +12,26 @@ a traffic split) and the live Cloud Run services come from Cloud Deploy.
 
 What the platform has no resource or API for is kept in the artifacts bucket:
 - stages of prompt versions (prompt management has versions, not stages)
-- the stage audit trail of model versions (aliases move, the reason is logged here)
+- the stage log of model versions (aliases hold `live` and `approved`; the log holds the
+  reasons and the stages no alias can, `candidate` and `retired`)
 - the agent registry document `agents/agents.json`
+- the live endpoints' canary record `<environment>-live/endpoints/<name>.json`
+- the RAG corpus's metadata `<prefix>/rag/<collection>/meta.json`
+
+Documents shared by several writers (the agent registry, the stage logs, prompt indexes) are
+written read-modify-write with a generation precondition (`if_generation_match`) and retried
+on a conflict, so two learners of a cohort never overwrite each other's update.
 """
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
 import re
 import time
+import urllib.parse
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -31,6 +40,8 @@ from typing import Any
 
 from nw.config import Settings, Track
 from nw.platform.base import (
+    STEP_BACK,
+    UNIQUE_STAGES,
     Hit,
     ModelVersion,
     PipelineRun,
@@ -39,6 +50,8 @@ from nw.platform.base import (
     RunStatus,
     Stage,
     Tenant,
+    clamp_score,
+    default_prompt,
 )
 
 STAGE_ALIASES: tuple[str, ...] = tuple(s.value for s in Stage)
@@ -263,9 +276,21 @@ class GcpClients:
 # ----- bucket helpers ---------------------------------------------------------------------------
 
 
+class Conflict(RuntimeError):
+    """A generation precondition kept failing: another writer is updating the document."""
+
+
+def _precondition_failed(exc: BaseException) -> bool:
+    return type(exc).__name__ == "PreconditionFailed" or getattr(exc, "code", None) == 412
+
+
 class Documents:
     """JSON documents in the artifacts bucket, the store for everything the platform has no
-    resource for. Thin on purpose so a fake needs three methods."""
+    resource for. Updates of a shared document go through `update`, which reads the object's
+    generation and writes with `if_generation_match` (0 for an object that must not exist yet),
+    retrying from a fresh read when another writer got there first."""
+
+    ATTEMPTS = 8
 
     def __init__(self, clients: GcpClients, bucket: str) -> None:
         self.clients = clients
@@ -280,16 +305,50 @@ class Documents:
             return default
         return json.loads(blob.download_as_text())
 
+    def _read_versioned(self, path: str) -> tuple[Any, str | None, int]:
+        blob = self._blob(path)
+        if not blob.exists():
+            return blob, None, 0
+        blob.reload()
+        generation = int(getattr(blob, "generation", 0) or 0)
+        return blob, blob.download_as_text(if_generation_match=generation), generation
+
+    def update_text(self, path: str, mutate: Callable[[str | None], str], content_type: str) -> str:
+        for _ in range(self.ATTEMPTS):
+            blob, text, generation = self._read_versioned(path)
+            new = mutate(text)
+            try:
+                blob.upload_from_string(
+                    new, content_type=content_type, if_generation_match=generation
+                )
+                return new
+            except Exception as exc:  # noqa: BLE001  PreconditionFailed without the import
+                if not _precondition_failed(exc):
+                    raise
+        raise Conflict(f"gs://{self.bucket}/{path} kept changing under {self.ATTEMPTS} attempts")
+
+    def update(self, path: str, mutate: Callable[[Any], Any], default: Any) -> Any:
+        """Read, mutate a copy, write back only if nobody wrote in between; returns the doc."""
+        out: dict[str, Any] = {}
+
+        def apply(text: str | None) -> str:
+            doc = json.loads(text) if text is not None else copy.deepcopy(default)
+            out["doc"] = mutate(doc)
+            return json.dumps(out["doc"], indent=2, sort_keys=True)
+
+        self.update_text(path, apply, "application/json")
+        return out["doc"]
+
     def write(self, path: str, doc: Any) -> str:
+        """A document only its owner writes (one version's record): a plain overwrite."""
         self._blob(path).upload_from_string(
             json.dumps(doc, indent=2, sort_keys=True), content_type="application/json"
         )
         return f"gs://{self.bucket}/{path}"
 
     def append(self, path: str, row: Mapping[str, Any]) -> None:
-        blob = self._blob(path)
-        text = blob.download_as_text() if blob.exists() else ""
-        blob.upload_from_string(text + json.dumps(row, sort_keys=True) + "\n")
+        line = json.dumps(row, sort_keys=True) + "\n"
+        self.update_text(path, lambda text: (text or "") + line, "application/x-ndjson")
 
     def upload_dir(self, local: Path, prefix: str) -> str:
         bucket = self.clients.storage.bucket(self.bucket)
@@ -303,6 +362,13 @@ class Documents:
     def upload_text(self, path: str, text: str, content_type: str = "text/plain") -> str:
         self._blob(path).upload_from_string(text, content_type=content_type)
         return f"gs://{self.bucket}/{path}"
+
+    def delete_prefix(self, prefix: str) -> int:
+        bucket = self.clients.storage.bucket(self.bucket)
+        found = list(bucket.list_blobs(prefix=prefix))
+        for blob in found:
+            blob.delete()
+        return len(found)
 
     def download_prefix(self, uri: str, into: Path) -> Path:
         bucket_name, prefix = split_gcs(uri)
@@ -329,6 +395,22 @@ def _stage_from_aliases(aliases: Sequence[str]) -> Stage:
     return Stage.CANDIDATE
 
 
+def _stage_of(aliases: Sequence[str], logged: str | None) -> Stage:
+    """A version's stage: the `live` or `approved` alias when it holds one (aliases are unique
+    per model, so there is one holder of each); else the last stage the log recorded for it,
+    where a `live` or `approved` that lost its alias to a newer holder reads as stepped back."""
+    present = set(aliases)
+    for stage in UNIQUE_STAGES:
+        if stage.value in present:
+            return stage
+    if logged in {s.value for s in Stage}:
+        stage = Stage(logged)
+        return STEP_BACK.get(stage, stage)
+    if Stage.RETIRED.value in present:
+        return Stage.RETIRED
+    return Stage.CANDIDATE
+
+
 def _labels(tenant: Tenant, tags: Mapping[str, str]) -> dict[str, str]:
     """Vertex labels: lowercase letters, digits, underscore and dash, 63 characters."""
     out = {"tenant": tenant.name, "environment": tenant.environment}
@@ -339,11 +421,13 @@ def _labels(tenant: Tenant, tags: Mapping[str, str]) -> dict[str, str]:
 
 
 class VertexModelRegistry:
-    """Model Registry: one model per tenant and name, one version per registration, the
-    stage as a version alias (`candidate`, `approved`, `live`, `retired`). Aliases are unique
-    per model, so adding `live` to a version takes it from the previous one, which is the
-    promotion. Metrics travel in the version description; the reason of every stage change
-    is appended to `<prefix>/registry/<name>/stages.jsonl`."""
+    """Model Registry: one model per tenant and name, one version per registration. `live`
+    and `approved` are version aliases (unique per model, so the alias itself is the single
+    holder); `candidate` and `retired`, which many versions hold at once, live in the stage log
+    `<prefix>/registry/<name>/stages.jsonl`, which also records the reason of every change.
+    Moving `live` or `approved` onto a version takes the alias off the previous holder and logs
+    its step back (`retired`, `candidate`), the rules of `nw.platform.base`. Metrics travel in
+    the version description."""
 
     def __init__(self, cfg: GcpConfig, clients: GcpClients) -> None:
         self.cfg = cfg
@@ -355,20 +439,47 @@ class VertexModelRegistry:
         found = self.clients.aiplatform.Model.list(filter=f'display_name="{display}"')
         return found[0] if found else None
 
-    def _to_version(self, name: str, model: Any, version: Any | None = None) -> ModelVersion:
+    def _log_path(self, tenant: Tenant, name: str) -> str:
+        return f"{tenant.prefix}/registry/{name}/stages.jsonl"
+
+    def _logged(self, tenant: Tenant, name: str) -> dict[str, str]:
+        """The last stage the log recorded per version."""
+        blob = self.docs._blob(self._log_path(tenant, name))
+        if not blob.exists():
+            return {}
+        out: dict[str, str] = {}
+        for line in blob.download_as_text().splitlines():
+            if line.strip():
+                row = json.loads(line)
+                out[str(row.get("version"))] = str(row.get("stage"))
+        return out
+
+    def _log(self, tenant: Tenant, name: str, version: str, stage: Stage, reason: str) -> None:
+        self.docs.append(
+            self._log_path(tenant, name),
+            {"version": version, "stage": stage.value, "reason": reason, "at": _now()},
+        )
+
+    def _to_version(
+        self, name: str, model: Any, version: Any | None = None, logged: str | None = None
+    ) -> ModelVersion:
         v = version if version is not None else model
         aliases = list(getattr(v, "version_aliases", None) or [])
         desc = getattr(v, "version_description", None) or ""
         metrics: dict[str, float] = {}
+        recorded_uri = ""
         try:
-            metrics = {k: float(x) for k, x in json.loads(desc).get("metrics", {}).items()}
+            described = json.loads(desc)
+            metrics = {k: float(x) for k, x in described.get("metrics", {}).items()}
+            recorded_uri = str(described.get("artifact_uri") or "")
         except (ValueError, AttributeError):
             pass
         return ModelVersion(
             name=name,
             version=str(getattr(v, "version_id", "")),
-            stage=_stage_from_aliases(aliases),
-            uri=getattr(model, "uri", None) or getattr(v, "uri", "") or "",
+            stage=_stage_of(aliases, logged),
+            # each version's own artifact (the parent Model object is the default version)
+            uri=recorded_uri or getattr(v, "uri", None) or getattr(model, "uri", None) or "",
             metrics=metrics,
             tags=dict(getattr(model, "labels", None) or {}),
         )
@@ -390,22 +501,17 @@ class VertexModelRegistry:
             serving_container_image_uri=self.cfg.serving_image,
             parent_model=parent.resource_name if parent is not None else None,
             is_default_version=False,
-            version_aliases=[Stage.CANDIDATE.value],
-            version_description=json.dumps({"metrics": dict(metrics), "registered": _now()}),
+            version_aliases=[],
+            version_description=json.dumps(
+                {"metrics": dict(metrics), "registered": _now(), "artifact_uri": uri}
+            ),
             labels=_labels(tenant, tags),
         )
         out = self._to_version(name, model)
         out.uri = uri
         out.metrics = dict(metrics)
-        self.docs.append(
-            f"{tenant.prefix}/registry/{name}/stages.jsonl",
-            {
-                "version": out.version,
-                "stage": Stage.CANDIDATE.value,
-                "reason": "registered",
-                "at": _now(),
-            },
-        )
+        out.stage = Stage.CANDIDATE
+        self._log(tenant, name, out.version, Stage.CANDIDATE, "registered")
         return out
 
     def set_stage(
@@ -415,36 +521,47 @@ class VertexModelRegistry:
         if parent is None:
             raise KeyError(f"no model {tenant.resource(name)} in the registry")
         registry = parent.versioning_registry
-        current = [
-            v for v in registry.list_versions() if str(getattr(v, "version_id", "")) == version
-        ]
+        listed = list(registry.list_versions())
+        current = [v for v in listed if str(getattr(v, "version_id", "")) == version]
         if not current:
             raise KeyError(f"{tenant.resource(name)} has no version {version}")
+        if stage in UNIQUE_STAGES:
+            for other in listed:
+                other_id = str(getattr(other, "version_id", ""))
+                if other_id != version and stage.value in (other.version_aliases or []):
+                    registry.remove_version_aliases(
+                        version_name=other_id, alias_names=[stage.value]
+                    )
+                    self._log(
+                        tenant, name, other_id, STEP_BACK[stage], f"replaced by {version}: {reason}"
+                    )
         old = [a for a in (current[0].version_aliases or []) if a in STAGE_ALIASES]
         if old:
             registry.remove_version_aliases(version_name=version, alias_names=old)
-        registry.add_version_aliases(version_name=version, alias_names=[stage.value])
-        self.docs.append(
-            f"{tenant.prefix}/registry/{name}/stages.jsonl",
-            {"version": version, "stage": stage.value, "reason": reason, "at": _now()},
-        )
+        if stage in UNIQUE_STAGES:
+            registry.add_version_aliases(version_name=version, alias_names=[stage.value])
+        self._log(tenant, name, version, stage, reason)
         refreshed = [
             v for v in registry.list_versions() if str(getattr(v, "version_id", "")) == version
         ]
-        out = self._to_version(name, parent, refreshed[0] if refreshed else current[0])
+        out = self._to_version(name, parent, refreshed[0] if refreshed else current[0], stage.value)
         out.stage = stage
         return out
 
     def versions(self, tenant: Tenant, name: str) -> Sequence[ModelVersion]:
+        """Every version, oldest first."""
         parent = self._parent(tenant, name)
         if parent is None:
             return []
-        return [
-            self._to_version(name, parent, v) for v in parent.versioning_registry.list_versions()
+        logged = self._logged(tenant, name)
+        found = [
+            self._to_version(name, parent, v, logged.get(str(getattr(v, "version_id", ""))))
+            for v in parent.versioning_registry.list_versions()
         ]
+        return sorted(found, key=lambda v: int(v.version) if v.version.isdigit() else 0)
 
     def live(self, tenant: Tenant, name: str) -> ModelVersion | None:
-        for v in self.versions(tenant, name):
+        for v in reversed(list(self.versions(tenant, name))):
             if v.stage == Stage.LIVE:
                 return v
         return None
@@ -469,14 +586,58 @@ class VertexPipelineRunner:
 
     A named template is uploaded first to `gs://<artifacts>/<prefix>/pipelines/<pipeline>.yaml`,
     the object the tenant's Cloud Scheduler job reads for `retrain-triage`, so the weekly run and
-    the last hand submission use one definition. `upload` alone is `make pipeline-upload-gcp`."""
+    the last hand submission use one definition. `upload` alone is `make pipeline-upload-gcp`.
+
+    Every submit (and every `upload`) ships the checkout's code (`nw.pipelines.source`): the
+    bundle goes to `gs://<artifacts>/<prefix>/source/nw-source-<sha>.tar.gz` and, for the
+    scheduler, `source/latest.tar.gz`; the run gets its URI as `source_uri`, which the
+    components read through the `/gcs/` mount. `platform_env` tells the gate's champion lookup
+    and the register step that they are on this project's platform."""
 
     def __init__(
-        self, cfg: GcpConfig, clients: GcpClients, sleep: Callable[[float], None] = time.sleep
+        self,
+        cfg: GcpConfig,
+        clients: GcpClients,
+        sleep: Callable[[float], None] = time.sleep,
+        bundler: Callable[[], Any] | None = None,
     ) -> None:
         self.cfg = cfg
         self.clients = clients
         self.sleep = sleep
+        self.bundler = bundler
+
+    def source_uri(self, tenant: Tenant, name: str) -> str:
+        return f"gs://{self.cfg.artifacts_bucket}/{tenant.prefix}/source/{name}"
+
+    def ship_source(self, tenant: Tenant) -> str:
+        """Upload the checkout's source bundle (and `latest.tar.gz`); returns its URI."""
+        from nw.pipelines.source import default_bundle
+
+        bundle = (self.bundler or default_bundle)()
+        bucket = self.clients.storage.bucket(self.cfg.artifacts_bucket)
+        for name in (bundle.name, "latest.tar.gz"):
+            blob = bucket.blob(f"{tenant.prefix}/source/{name}")
+            if name == bundle.name and blob.exists():
+                continue
+            blob.upload_from_filename(str(bundle.path))
+        return self.source_uri(tenant, bundle.name)
+
+    def platform_env(self, tenant: Tenant) -> str:
+        """The `NW_*` settings a Vertex step needs to build this platform, as the JSON the
+        launcher's `--env` takes."""
+        return json.dumps(
+            {
+                "NW_TRACK": "gcp",
+                "NW_GCP_PROJECT": self.cfg.project,
+                "NW_GCP_RUN_REGION": self.cfg.region,
+                "NW_GCP_ARTIFACTS_BUCKET": self.cfg.artifacts_bucket,
+                "NW_GCP_PIPELINES_BUCKET": self.cfg.pipelines_bucket,
+                "NW_GCP_DATA_BUCKET": self.cfg.data_bucket,
+                "NW_ENVIRONMENT": tenant.environment,
+                "NW_TENANT": tenant.name,
+            },
+            sort_keys=True,
+        )
 
     def _local(self, pipeline: str) -> Path:
         path = Path(self.cfg.pipeline_dir) / f"{pipeline}.yaml"
@@ -490,7 +651,7 @@ class VertexPipelineRunner:
         """Where the tenant's compiled `pipeline` lives in the artifacts bucket."""
         return f"gs://{self.cfg.artifacts_bucket}/{tenant.prefix}/pipelines/{pipeline}.yaml"
 
-    def upload(self, tenant: Tenant, pipeline: str) -> str:
+    def upload(self, tenant: Tenant, pipeline: str, *, ship: bool = True) -> str:
         """Copy `<NW_PIPELINE_DIR>/<pipeline>.yaml` to `template_uri`, and for `triage` or
         `semantic` to the scheduler's name too (`retrain-triage.yaml`); returns the URI of
         `pipeline`."""
@@ -501,13 +662,15 @@ class VertexPipelineRunner:
         for name in names:
             bucket, blob = split_gcs(self.template_uri(tenant, name))
             self.clients.storage.bucket(bucket).blob(blob).upload_from_filename(str(local))
+        if ship:  # the scheduler's `source/latest.tar.gz` follows the template
+            self.ship_source(tenant)
         return self.template_uri(tenant, pipeline)
 
     def _template(self, tenant: Tenant, pipeline: str, params: Mapping[str, Any]) -> str:
         explicit = params.get("template_path")
         if explicit:
             return str(explicit)
-        return self.upload(tenant, pipeline)
+        return self.upload(tenant, pipeline, ship=False)
 
     def _url(self, resource_name: str) -> str:
         run_id = resource_name.rsplit("/", 1)[-1]
@@ -544,9 +707,13 @@ class VertexPipelineRunner:
         values.setdefault("environment", tenant.environment)
         for key, value in self.deployed_defaults(tenant, pipeline).items():
             values.setdefault(key, value)
+        template = self._template(tenant, pipeline, params)
+        if not values.get("source_uri"):
+            values["source_uri"] = self.ship_source(tenant)
+        values.setdefault("platform_env", self.platform_env(tenant))
         job = self.clients.aiplatform.PipelineJob(
             display_name=tenant.resource(pipeline),
-            template_path=self._template(tenant, pipeline, params),
+            template_path=template,
             pipeline_root=f"gs://{self.cfg.pipelines_bucket}/{tenant.prefix}",
             parameter_values=values,
             enable_caching=False,
@@ -607,15 +774,120 @@ def _state_name(state: Any) -> str:
 class CloudRunEndpointClient:
     """Tenant serving is the tenant's Cloud Run service reading the version's artifact through
     NW_MODEL_URI; the live target is the Vertex endpoint `northwind-live-<name>` with a traffic
-    split. `deploy(live=False)` rewrites the service's environment (a new revision),
-    `deploy(live=True, canary_percent=N)` deploys the version on the live endpoint at N percent
-    (100 when 0) and leaves the rest on what was serving. The live Cloud Run services move
-    through Cloud Deploy (`make release-gcp`), not through this client."""
+    split. `deploy(live=False)` rewrites the service's environment (a new revision). The live
+    Cloud Run services move through Cloud Deploy (`make release-gcp`), not through this client.
+
+    The live endpoint holds at most two deployed models, the stable one and one canary, and the
+    record `<environment>-live/endpoints/<name>.json` says which is which (explicit, never
+    guessed from the traffic):
+
+    - `deploy(live=True, canary_percent=N)` deploys the version as the canary at N percent;
+      the stable model keeps the rest. A canary that never finished is undeployed first.
+    - `deploy(live=True, canary_percent=0 or 100)`, or `promote`, finishes: the version (the
+      canary, when it is the one on the endpoint already, never a second copy) takes all the
+      traffic and every other deployed model is undeployed, so no replica keeps billing.
+    - `rollback` sends everything back to the stable model and undeploys the canary."""
 
     def __init__(self, cfg: GcpConfig, clients: GcpClients, api_key: str | None = None) -> None:
         self.cfg = cfg
         self.clients = clients
         self.api_key = api_key or os.environ.get("NW_API_KEY")
+        self.docs = Documents(clients, cfg.artifacts_bucket)
+
+    # ----- the live endpoint's canary record
+
+    def _record_path(self, name: str) -> str:
+        return f"{self.cfg.environment}-live/endpoints/{name}.json"
+
+    def live_record(self, name: str) -> dict[str, Any]:
+        return self.docs.read(self._record_path(name), {"stable": None, "canary": None})
+
+    def _set_record(self, name: str, stable: str | None, canary: str | None, note: str) -> None:
+        def mutate(doc: dict[str, Any]) -> dict[str, Any]:
+            history = list(doc.get("history", []))[-19:]
+            history.append({"stable": stable, "canary": canary, "note": note, "at": _now()})
+            return {"stable": stable, "canary": canary, "history": history}
+
+        self.docs.update(self._record_path(name), mutate, {"stable": None, "canary": None})
+
+    def _deployed(self, endpoint: Any) -> dict[str, Any]:
+        return {str(m.id): m for m in endpoint.list_models()}
+
+    def _finish(self, name: str, endpoint: Any, keep: str, note: str) -> str:
+        """`keep` takes all the traffic; every other deployed model is undeployed."""
+        endpoint.update(traffic_split={keep: 100})
+        for other in list(self._deployed(endpoint)):
+            if other != keep:
+                endpoint.undeploy(deployed_model_id=other)
+        self._set_record(name, keep, None, note)
+        return keep
+
+    def promote(self, tenant: Tenant, name: str) -> str:
+        """The canary takes all the traffic; the old stable model is undeployed."""
+        endpoint = self.clients.aiplatform.Endpoint(self.cfg.live_endpoint_name(name))
+        record = self.live_record(name)
+        deployed = self._deployed(endpoint)
+        canary = record.get("canary")
+        if not canary or canary not in deployed:
+            raise KeyError(f"no canary on the live {name} endpoint to promote")
+        return self._finish(name, endpoint, canary, f"promoted by {tenant.name}")
+
+    def rollback(self, tenant: Tenant, name: str) -> str:
+        """Everything back to the stable model; the canary is undeployed."""
+        endpoint = self.clients.aiplatform.Endpoint(self.cfg.live_endpoint_name(name))
+        record = self.live_record(name)
+        deployed = self._deployed(endpoint)
+        stable = record.get("stable")
+        if not stable or stable not in deployed:
+            raise KeyError(f"no stable model on the live {name} endpoint to roll back to")
+        return self._finish(name, endpoint, stable, f"rolled back by {tenant.name}")
+
+    def _deploy_live(self, tenant: Tenant, version: ModelVersion, canary_percent: int) -> str:
+        if not 0 <= canary_percent <= 100:
+            raise ValueError(f"canary_percent {canary_percent}: 0 to 100")
+        name = version.name
+        endpoint = self.clients.aiplatform.Endpoint(self.cfg.live_endpoint_name(name))
+        display = f"{tenant.resource(name)}-v{version.version}"
+        record = self.live_record(name)
+        deployed = self._deployed(endpoint)
+        percent = canary_percent or 100
+        existing = next((i for i, m in deployed.items() if m.display_name == display), None)
+        stable = record.get("stable") if record.get("stable") in deployed else None
+        if stable is None and deployed:
+            split = {str(k): int(v) for k, v in (endpoint.traffic_split or {}).items()}
+            stable = max(deployed, key=lambda i: split.get(i, 0))
+        if existing is not None:
+            if percent >= 100:
+                self._finish(name, endpoint, existing, f"{display} finished by {tenant.name}")
+            elif existing != stable and stable is not None:
+                endpoint.update(traffic_split={existing: percent, stable: 100 - percent})
+                self._set_record(name, stable, existing, f"{display} at {percent}")
+            return endpoint.resource_name
+        canary = record.get("canary")
+        if canary and canary in deployed and canary != stable:
+            # one canary at a time: the unfinished one goes before the next is deployed
+            if stable is not None:
+                endpoint.update(traffic_split={stable: 100})
+            endpoint.undeploy(deployed_model_id=canary)
+        model = self._model_resource(tenant, version)
+        model.deploy(
+            endpoint=endpoint,
+            deployed_model_display_name=display,
+            traffic_percentage=percent if stable is not None else 100,
+            machine_type="n1-standard-2",
+            min_replica_count=1,
+            max_replica_count=1,
+        )
+        new = next(
+            (i for i, m in self._deployed(endpoint).items() if m.display_name == display), None
+        )
+        if new is None:
+            raise RuntimeError(f"{display} did not appear on the live {name} endpoint")
+        if stable is None or percent >= 100:
+            self._finish(name, endpoint, new, f"{display} deployed by {tenant.name}")
+        else:
+            self._set_record(name, stable, new, f"{display} canary at {percent}")
+        return endpoint.resource_name
 
     def _service_path(self, tenant: Tenant, name: str) -> str:
         return (
@@ -635,17 +907,7 @@ class CloudRunEndpointClient:
         self, tenant: Tenant, version: ModelVersion, *, live: bool = False, canary_percent: int = 0
     ) -> str:
         if live:
-            endpoint = self.clients.aiplatform.Endpoint(self.cfg.live_endpoint_name(version.name))
-            model = self._model_resource(tenant, version)
-            model.deploy(
-                endpoint=endpoint,
-                deployed_model_display_name=f"{tenant.resource(version.name)}-v{version.version}",
-                traffic_percentage=canary_percent or 100,
-                machine_type="n1-standard-2",
-                min_replica_count=1,
-                max_replica_count=1,
-            )
-            return endpoint.resource_name
+            return self._deploy_live(tenant, version, canary_percent)
         service = self.clients.run.get_service(name=self._service_path(tenant, version.name))
         container = service.template.containers[0]
         env = [e for e in container.env if e.name not in ("NW_MODEL_URI", "NW_MODEL_VERSION")]
@@ -676,9 +938,12 @@ class CloudRunEndpointClient:
     def status(self, tenant: Tenant, name: str) -> Mapping[str, Any]:
         if tenant.name == "live" and name in self.cfg.live_models:
             endpoint = self.clients.aiplatform.Endpoint(self.cfg.live_endpoint_name(name))
+            record = self.live_record(name)
             return {
                 "kind": "vertex-endpoint",
                 "name": endpoint.resource_name,
+                "stable": record.get("stable"),
+                "canary": record.get("canary"),
                 "traffic_split": dict(endpoint.traffic_split or {}),
                 "deployed_models": [
                     {"id": m.id, "display_name": m.display_name, "model": m.model}
@@ -700,6 +965,7 @@ class CloudRunEndpointClient:
         if tenant.name == "live" and name in self.cfg.live_models:
             endpoint = self.clients.aiplatform.Endpoint(self.cfg.live_endpoint_name(name))
             endpoint.undeploy_all()
+            self._set_record(name, None, None, f"emptied by {tenant.name}")
             return
         op = self.clients.run.delete_service(name=self._service_path(tenant, name))
         if hasattr(op, "result"):
@@ -728,8 +994,9 @@ class VertexPromptStore:
     """Prompt management on the Agent Platform through `vertexai.preview.prompts`
     (google-cloud-aiplatform; the online prompt store, preview). Its versions have ids but no
     stages, so every registration also writes `<prefix>/prompts/<name>/<sha>.json` with the
-    stage and tags, and `index.json` with the stage map; the version id the course uses is the
-    twelve-character SHA-256 of the text, the same `prompt_version` that travels in answers.
+    stage and tags, and `index.json` with the stage map (updated with a generation
+    precondition); the version id the course uses is the twelve-character SHA-256 of the text,
+    the same `prompt_version` that travels in answers. Stages follow `nw.platform.base`.
     Without the SDK the bucket alone is the store, and the record says so."""
 
     def __init__(self, cfg: GcpConfig, clients: GcpClients) -> None:
@@ -785,24 +1052,26 @@ class VertexPromptStore:
             "online": online,
         }
         self.docs.write(f"{directory}/{sha}.json", doc)
-        index["versions"][sha] = Stage.CANDIDATE.value
-        self.docs.write(f"{directory}/index.json", index)
+        prompt_id = index.get("prompt_id")
+
+        def add(current: dict[str, Any]) -> dict[str, Any]:
+            current.setdefault("versions", {})[sha] = Stage.CANDIDATE.value
+            order = current.setdefault("order", list(current["versions"]))
+            if sha not in order:
+                order.append(sha)
+            current["prompt_id"] = current.get("prompt_id") or prompt_id
+            return current
+
+        self.docs.update(f"{directory}/index.json", add, {"prompt_id": None, "versions": {}})
         return self._record(doc)
 
     def get(self, tenant: Tenant, name: str, version: str | None = None) -> PromptVersion:
         directory = self._dir(tenant, name)
-        index = self.docs.read(f"{directory}/index.json")
-        if not index or not index.get("versions"):
-            raise KeyError(f"no prompt {tenant.resource(name)}")
         if version is None:
-            stages = index["versions"]
-            for stage in STAGE_PRIORITY:
-                hits = [v for v, s in stages.items() if s == stage.value]
-                if hits and stage != Stage.RETIRED:
-                    version = hits[-1]
-                    break
-            if version is None:
-                version = list(stages)[-1]
+            found = self.versions(tenant, name)
+            if not found:
+                raise KeyError(f"no prompt {tenant.resource(name)}")
+            return default_prompt(found)
         doc = self.docs.read(f"{directory}/{version}.json")
         if not doc:
             raise KeyError(f"prompt {tenant.resource(name)} has no version {version}")
@@ -813,31 +1082,37 @@ class VertexPromptStore:
         doc = self.docs.read(f"{directory}/{version}.json")
         if not doc:
             raise KeyError(f"prompt {tenant.resource(name)} has no version {version}")
-        index = self.docs.read(f"{directory}/index.json", {"prompt_id": None, "versions": {}})
-        if stage in (Stage.LIVE, Stage.APPROVED):
-            # One version holds a stage at a time; the previous holder steps back.
-            for v, s in list(index["versions"].items()):
-                if s == stage.value and v != version:
-                    index["versions"][v] = (
-                        Stage.RETIRED.value if stage == Stage.LIVE else Stage.CANDIDATE.value
-                    )
-                    other = self.docs.read(f"{directory}/{v}.json")
-                    if other:
-                        other["stage"] = index["versions"][v]
-                        self.docs.write(f"{directory}/{v}.json", other)
-        doc["stage"] = stage.value
-        index["versions"][version] = stage.value
-        self.docs.write(f"{directory}/{version}.json", doc)
-        self.docs.write(f"{directory}/index.json", index)
+        changed: dict[str, str] = {}
+
+        def move(index: dict[str, Any]) -> dict[str, Any]:
+            changed.clear()
+            versions = index.setdefault("versions", {})
+            if stage in UNIQUE_STAGES:
+                # one version holds the stage at a time: the previous holder steps back
+                for v, held in list(versions.items()):
+                    if held == stage.value and v != version:
+                        versions[v] = changed[v] = STEP_BACK[stage].value
+            versions[version] = changed[version] = stage.value
+            return index
+
+        self.docs.update(f"{directory}/index.json", move, {"prompt_id": None, "versions": {}})
+        for v, value in changed.items():
+            record = doc if v == version else self.docs.read(f"{directory}/{v}.json")
+            if record:
+                record["stage"] = value
+                self.docs.write(f"{directory}/{v}.json", record)
         return self._record(doc)
 
     def versions(self, tenant: Tenant, name: str) -> Sequence[PromptVersion]:
+        """Every version, oldest first (the index keeps the registration order)."""
         directory = self._dir(tenant, name)
         index = self.docs.read(f"{directory}/index.json")
         if not index:
             return []
+        order = list(index.get("order") or [])
+        order += [v for v in index.get("versions", {}) if v not in order]
         out = []
-        for v in index.get("versions", {}):
+        for v in order:
             doc = self.docs.read(f"{directory}/{v}.json")
             if doc:
                 out.append(self._record(doc))
@@ -850,13 +1125,27 @@ class VertexPromptStore:
 class RagEngineVectorStore:
     """RAG Engine: the corpus `northwind-<tenant>-<collection>` (Terraform creates
     `policies`), files imported from the artifacts bucket, retrieval through
-    `retrieval_query`. RAG Engine chunks and embeds on import, so `vectors` is ignored and
-    the caller's ids become file names; a hit's id is the file's display name."""
+    `retrieval_query`. RAG Engine chunks and embeds on import, so `vectors` is ignored.
 
-    def __init__(self, cfg: GcpConfig, clients: GcpClients) -> None:
+    Layout under `<prefix>/rag/<collection>/`: `docs/<id>.txt` is what the corpus imports (the
+    import path is `docs/`, so nothing else becomes a document), and `meta.json` maps every id to
+    the metadata given to `upsert`. A hit's id comes from its source file's name, and its
+    metadata from `meta.json`, so `audience` and `current` reach the policy service's filter on
+    every hit; a hit whose id has no metadata carries none, and the retriever treats that as
+    internal. `drop` deletes the corpus files and the bucket objects, so the next upsert cannot
+    import stale documents back.
+
+    Scores: RAG Engine's context `score` is a vector distance for the default distance metric
+    (`NW_GCP_RAG_SCORE=distance`, lower is closer): the hit's score is `1 - distance`, clamped
+    to the contract's 0 to 1. `NW_GCP_RAG_SCORE=similarity` passes a similarity through."""
+
+    def __init__(self, cfg: GcpConfig, clients: GcpClients, score_kind: str | None = None) -> None:
         self.cfg = cfg
         self.clients = clients
         self.docs = Documents(clients, cfg.artifacts_bucket)
+        self.score_kind = (score_kind or os.environ.get("NW_GCP_RAG_SCORE") or "distance").lower()
+        if self.score_kind not in ("distance", "similarity"):
+            raise ValueError(f"NW_GCP_RAG_SCORE={self.score_kind!r}: distance or similarity")
 
     def _corpus(self, tenant: Tenant, collection: str, create: bool = False) -> Any:
         rag = self.clients.rag
@@ -868,6 +1157,18 @@ class RagEngineVectorStore:
             raise KeyError(f"no RAG corpus {display}; `make deploy-gcp` creates it")
         return rag.create_corpus(display_name=display)
 
+    def _prefix(self, tenant: Tenant, collection: str) -> str:
+        return f"{tenant.prefix}/rag/{collection}"
+
+    @staticmethod
+    def file_name(doc_id: str) -> str:
+        """Chunk ids carry `#` and `/`; the file name is the id, percent-encoded."""
+        return urllib.parse.quote(doc_id, safe="") + ".txt"
+
+    @staticmethod
+    def id_of(uri: str) -> str:
+        return urllib.parse.unquote(uri.rsplit("/", 1)[-1].removesuffix(".txt"))
+
     def upsert(
         self,
         tenant: Tenant,
@@ -877,22 +1178,32 @@ class RagEngineVectorStore:
         vectors: Sequence[Sequence[float]] | None,
         metadata: Sequence[Mapping[str, Any]],
     ) -> int:
+        if not (len(ids) == len(texts) == len(metadata)):
+            raise ValueError("ids, texts and metadata must have the same length")
         corpus = self._corpus(tenant, collection, create=True)
-        prefix = f"{tenant.prefix}/rag/{collection}"
-        for i, (doc_id, text) in enumerate(zip(ids, texts, strict=True)):
-            meta = dict(metadata[i]) if i < len(metadata) else {}
-            self.docs.upload_text(f"{prefix}/{doc_id}.txt", text)
-            self.docs.write(f"{prefix}/{doc_id}.meta.json", {"id": doc_id, **meta})
+        prefix = self._prefix(tenant, collection)
+        for doc_id, text in zip(ids, texts, strict=True):
+            self.docs.upload_text(f"{prefix}/docs/{self.file_name(doc_id)}", text)
+        given = {doc_id: dict(meta) for doc_id, meta in zip(ids, metadata, strict=True)}
+
+        def merge(current: dict[str, Any]) -> dict[str, Any]:
+            current.update(given)
+            return current
+
+        self.docs.update(f"{prefix}/meta.json", merge, {})
         rag = self.clients.rag
         rag.import_files(
             corpus_name=corpus.name,
-            paths=[f"gs://{self.cfg.artifacts_bucket}/{prefix}/"],
+            paths=[f"gs://{self.cfg.artifacts_bucket}/{prefix}/docs/"],
             transformation_config=rag.TransformationConfig(
                 chunking_config=rag.ChunkingConfig(chunk_size=512, chunk_overlap=64)
             ),
             max_embedding_requests_per_min=600,
         )
         return len(ids)
+
+    def _score(self, raw: float) -> float:
+        return clamp_score(1.0 - raw if self.score_kind == "distance" else raw)
 
     def search(
         self,
@@ -909,18 +1220,23 @@ class RagEngineVectorStore:
             text=query,
             rag_retrieval_config=rag.RagRetrievalConfig(top_k=k),
         )
+        known = self.docs.read(f"{self._prefix(tenant, collection)}/meta.json", {})
         hits = []
         for ctx in resp.contexts.contexts:
             uri = getattr(ctx, "source_uri", "") or ""
-            doc_id = uri.rsplit("/", 1)[-1].removesuffix(".txt") or getattr(
-                ctx, "source_display_name", ""
-            )
+            doc_id = self.id_of(uri) if uri else str(getattr(ctx, "source_display_name", ""))
+            raw = float(getattr(ctx, "score", 0.0) or 0.0)
             hits.append(
                 Hit(
                     id=doc_id,
                     text=ctx.text,
-                    score=float(getattr(ctx, "score", 0.0) or 0.0),
-                    metadata={"source_uri": uri},
+                    score=self._score(raw),
+                    metadata={
+                        **dict(known.get(doc_id) or {}),
+                        "source_uri": uri,
+                        "raw_score": raw,
+                        "score_kind": self.score_kind,
+                    },
                 )
             )
         return hits
@@ -930,21 +1246,28 @@ class RagEngineVectorStore:
         return sum(1 for _ in self.clients.rag.list_files(corpus_name=corpus.name))
 
     def drop(self, tenant: Tenant, collection: str) -> None:
-        """Empties the corpus. The corpus itself belongs to Terraform and stays."""
+        """Empties the corpus and deletes the source objects and the metadata. The corpus
+        itself belongs to Terraform and stays."""
         rag = self.clients.rag
         corpus = self._corpus(tenant, collection)
         for f in list(rag.list_files(corpus_name=corpus.name)):
             rag.delete_file(name=f.name)
+        self.docs.delete_prefix(f"{self._prefix(tenant, collection)}/")
 
 
 # ----- AgentRuntime ---------------------------------------------------------------------------
 
 
 class AgentEngineRuntime:
-    """Agent Engine: the reasoning engine `northwind-<tenant>-agent` (Terraform creates it
-    from the nw-agent image; `deploy` updates image and environment in place), `query` with
-    the `route` class method of nw/agent/agentcore.py, and the registry document
-    `agents/agents.json` in the artifacts bucket."""
+    """Agent Engine: the reasoning engine `northwind-<tenant>-agent`, which Terraform creates
+    from the nw-agent image (a tenant has no permission to create one); `deploy` updates the
+    image and environment of that engine in place and refuses when it is missing. `invoke` is
+    `query` with the `route` class method of nw/agent/agentcore.py.
+
+    The registry: a tenant writes its own card to `<prefix>/agents/<id>.json` (the only
+    prefix it can write); `merge_registry` (`python -m nw.platform.gcp agents-merge`, run by the
+    instructor or the live identity) folds every tenant's cards into `agents/agents.json`, which
+    every tenant can read."""
 
     REGISTRY_PATH = "agents/agents.json"
 
@@ -952,6 +1275,9 @@ class AgentEngineRuntime:
         self.cfg = cfg
         self.clients = clients
         self.docs = Documents(clients, cfg.artifacts_bucket)
+
+    def card_path(self, tenant: Tenant, card_id: str) -> str:
+        return f"{tenant.prefix}/agents/{card_id}.json"
 
     @property
     def _parent(self) -> str:
@@ -973,37 +1299,22 @@ class AgentEngineRuntime:
         merged.setdefault("NW_TENANT", tenant.name)
         merged.setdefault("NW_ENVIRONMENT", tenant.environment)
         if engine is None:
-            spec = v1.ReasoningEngineSpec(
-                agent_framework="custom",
-                service_account=f"nw-{tenant.name}-agent@{self.cfg.project}.iam.gserviceaccount.com",
-                container_spec=v1.ReasoningEngineSpec.ContainerSpec(image_uri=image, port=8000),
-                deployment_spec=v1.ReasoningEngineSpec.DeploymentSpec(
-                    env=[v1.EnvVar(name=k, value=str(x)) for k, x in sorted(merged.items())]
-                ),
+            raise KeyError(
+                f"no reasoning engine {tenant.resource('agent')}: Terraform creates each "
+                "tenant's engine (`make deploy-gcp`); a tenant can only update its own"
             )
-            op = self.clients.reasoning_engines.create_reasoning_engine(
-                parent=self._parent,
-                reasoning_engine=v1.ReasoningEngine(
-                    display_name=tenant.resource("agent"),
-                    description=f"Northwind resolver of tenant {tenant.name}",
-                    spec=spec,
-                ),
-            )
-            engine = op.result()
-        else:
-            engine.spec.container_spec.image_uri = image
-            existing = {e.name: e.value for e in engine.spec.deployment_spec.env}
-            existing.update({k: str(x) for k, x in merged.items()})
-            engine.spec.deployment_spec.env = [
-                v1.EnvVar(name=k, value=x) for k, x in sorted(existing.items())
-            ]
-            op = self.clients.reasoning_engines.update_reasoning_engine(
-                reasoning_engine=engine,
-                update_mask={
-                    "paths": ["spec.container_spec.image_uri", "spec.deployment_spec.env"]
-                },
-            )
-            engine = op.result()
+        # update in place: the only change a tenant may make to its engine
+        engine.spec.container_spec.image_uri = image
+        existing = {e.name: e.value for e in engine.spec.deployment_spec.env}
+        existing.update({k: str(x) for k, x in merged.items()})
+        engine.spec.deployment_spec.env = [
+            v1.EnvVar(name=k, value=x) for k, x in sorted(existing.items())
+        ]
+        op = self.clients.reasoning_engines.update_reasoning_engine(
+            reasoning_engine=engine,
+            update_mask={"paths": ["spec.container_spec.image_uri", "spec.deployment_spec.env"]},
+        )
+        engine = op.result()
         self._upsert_registry(
             tenant,
             {
@@ -1047,8 +1358,7 @@ class AgentEngineRuntime:
         if engine is None:
             return {"name": tenant.resource("agent"), "state": "absent"}
         env = {e.name: e.value for e in engine.spec.deployment_spec.env}
-        registry = self.docs.read(self.REGISTRY_PATH, {"agents": []})
-        card = next((a for a in registry.get("agents", []) if a.get("tenant") == tenant.name), None)
+        card = self.docs.read(self.card_path(tenant, tenant.resource("agent")))
         return {
             "name": engine.name,
             "display_name": engine.display_name,
@@ -1060,27 +1370,30 @@ class AgentEngineRuntime:
         }
 
     def _upsert_registry(self, tenant: Tenant, entry: Mapping[str, Any]) -> str:
+        """The tenant's own card under its prefix, merged into what it wrote before."""
         entry = {**entry, "tenant": tenant.name}
-        registry = self.docs.read(
-            self.REGISTRY_PATH, {"environment": tenant.environment, "agents": []}
-        )
-        agents = [
-            a
-            for a in registry.get("agents", [])
-            if not (a.get("tenant") == tenant.name and a.get("id") == entry["id"])
-        ]
-        previous = next(
-            (
-                a
-                for a in registry.get("agents", [])
-                if a.get("tenant") == tenant.name and a.get("id") == entry["id"]
-            ),
-            {},
-        )
-        agents.append({**previous, **entry})
-        registry["agents"] = sorted(agents, key=lambda a: (a.get("tenant", ""), a.get("id", "")))
-        registry["updated"] = _now()
-        return self.docs.write(self.REGISTRY_PATH, registry)
+        path = self.card_path(tenant, str(entry["id"]))
+        self.docs.update(path, lambda previous: {**previous, **entry}, {})
+        return f"gs://{self.cfg.artifacts_bucket}/{path}"
+
+    def merge_registry(self) -> str:
+        """Every tenant's cards into `agents/agents.json` (the platform identity runs this)."""
+        bucket = self.clients.storage.bucket(self.cfg.artifacts_bucket)
+        cards = []
+        for blob in bucket.list_blobs(prefix=f"{self.cfg.environment}-"):
+            parts = blob.name.split("/")
+            if len(parts) == 3 and parts[1] == "agents" and parts[2].endswith(".json"):
+                cards.append(json.loads(blob.download_as_text()))
+
+        def merge(registry: dict[str, Any]) -> dict[str, Any]:
+            registry["agents"] = sorted(
+                cards, key=lambda a: (str(a.get("tenant", "")), str(a.get("id", "")))
+            )
+            registry["updated"] = _now()
+            return registry
+
+        self.docs.update(self.REGISTRY_PATH, merge, {"environment": self.cfg.environment})
+        return f"gs://{self.cfg.artifacts_bucket}/{self.REGISTRY_PATH}"
 
 
 def _to_plain(value: Any) -> Any:
@@ -1125,14 +1438,30 @@ def build(settings: Settings, clients: GcpClients | None = None) -> GcpPlatform:
 
 def main(argv: list[str] | None = None) -> int:
     """`pipeline-upload [--tenants alice,bob] [name ...]`: upload the compiled pipelines to
-    each tenant's `<prefix>/pipelines/`, where the Cloud Scheduler job reads them."""
+    each tenant's `<prefix>/pipelines/`, where the Cloud Scheduler job reads them.
+    `bootstrap [triage|semantic ...] [--force]`: register and approve `artifacts/*/latest`
+    (`nw.platform.bootstrap`), the mid-course recovery. `agents-merge`: fold the tenants' agent
+    cards into `agents/agents.json` (the instructor or the live identity runs it)."""
     import argparse
+    import sys
+
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw[:1] == ["agents-merge"]:
+        from nw.config import settings as load_settings
+
+        print(build(load_settings()).agents.merge_registry())  # type: ignore[attr-defined]
+        return 0
+    if raw[:1] == ["bootstrap"]:
+        from nw.platform.bootstrap import main as bootstrap_main
+
+        return bootstrap_main(raw[1:], track="gcp")
 
     from nw.config import settings as load_settings
     from nw.pipelines import NAMES, PIPELINES
     from nw.platform.base import tenant_from_env
 
     ap = argparse.ArgumentParser(prog="python -m nw.platform.gcp")
+    argv = raw
     sub = ap.add_subparsers(dest="command", required=True)
     up = sub.add_parser("pipeline-upload", help="upload compiled pipelines for the tenants")
     up.add_argument("--tenants", default="", help="comma separated; default NW_TENANT or solo")

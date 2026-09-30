@@ -7,19 +7,42 @@ jobs, pipelines, models and model packages only under its own name prefix
 `tenants/<tenant>/`. Approval status on the model package is the stage (`Stage` in
 `nw/platform/base.py`): PendingManualApproval is a candidate, Approved is what the serving area
 deploys, Rejected is retired.
+
+Guards on every tenant execution role: compute only from `INSTANCE_TYPES` and no accelerators
+(`sagemaker:InstanceTypes`, `sagemaker:AcceleratorTypes`), ECR pull only from this account's
+platform repositories and the listed framework images, MLflow without deletes (the tracking
+server has one IAM resource, so `sagemaker-mlflow:Delete*` is denied rather than scoped) and
+MLflow artifacts written only under `mlflow/tenants/<tenant>/`.
+
+Destroy: CloudFormation deletes the domain but keeps its home EFS file system and the two NFS
+security groups SageMaker created, which then block the VPC's deletion. `DomainCleanup` is a
+custom resource the domain depends on, so it is deleted after the domain and before the VPC,
+and on delete it removes the file system, its mount targets and the security groups.
 """
 
 from __future__ import annotations
 
-from aws_cdk import CfnOutput, Stack
+from pathlib import Path
+
+from aws_cdk import CfnOutput, CustomResource, Duration, RemovalPolicy, Stack
 from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_kms as kms
+from aws_cdk import aws_lambda as lam
+from aws_cdk import aws_logs as logs
 from aws_cdk import aws_s3 as s3
 from aws_cdk import aws_sagemaker as sm
+from aws_cdk import custom_resources as cr
 from constructs import Construct
 
-from stacks.common import PROJECTS
+from stacks.common import (
+    PROJECTS,
+    accelerator_guard,
+    ecr_pull_statement,
+    instance_type_guard,
+)
+
+FUNCTIONS = Path(__file__).resolve().parents[2] / "functions"
 
 SAGEMAKER_SERVICE = "sagemaker.amazonaws.com"
 
@@ -87,13 +110,16 @@ class TrackingRegistry(Construct):
             ),
         )
 
+        self._domain_cleanup(prefix, vpc)
+
         # ----- one profile, one role and two package groups per tenant -----
         self.tenant_roles: dict[str, iam.Role] = {}
+        self.profiles: dict[str, sm.CfnUserProfile] = {}
         self.groups: dict[tuple[str, str], sm.CfnModelPackageGroup] = {}
         for tenant in tenants:
             role = self._execution_role(f"Tenant{tenant.title()}", tenant)
             self.tenant_roles[tenant] = role
-            sm.CfnUserProfile(
+            self.profiles[tenant] = sm.CfnUserProfile(
                 self,
                 f"Profile{tenant.title()}",
                 domain_id=self.domain.attr_domain_id,
@@ -124,6 +150,8 @@ class TrackingRegistry(Construct):
         `platform` for the domain default and the promoted (`live`) endpoints."""
         stack = Stack.of(self)
         own = f"{self.prefix}-{owner}-*"
+        # Only ever one tenant's names: `northwind-alice-*` never matches `northwind-alicebob-*`
+        # because the tenant is followed by `-`, and tenants cannot be environment words.
         names = [own, f"{self.prefix}-live-*"] if live else [own]
         role = iam.Role(
             self,
@@ -141,7 +169,25 @@ class TrackingRegistry(Construct):
             role.add_to_policy(
                 iam.PolicyStatement(
                     sid=f"List{bucket.node.id}",
-                    actions=["s3:ListBucket", "s3:GetBucketLocation"],
+                    actions=["s3:ListBucket"],
+                    resources=[bucket.bucket_arn],
+                    conditions={
+                        "StringLike": {
+                            "s3:prefix": [
+                                f"tenants/{owner}/*",
+                                "data/*",
+                                "baselines/*",
+                                "mlflow/*",
+                                "live/*" if live else f"tenants/{owner}/",
+                            ]
+                        }
+                    },
+                )
+            )
+            role.add_to_policy(
+                iam.PolicyStatement(
+                    sid=f"Location{bucket.node.id}",
+                    actions=["s3:GetBucketLocation"],
                     resources=[bucket.bucket_arn],
                 )
             )
@@ -200,8 +246,12 @@ class TrackingRegistry(Construct):
         role.add_to_policy(
             iam.PolicyStatement(
                 sid="OwnModelPackages",
+                # The pipeline's register step (a processing step running
+                # nw.pipelines.steps.register) creates the version with its lineage tags.
                 actions=[
                     "sagemaker:CreateModelPackage",
+                    "sagemaker:AddTags",
+                    "sagemaker:ListTags",
                     "sagemaker:DescribeModelPackage",
                     "sagemaker:UpdateModelPackage",
                     "sagemaker:DeleteModelPackage",
@@ -217,6 +267,7 @@ class TrackingRegistry(Construct):
                 sid="ListsAreAccountWide",
                 actions=[
                     "sagemaker:ListModelPackageGroups",
+                    "sagemaker:ListModelPackages",  # no resource-level scope: the champion lookup lists a group
                     "sagemaker:ListPipelines",
                     "sagemaker:ListTrainingJobs",
                     "sagemaker:ListProcessingJobs",
@@ -236,6 +287,18 @@ class TrackingRegistry(Construct):
                 ],
             )
         )
+        if not live:
+            role.add_to_policy(
+                iam.PolicyStatement(
+                    sid="MlflowNoDeletes",
+                    effect=iam.Effect.DENY,
+                    actions=["sagemaker-mlflow:Delete*"],
+                    resources=["*"],
+                )
+            )
+        # MLflow artifacts: every run readable, writes only under the owner's prefix.
+        self.artifacts.grant_read(role, "mlflow/*")
+        self.artifacts.grant_put(role, f"mlflow/tenants/{owner}/*")
         role.add_to_policy(
             iam.PolicyStatement(
                 sid="MlflowPresignedUrl",
@@ -265,21 +328,13 @@ class TrackingRegistry(Construct):
                 actions=["cloudwatch:PutMetricData"],
                 resources=["*"],
                 conditions={
-                    "StringEquals": {"cloudwatch:namespace": ["/aws/sagemaker/*", "Northwind"]}
+                    "StringLike": {"cloudwatch:namespace": ["/aws/sagemaker/*", "Northwind"]}
                 },
             )
         )
-        role.add_to_policy(
-            iam.PolicyStatement(
-                sid="EcrPull",
-                actions=[
-                    "ecr:BatchGetImage",
-                    "ecr:GetDownloadUrlForLayer",
-                    "ecr:BatchCheckLayerAvailability",
-                ],
-                resources=[f"arn:aws:ecr:{stack.region}:*:repository/*"],
-            )
-        )
+        role.add_to_policy(ecr_pull_statement(self, self.prefix))
+        role.add_to_policy(instance_type_guard())
+        role.add_to_policy(accelerator_guard())
         role.add_to_policy(
             iam.PolicyStatement(
                 sid="EcrToken", actions=["ecr:GetAuthorizationToken"], resources=["*"]
@@ -295,3 +350,81 @@ class TrackingRegistry(Construct):
             )
         )
         return role
+
+    def _domain_cleanup(self, prefix: str, vpc: ec2.IVpc) -> None:
+        """Delete the domain's home EFS and NFS security groups after the domain is deleted."""
+        stack = Stack.of(self)
+        fn = lam.Function(
+            self,
+            "DomainCleanupFn",
+            function_name=f"{prefix}-domain-cleanup",
+            runtime=lam.Runtime.PYTHON_3_12,
+            architecture=lam.Architecture.ARM_64,
+            handler="handler.on_event",
+            code=lam.Code.from_asset(str(FUNCTIONS / "domain_cleanup")),
+            timeout=Duration.minutes(14),
+            memory_size=256,
+            description="On stack delete: the SageMaker domain's home EFS and NFS security groups",
+            log_group=logs.LogGroup(
+                self,
+                "DomainCleanupLogs",
+                log_group_name=f"/aws/lambda/{prefix}-domain-cleanup",
+                retention=logs.RetentionDays.ONE_MONTH,
+                removal_policy=RemovalPolicy.DESTROY,
+            ),
+        )
+        fn.add_to_role_policy(
+            iam.PolicyStatement(
+                sid="Describe",
+                actions=[
+                    "elasticfilesystem:DescribeFileSystems",
+                    "elasticfilesystem:DescribeMountTargets",
+                    "elasticfilesystem:DescribeMountTargetSecurityGroups",
+                    "ec2:DescribeSecurityGroups",
+                    "ec2:DescribeNetworkInterfaces",
+                ],
+                resources=["*"],
+            )
+        )
+        fn.add_to_role_policy(
+            iam.PolicyStatement(
+                sid="DeleteDomainEfs",
+                actions=[
+                    "elasticfilesystem:DeleteMountTarget",
+                    "elasticfilesystem:DeleteFileSystem",
+                ],
+                resources=[
+                    f"arn:aws:elasticfilesystem:{stack.region}:{stack.account}:file-system/*"
+                ],
+                conditions={
+                    "StringLike": {
+                        "aws:ResourceTag/ManagedByAmazonSageMakerResource": f"arn:aws:sagemaker:{stack.region}:{stack.account}:domain/*"
+                    }
+                },
+            )
+        )
+        fn.add_to_role_policy(
+            iam.PolicyStatement(
+                sid="DeleteNfsGroups",
+                actions=[
+                    "ec2:RevokeSecurityGroupIngress",
+                    "ec2:RevokeSecurityGroupEgress",
+                    "ec2:DeleteSecurityGroup",
+                ],
+                resources=[f"arn:aws:ec2:{stack.region}:{stack.account}:security-group/*"],
+                conditions={
+                    "ArnEquals": {
+                        "ec2:Vpc": f"arn:aws:ec2:{stack.region}:{stack.account}:vpc/{vpc.vpc_id}"
+                    }
+                },
+            )
+        )
+        provider = cr.Provider(self, "DomainCleanupProvider", on_event_handler=fn)
+        cleanup = CustomResource(
+            self,
+            "DomainCleanup",
+            service_token=provider.service_token,
+            properties={"VpcId": vpc.vpc_id},
+        )
+        # Deleted after the domain (the domain depends on it), before the VPC (it references it).
+        self.domain.node.add_dependency(cleanup)

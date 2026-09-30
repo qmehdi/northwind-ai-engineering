@@ -36,6 +36,7 @@ PATTERNS = (
     "golden/*.json",
     "golden/*.jsonl",
     "adversarial/*.jsonl",
+    "pii/*.jsonl",
 )
 LICENCE = (
     "Synthetic, generated for the course and for the cohort's use. No row of the reference "

@@ -4,7 +4,10 @@
     {
       "Sid": "ECRImageAccess",
       "Effect": "Allow",
-      "Action": ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"],
+      "Action": [
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer"
+      ],
       "Resource": "arn:aws:ecr:${Region}:${AccountId}:repository/*"
     },
     {
@@ -15,7 +18,10 @@
     },
     {
       "Effect": "Allow",
-      "Action": ["logs:DescribeLogStreams", "logs:CreateLogGroup"],
+      "Action": [
+        "logs:DescribeLogStreams",
+        "logs:CreateLogGroup"
+      ],
       "Resource": "arn:aws:logs:${Region}:${AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
     },
     {
@@ -30,19 +36,31 @@
     },
     {
       "Effect": "Allow",
-      "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+      "Action": [
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
       "Resource": "arn:aws:logs:${Region}:${AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*"
     },
     {
       "Effect": "Allow",
-      "Action": ["xray:PutTraceSegments", "xray:PutTelemetryRecords", "xray:GetSamplingRules", "xray:GetSamplingTargets"],
+      "Action": [
+        "xray:PutTraceSegments",
+        "xray:PutTelemetryRecords",
+        "xray:GetSamplingRules",
+        "xray:GetSamplingTargets"
+      ],
       "Resource": "*"
     },
     {
       "Effect": "Allow",
       "Action": "cloudwatch:PutMetricData",
       "Resource": "*",
-      "Condition": {"StringEquals": {"cloudwatch:namespace": "bedrock-agentcore"}}
+      "Condition": {
+        "StringEquals": {
+          "cloudwatch:namespace": "bedrock-agentcore"
+        }
+      }
     },
     {
       "Sid": "GetAgentAccessToken",
@@ -60,14 +78,17 @@
     {
       "Sid": "InvokeCourseModels",
       "Effect": "Allow",
-      "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream"
+      ],
       "Resource": [
-        "arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-5",
+        "arn:aws:bedrock:*::foundation-model/openai.gpt-oss-120b-1:0",
         "arn:aws:bedrock:*::foundation-model/anthropic.claude-opus-5",
-        "arn:aws:bedrock:*::foundation-model/anthropic.claude-haiku-4-5",
-        "arn:aws:bedrock:${Region}:${AccountId}:inference-profile/*anthropic.claude-sonnet-5",
-        "arn:aws:bedrock:${Region}:${AccountId}:inference-profile/*anthropic.claude-opus-5",
-        "arn:aws:bedrock:${Region}:${AccountId}:inference-profile/*anthropic.claude-haiku-4-5"
+        "arn:aws:bedrock:*::foundation-model/amazon.nova-micro-v1:0",
+        "arn:aws:bedrock:${Region}:${AccountId}:inference-profile/us.anthropic.claude-opus-5",
+        "arn:aws:bedrock:${Region}:${AccountId}:inference-profile/us.amazon.nova-micro-v1:0",
+        "arn:aws:bedrock:${Region}:${AccountId}:application-inference-profile/*"
       ]
     }
   ]

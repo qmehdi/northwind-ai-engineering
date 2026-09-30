@@ -12,7 +12,13 @@ import httpx
 import pytest
 
 from nw.config import DEFAULT_MODELS, ModelRole, ProviderMode, Settings, Track
-from nw.llm.providers import RoleRouter, describe_route, is_fake, make_provider
+from nw.llm.providers import (
+    ResidencyRouter,
+    RoleRouter,
+    describe_route,
+    is_fake,
+    make_provider,
+)
 from nw.llm.providers.fake import FakeProvider
 from nw.llm.providers.openai_compat import OpenAICompatProvider
 from nw.llm.types import Message
@@ -38,7 +44,7 @@ def test_defaults_follow_adr_0010():
     )
     assert aws[ModelRole.WORKHORSE] == "openai.gpt-oss-120b-1:0"
     assert aws[ModelRole.ECONOMY] == "us.amazon.nova-micro-v1:0"
-    assert aws[ModelRole.JUDGE] == "anthropic.claude-opus-5"
+    assert aws[ModelRole.JUDGE] == "us.anthropic.claude-opus-5"
     assert gcp[ModelRole.WORKHORSE] == "openai/gpt-oss-120b-maas"
     assert (
         gcp[ModelRole.ECONOMY] == "openai/gpt-oss-120b-maas"
@@ -61,12 +67,20 @@ def test_fake_mode_resolves_every_role_to_fake_models_on_any_track():
         assert not s.uses_gateway
 
 
-def test_local_judge_becomes_claude_when_a_cloud_key_is_present():
+def test_local_judge_becomes_claude_when_a_cloud_key_is_present(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     assert _settings(track=Track.LOCAL).model_for(ModelRole.JUDGE) == "fake-judge"
     assert (
         _settings(track=Track.LOCAL, anthropic_api_key="k").model_for(ModelRole.JUDGE)
         == "claude-opus-5"
     )
+    # The Local gateway serves Claude only when it was started with ANTHROPIC_API_KEY;
+    # without it `claude-opus-5` is a 400 there, so the Judge stays fake.
+    assert (
+        _settings(track=Track.LOCAL, gateway_url="http://gw").model_for(ModelRole.JUDGE)
+        == "fake-judge"
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
     assert (
         _settings(track=Track.LOCAL, gateway_url="http://gw").model_for(ModelRole.JUDGE)
         == "claude-opus-5"
@@ -113,7 +127,9 @@ async def test_router_dispatches_by_model_id():
 
 def test_aws_routes_claude_to_the_sdk_and_the_rest_to_converse():
     s = _settings(track=Track.AWS, aws_profile=None)
-    p = make_provider(s)
+    top = make_provider(s)
+    assert isinstance(top, ResidencyRouter), "EU accounts get their own providers"
+    p = top.default
     assert isinstance(p, RoleRouter)
     assert type(p.route(s.model_for(ModelRole.JUDGE))).__name__ == "BedrockProvider"
     assert type(p.route(s.model_for(ModelRole.WORKHORSE))).__name__ == "BedrockConverseProvider"
@@ -125,7 +141,7 @@ def test_aws_routes_claude_to_the_sdk_and_the_rest_to_converse():
 
 def test_gcp_routes_claude_to_vertex_and_the_rest_to_the_managed_api():
     s = _settings(track=Track.GCP, gcp_project="proj")
-    p = make_provider(s)
+    p = make_provider(s).default
     assert type(p.route(s.model_for(ModelRole.JUDGE))).__name__ == "VertexProvider"
     maas = p.route(s.model_for(ModelRole.WORKHORSE))
     assert isinstance(maas, OpenAICompatProvider) and maas.name == "google-maas"
@@ -152,7 +168,11 @@ def test_local_routes_to_ollama_with_the_fake_judge():
 async def test_gateway_takes_every_role_with_bearer_and_model_name():
     s = _settings(track=Track.AWS, gateway_url="http://gw.invalid/v1", gateway_key="sk-tenant")
     assert s.uses_gateway
-    p = make_provider(s)
+    router = make_provider(s)
+    assert isinstance(router, RoleRouter)
+    # `fake-*` ids stay in memory; every real model id goes to the gateway.
+    assert router.route("fake-judge").name == "fake"
+    p = router.route("anything")
     assert isinstance(p, OpenAICompatProvider) and p.name == "gateway"
     assert describe_route(p, "anything") == "gateway at http://gw.invalid/v1"
 
@@ -216,8 +236,10 @@ async def test_preflight_round_trips_once_per_role_under_a_fake_transport():
     by_name = {c.name: c for c in checks}
     assert all(by_name[f"model {r.value}"].ok for r in ModelRole)
     assert seen == ["gpt-oss:20b", "gpt-oss:20b"]  # the fake judge never touches the wire
-    # Ollama is free; the fake judge is priced like the real Judge (50 + 20 tokens at Opus rates)
-    assert by_name["spend"].detail == "0.00075 USD"
+    # No Judge route on Local: reported, not required, and no canned round trip is priced.
+    judge = by_name["model judge"]
+    assert not judge.required and "no Judge route" in judge.detail
+    assert by_name["spend"].detail == "0.00000 USD"  # Ollama is free
 
     routes = {c.name: c.detail for c in pf.check_routes(s, provider)}
     assert routes["route workhorse"] == (
@@ -336,3 +358,21 @@ def test_preflight_azure_tools_check_az(monkeypatch):
     monkeypatch.setattr(pf, "_run", lambda cmd, timeout=30: (0, "2.79.0"))
     (az,) = pf.check_track_tools("azure")
     assert az.name == "az" and az.ok and not az.required and az.detail == "2.79.0"
+
+
+def test_a_judged_run_is_refused_without_a_judge_route(monkeypatch):
+    """On Local without a Claude route the Judge is `fake-judge`: real answers must not be
+    scored with canned verdicts, so the harnesses refuse a judged run up front."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    from nw.config import ProviderMode
+
+    local = _settings(track=Track.LOCAL, provider=ProviderMode.AUTO)
+    assert local.judge_unavailable() and "--no-judge" in local.judge_unavailable()
+    assert (
+        _settings(
+            track=Track.LOCAL, provider=ProviderMode.AUTO, anthropic_api_key="k"
+        ).judge_unavailable()
+        is None
+    )
+    assert _settings(track=Track.LOCAL, provider=ProviderMode.FAKE).judge_unavailable() is None
+    assert _settings(track=Track.AWS, provider=ProviderMode.AUTO).judge_unavailable() is None

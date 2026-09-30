@@ -30,7 +30,7 @@
     "type": "object"
    },
    "AskResponse": {
-    "description": "An Answer plus what the service adds: an id to give feedback on, the model that\nanswered, and whether it came from the cache.",
+    "description": "An Answer plus what the service adds: an id to give feedback on, the model that\nanswered, whether it came from the cache, and what this request's model calls cost.",
     "properties": {
      "answer_id": {
       "title": "Answer Id",
@@ -58,6 +58,11 @@
       },
       "title": "Context Ids",
       "type": "array"
+     },
+     "cost_usd": {
+      "default": 0.0,
+      "title": "Cost Usd",
+      "type": "number"
      },
      "dropped_citations": {
       "items": {
@@ -270,7 +275,7 @@
   "/feedback": {
    "post": {
     "deprecated": true,
-    "description": "Deprecated alias of `/v1/feedback`, kept for one release. Call `/v1/feedback`.\n\nRecord a verdict on an answer. Wrong and unsafe verdicts are golden-set candidates:\n`python -m nw.policy.feedback --to-golden` prints them.",
+    "description": "Deprecated alias of `/v1/feedback`, kept for one release. Call `/v1/feedback`.\n\nRecord a verdict on an answer, with who gave it. Wrong and unsafe verdicts are\ngolden-set candidates: `python -m nw.policy.feedback --to-golden` prints them. One\nanswer takes a few verdicts, not a flood: past the limit, 429.",
     "operationId": "feedback_feedback_post",
     "requestBody": {
      "content": {
@@ -440,7 +445,7 @@
   },
   "/v1/feedback": {
    "post": {
-    "description": "Record a verdict on an answer. Wrong and unsafe verdicts are golden-set candidates:\n`python -m nw.policy.feedback --to-golden` prints them.",
+    "description": "Record a verdict on an answer, with who gave it. Wrong and unsafe verdicts are\ngolden-set candidates: `python -m nw.policy.feedback --to-golden` prints them. One\nanswer takes a few verdicts, not a flood: past the limit, 429.",
     "operationId": "feedback_v1_feedback_post",
     "requestBody": {
      "content": {

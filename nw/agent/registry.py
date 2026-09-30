@@ -87,6 +87,10 @@ class AgentCard(BaseModel):
     risk_class: str
     oversight: dict[str, str]
     data_classes: list[str]
+    # Derived from the tools, not declared: what the catalog check proved the agent can reach.
+    reachable_data_classes: list[str] = Field(default_factory=list)
+    # EU AI Act class, Article 50 disclosure, DPIA section and privacy approver, from the catalog.
+    governance: dict[str, str | None] = Field(default_factory=dict)
     endpoints: list[str]
     evaluation: Evaluation
     approval: dict[str, str | None]
@@ -130,17 +134,31 @@ def _evaluation(name: str) -> Evaluation:
     )
 
 
+def _governance(use_case: cat.UseCase) -> dict[str, str | None]:
+    return {
+        "eu_ai_act_class": use_case.eu_ai_act_class.value if use_case.eu_ai_act_class else None,
+        "annex_iii_item": use_case.annex_iii_item,
+        "article_50_disclosure": use_case.article_50_disclosure,
+        "dpia_ref": use_case.dpia_ref,
+        "privacy_approver": use_case.privacy_approver,
+    }
+
+
 def build_card(
     definition: cat.AgentDefinition,
     use_case: cat.UseCase,
     s: Settings,
     *,
     models: dict[str, str] | None = None,
+    agents: dict[str, cat.AgentDefinition] | None = None,
 ) -> AgentCard:
     """The card from code: the same `describe()` the service's `/version` uses, plus what the
     catalog says and what the baseline measured."""
     models = models or _models_for(definition, s)
     d = describe(definition.system, definition.specs, models)
+    reach, _ = cat.reachable_classes(
+        definition.name, {**(agents or {}), definition.name: definition}
+    )
     return AgentCard(
         name=definition.name,
         kind=definition.kind,
@@ -164,6 +182,8 @@ def build_card(
         risk_class=use_case.risk_class.value,
         oversight=dict(use_case.oversight),
         data_classes=list(use_case.data_classes),
+        reachable_data_classes=sorted(reach),
+        governance=_governance(use_case),
         endpoints=list(definition.endpoints),
         evaluation=_evaluation(definition.name),
         approval={"state": use_case.approval.value, "approver": use_case.approver},
@@ -221,7 +241,11 @@ def check(
             )
             continue
         fresh = build_card(
-            definition, catalog.get(name) or _placeholder(name), s, models=card.models
+            definition,
+            catalog.get(name) or _placeholder(name),
+            s,
+            models=card.models,
+            agents=agents,
         )
         if card.tool_names != fresh.tool_names:
             r.problems.append(
@@ -259,6 +283,11 @@ def check(
                 )
             if card.approval.get("state") != cat.Approval.APPROVED.value:
                 r.problems.append(f"{name}: card is not approved")
+            if card.governance != _governance(uc) or card.data_classes != list(uc.data_classes):
+                r.problems.append(
+                    f"{name}: governance or data classes on the card differ from {uc.id}; "
+                    "rewrite the card (registry --write)"
+                )
         current = _models_for(definition, s)
         if current != card.models:
             r.notes.append(
@@ -360,7 +389,7 @@ def main(argv: list[str] | None = None) -> int:
             if name not in agents or uc is None:
                 print(f"{name}: not an agent in code with a use case; skipped", file=sys.stderr)
                 continue
-            path = write_card(build_card(agents[name], uc, s), args.cards)
+            path = write_card(build_card(agents[name], uc, s, agents=agents), args.cards)
             print(f"{name}: {path}")
         return 0
     if args.check:

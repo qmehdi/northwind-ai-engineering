@@ -1,20 +1,64 @@
-# Retrain Project 1 on a schedule or on demand: validate the data, train a candidate,
-# run the promotion gate against the committed production summary, publish the model
-# card and the artifact. Promotion to serving is the deploy step; this workflow never
-# changes what is served on its own.
+# Retrain Project 1 when there is a reason to: new data, a drift or quality alert, live P0
+# recall below the bar, or enough new labels. The `trigger` job decides
+# (`nw.triage.monitor trigger`); a scheduled run with the same data and no signal skips the
+# training, because the same data trains the same model. A pull request that changes the data
+# or the code, and a hand dispatch, always train. The candidate goes through the promotion
+# gate against the committed production summary, and the model card and artifact are
+# published. Promotion to serving is the deploy step; this workflow never changes what is
+# served on its own.
+#
+# Wiring live signals in: the trigger reads optional files. On the platform, a scheduled job
+# writes the central drift snapshot (`python -m nw.triage.monitor drift --capture ...`) and the
+# live quality report (`... quality --capture ... --outcomes ...`) to object storage; pass them
+# here as the `drift` and `quality` dispatch inputs (paths in the checkout after a download
+# step you add for your bucket), and `new_labels` as the count of labelled tickets since the
+# production data was cut. Until that is wired, the schedule only retrains on new data.
 name: retrain-triage
 on:
   schedule:
     - cron: "0 5 * * 1"   # Mondays 05:00 UTC
   workflow_dispatch:
+    inputs:
+      new_labels:
+        description: labelled tickets since the production data (500 or more triggers a retrain)
+        default: "0"
+      reason:
+        description: why this run was started by hand (recorded on the gate decision)
+        default: "manual retrain"
   pull_request:
-    paths: ["data/tickets.jsonl", "nw/triage/**"]
+    paths: ["data/tickets.jsonl", "nw/triage/**", "data/golden/triage_slices.jsonl"]
+permissions:
+  contents: read
 jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    outputs:
+      retrain: ${{ steps.decide.outputs.retrain }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+      - run: uv sync --locked --extra dev
+      - name: Is there a reason to retrain?
+        id: decide
+        env:
+          NEW_LABELS: ${{ inputs.new_labels || '0' }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          uv run python -m nw.triage.monitor trigger --data data/tickets.jsonl \
+            --summary data/golden/triage_production.json --new-labels "$NEW_LABELS" \
+            --github-output "$GITHUB_OUTPUT"
+          if [ "$EVENT" != "schedule" ]; then echo "retrain=true" >> "$GITHUB_OUTPUT"; fi
   retrain:
+    needs: trigger
+    if: needs.trigger.outputs.retrain == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
       - run: uv sync --locked --extra dev
       - name: Validate the data
         run: uv run python -m nw.triage.data_check
@@ -22,13 +66,17 @@ jobs:
         run: uv run python -m nw.triage.train --no-promote | tee train.log
       - name: Promotion gate against the committed production summary
         id: gate
+        env:
+          NW_ACTOR: ${{ github.actor }}
+          REASON: ${{ inputs.reason || github.event_name }}
         run: |
-          uv run python -m nw.triage.promote --summary data/golden/triage_production.json | tee gate.log
+          uv run python -m nw.triage.promote --summary data/golden/triage_production.json \
+            --reason "$REASON" | tee gate.log
         continue-on-error: true
       - name: Summary
         run: |
           { echo "## Retrain"; echo; echo '```'; cat train.log; echo; cat gate.log; echo '```'; echo; cat artifacts/triage/latest/MODEL_CARD.md 2>/dev/null || cat artifacts/triage/*/MODEL_CARD.md; } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: triage-candidate
           path: |

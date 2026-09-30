@@ -1,4 +1,6 @@
 {
+ "legacy": true,
+ "legacy_reason": "measured 2026-09-27 with the old Claude Workhorse and Judge, before reports carried models, prompt versions, corpus and golden hashes (every result's prompt_version is empty) and before the golden set grew to 111 cases with a dev and gate split. The gate refuses to compare with it. Kept for the record; the per-track baselines are in data/golden/baselines/ (see README.md there).",
  "aggregate": {
   "n": 77,
   "recall_at_k": 1.0,

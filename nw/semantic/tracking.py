@@ -5,9 +5,12 @@ parameters that matter (subset, epochs, learning rate, LoRA rank, alpha, dropout
 length, seed), the validation metrics per epoch, the test metrics of the best epoch, the
 seconds it took and the device. That file is the experiment log the course can always
 read, with no server. When MLflow is installed (the `mlops` extra) the same run is logged
-to the experiment `semantic` and registered as a version of `registered_model_name()`
-(`<environment>-<tenant>-semantic` when `NW_TENANT` is set, `northwind-semantic` when not) with
-the alias `candidate`; the promotion gate moves the alias `production`.
+to the laptop experiment and registered as a version of `registered_model_name()` with the alias
+`candidate` and the tag `source=laptop`; the promotion gate moves the alias `production`. As in
+Project 1 (`nw.triage.tracking`), a laptop run never lands on the platform's model: with
+`NW_TENANT` set it is `<environment>-<tenant>-semantic-laptop` in the experiment
+`<environment>-<tenant>-laptop-semantic`; without, `northwind-semantic` in `semantic`. Only
+pipelines (and `bootstrap`) register `<environment>-<tenant>-semantic`.
 
     uv run python -m nw.semantic.tracking            # the runs table
     make mlflow-ui                                   # the MLflow UI over the same store
@@ -22,7 +25,8 @@ from pathlib import Path
 from typing import Any
 
 from nw.logging import get_logger
-from nw.triage.tracking import mlflow_uri
+from nw.triage.tracking import LAPTOP, mlflow_uri, use_experiment
+from nw.triage.tracking import experiment_name as _experiment_name
 from nw.triage.tracking import registered_model_name as _registered_model_name
 
 log = get_logger("nw.semantic.tracking")
@@ -41,6 +45,10 @@ LOGGED_FILES = (
 
 def registered_model_name() -> str:
     return _registered_model_name("semantic")
+
+
+def experiment_name() -> str:
+    return _experiment_name("semantic")
 
 
 def run_params(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -67,11 +75,16 @@ def record_run(out: Path, metadata: dict[str, Any]) -> dict[str, Any]:
         "test_p0_recall": t["p0_recall"],
         "seconds": metadata["seconds"],
     }
+    from nw.platform.lineage import lineage
+    from nw.platform.lineage import resolve as resolve_git_sha
+
+    found = lineage()
     run = {
         "version": metadata["version"],
         "trained_at": metadata["trained_at"],
         "data_sha256_12": metadata["data_sha256_12"],
-        "git_sha": metadata["git_sha"],
+        "git_sha": resolve_git_sha(metadata["git_sha"]),
+        "lineage": {k: v for k, v in found.items() if k != "git_sha"},
         "device": metadata["device"],
         "params": run_params(metadata),
         "metrics": metrics,
@@ -93,7 +106,8 @@ def _log_to_mlflow(artifact_dir: Path, run: dict[str, Any]) -> dict[str, Any] | 
         log.info("mlflow not installed; run recorded in runs.jsonl only")
         return None
     mlflow.set_tracking_uri(mlflow_uri())
-    mlflow.set_experiment("semantic")
+    mlflow.set_registry_uri(mlflow_uri())  # never a registry another caller pointed at
+    use_experiment(mlflow, experiment_name())
     with mlflow.start_run(run_name=run["version"]) as active:
         mlflow.log_params(
             {
@@ -103,6 +117,7 @@ def _log_to_mlflow(artifact_dir: Path, run: dict[str, Any]) -> dict[str, Any] | 
                 "git_sha": run["git_sha"],
             }
         )
+        mlflow.set_tags({f"lineage.{k}": v for k, v in (run.get("lineage") or {}).items() if v})
         mlflow.log_metrics(run["metrics"])
         for h in run["history"]:
             mlflow.log_metrics(
@@ -122,6 +137,7 @@ def _log_to_mlflow(artifact_dir: Path, run: dict[str, Any]) -> dict[str, Any] | 
         )
         client.set_registered_model_alias(name, "candidate", version.version)
         client.set_model_version_tag(name, version.version, "artifact_version", run["version"])
+        client.set_model_version_tag(name, version.version, "source", LAPTOP)
     return {
         "run_id": active.info.run_id,
         "registered_model": name,
@@ -136,6 +152,7 @@ def set_production_alias(artifact_version: str) -> bool:
     except ImportError:
         return False
     mlflow.set_tracking_uri(mlflow_uri())
+    mlflow.set_registry_uri(mlflow_uri())  # never a registry another caller pointed at
     client = mlflow.MlflowClient()
     name = registered_model_name()
     for mv in client.search_model_versions(f"name='{name}'"):

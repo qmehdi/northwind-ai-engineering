@@ -13,7 +13,13 @@ from typing import Any
 
 import anthropic
 
-from nw.llm.errors import ContentFilteredError, RequestTimeout, RetryableError, TerminalError
+from nw.llm.errors import (
+    RETRYABLE_STATUS,
+    ContentFilteredError,
+    RequestTimeout,
+    RetryableError,
+    TerminalError,
+)
 from nw.llm.types import Completion, Message, StopReason, ToolCall, ToolSpec, Usage
 
 # Models that reject sampling parameters. Sending temperature to these is a 400.
@@ -179,10 +185,30 @@ def classify(exc: Exception) -> RetryableError | TerminalError:
         status = getattr(exc, "status_code", None)
         return RetryableError(str(exc), request_id=request_id, status=status)
     if isinstance(exc, anthropic.APIStatusError):
-        if exc.status_code >= 500:
-            return RetryableError(str(exc), request_id=request_id, status=exc.status_code)
-        return TerminalError(str(exc), request_id=request_id, status=exc.status_code)
+        if exc.status_code >= 500 or exc.status_code in RETRYABLE_STATUS:
+            return RetryableError(
+                str(exc),
+                request_id=request_id,
+                retry_after_s=_retry_after(exc),
+                status=exc.status_code,
+            )
+        return TerminalError(
+            str(exc), request_id=request_id, status=exc.status_code, code=_error_type(exc)
+        )
     return TerminalError(str(exc), request_id=request_id)
+
+
+def _error_type(exc: anthropic.APIStatusError) -> str | None:
+    """The Messages API error type (`not_found_error`, `invalid_request_error`) from the body:
+    `{"type": "error", "error": {"type": ...}}`."""
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict) and isinstance(error.get("type"), str):
+            return error["type"]
+        if isinstance(body.get("type"), str) and body["type"] != "error":
+            return body["type"]
+    return None
 
 
 def _timeout_seconds(timeout: Any) -> float:
@@ -213,6 +239,14 @@ class AnthropicMessagesProvider:
 
     def __init__(self, client: Any) -> None:
         self._client = client
+
+    async def aclose(self) -> None:
+        """Close the SDK's HTTP client (the connection pool); safe to call twice."""
+        close = getattr(self._client, "close", None)
+        if close is not None:
+            result = close()
+            if hasattr(result, "__await__"):
+                await result
 
     async def complete(
         self,

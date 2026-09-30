@@ -1,6 +1,6 @@
 # Cost sheet
 
-> Superseded on 2026-09-29 by `COSTS-platform.md` (ADR 0008 to 0012: the managed platform, cohort and solo modes, open-weight models). Kept for the model price table fetched 2026-09-08 and the network edge prices it cites; the Session path and Reference stack rows below describe infrastructure the course no longer deploys.
+> Archived. Superseded on 2026-09-29 by `deploy/COSTS-platform.md` (ADR 0008 to 0012: the managed platform, cohort and solo modes, open-weight models). Kept for the model price table fetched 2026-09-08 and the network edge prices it cites; the Session path and Reference stack rows below describe infrastructure the course no longer deploys.
 
 Every figure is an estimate from vendor list prices fetched on 2026-09-08 and 2026-09-27 (see the instructor research notes for sources) and must be replaced by the measured figure after the validation run. Model prices: Bedrock global endpoint prices for the AWS track (Sonnet 5 is 3.00 and 15.00 USD per million tokens since 2026-09-01, when launch pricing ended; Opus 5 at 5.00 and 25.00; Haiku 4.5 at 1.00 and 5.00) and first-party list prices for Vertex. The AWS figures below are about 50 percent higher than the same runs on the launch price. Assumptions: cohort of 25, six sessions, us-east-1 and us-central1, participants run in their own accounts.
 

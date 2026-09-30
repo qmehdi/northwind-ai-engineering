@@ -3,17 +3,22 @@
 # person before the canary takes all the traffic. Pull-request checks stay in GitHub Actions.
 #
 # Setup, once, in the Azure DevOps project (deploy/azure/README.md, "Delivery"):
-#   1. A service connection named `northwind-deployer`: Azure Resource Manager, workload identity
-#      federation (manual), bound to the managed identity `northwind-deployer` (the deployment
-#      output NW_AZURE_DEPLOYER_CLIENT_ID). Deploy the platform with NW_ADO_ISSUER and
-#      NW_ADO_SUBJECT set to the issuer and subject the connection shows, so the identity trusts it.
+#   1. Two service connections, Azure Resource Manager, workload identity federation (manual):
+#      `northwind-builder` bound to the managed identity `northwind-builder` (output
+#      NW_AZURE_BUILDER_CLIENT_ID; image pushes only) and `northwind-deployer` bound to
+#      `northwind-deployer` (NW_AZURE_DEPLOYER_CLIENT_ID). Deploy the platform with NW_ADO_ISSUER,
+#      NW_ADO_BUILDER_SUBJECT and NW_ADO_SUBJECT set to what the connections show, so each
+#      identity trusts its own connection. Restrict `northwind-deployer` to this pipeline
+#      (Security, Pipeline permissions) and to `main` (a Branch control check on the connection),
+#      so no other pipeline or branch can sign in as the deployer.
 #   2. Two environments: `northwind-canary` (no checks) and `northwind-live` with an Approvals
 #      check (Environments, northwind-live, Approvals and checks). Approvals are not YAML: the
 #      resource owner sets them, which is the point.
 #   3. A pipeline from this file on the GitHub repository (Azure Pipelines GitHub app).
 #
-# The deployer's rights (deploy/azure/modules/delivery.bicep): AcrPush on the registry and a
-# custom role on the resource group to update the live apps and move their traffic. Nothing else.
+# The rights (deploy/azure/modules/delivery.bicep): the builder pushes images; the deployer holds
+# a custom role on the live apps only (a new revision, the traffic split), the endpoint role on
+# the live online endpoints, and reads the alerts. Nothing on any tenant's app.
 
 trigger:
   branches:
@@ -24,6 +29,7 @@ variables:
   environment: northwind
   resourceGroup: rg-northwind
   serviceConnection: northwind-deployer
+  builderConnection: northwind-builder
   canaryPercent: 10
 
 stages:
@@ -39,15 +45,20 @@ stages:
           - task: AzureCLI@2
             displayName: outputs.json from the platform deployment
             inputs:
-              azureSubscription: $(serviceConnection)
+              azureSubscription: $(builderConnection)
               scriptType: bash
               scriptLocation: inlineScript
               inlineScript: |
                 NW_ENVIRONMENT=$(environment) NW_AZURE_RESOURCE_GROUP=$(resourceGroup) scripts/deploy_azure.sh outputs
+          - script: |
+              curl -fsSL -o /tmp/cosign https://github.com/sigstore/cosign/releases/download/v2.6.5/cosign-linux-amd64
+              echo "c3b4f5410e608af03a5eb0aaac84a4313d8da131248e08ff1759ac70c79d1644  /tmp/cosign" | sha256sum -c -
+              sudo install -m 0755 /tmp/cosign /usr/local/bin/cosign
+            displayName: Install cosign (images are signed with the Key Vault key)
           - task: AzureCLI@2
             displayName: Build and push policy, agent and mcp (tag = commit)
             inputs:
-              azureSubscription: $(serviceConnection)
+              azureSubscription: $(builderConnection)
               scriptType: bash
               scriptLocation: inlineScript
               inlineScript: |
@@ -68,6 +79,11 @@ stages:
               steps:
                 - checkout: self
                   fetchDepth: 1
+                - script: |
+                    curl -fsSL -o /tmp/cosign https://github.com/sigstore/cosign/releases/download/v2.6.5/cosign-linux-amd64
+                    echo "c3b4f5410e608af03a5eb0aaac84a4313d8da131248e08ff1759ac70c79d1644  /tmp/cosign" | sha256sum -c -
+                    sudo install -m 0755 /tmp/cosign /usr/local/bin/cosign
+                  displayName: Install cosign (release verifies the signature)
                 - task: AzureCLI@2
                   displayName: Release by digest
                   inputs:

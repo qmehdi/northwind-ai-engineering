@@ -26,6 +26,7 @@ own, which is what makes a failed agent run readable in a trace viewer.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -147,10 +148,18 @@ def instrument_app(app: Any) -> None:
         @app.middleware("http")
         async def flush_spans(request: Any, call_next: Any) -> Any:
             response = await call_next(request)
-            provider = trace.get_tracer_provider()
-            if isinstance(provider, TracerProvider):
-                provider.force_flush(timeout_millis=2000)
+            await flush_off_loop()
             return response
+
+
+async def flush_off_loop(timeout_millis: int = 2000) -> bool:
+    """`force_flush` in a worker thread. The export is a blocking network call (up to the
+    timeout); on the event loop it would stall every other request in the process, readiness
+    probes included."""
+    provider = trace.get_tracer_provider()
+    if not isinstance(provider, TracerProvider):
+        return True
+    return await asyncio.to_thread(provider.force_flush, timeout_millis)
 
 
 def tracer(name: str) -> trace.Tracer:

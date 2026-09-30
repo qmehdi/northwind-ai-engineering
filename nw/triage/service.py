@@ -38,7 +38,13 @@ from pydantic import BaseModel, Field
 from nw.api import UNVERSIONED, install_version_headers, mount_versioned, version_fields
 from nw.auth import install_api_key
 from nw.config import settings
-from nw.logging import bind_correlation_id, configure_logging, get_logger, log_fields
+from nw.logging import (
+    bind_correlation_id,
+    configure_logging,
+    correlation_id,
+    get_logger,
+    log_fields,
+)
 from nw.metrics_export import start_metrics_export
 from nw.policy.redact import redact_fields
 from nw.ratelimit import install_rate_limit
@@ -70,6 +76,9 @@ SHADOW = Counter("nw_triage_shadow_total", "Shadow model comparisons", ["agree"]
 class TicketIn(BaseModel):
     subject: str = Field(default="", max_length=500)
     body: str = Field(min_length=1, max_length=20000)
+    # The helpdesk's id, when the caller has one: capture lines carry it so the online quality
+    # job (`nw.triage.monitor quality`) can join a prediction with the label that comes later.
+    ticket_id: str | None = Field(default=None, pattern=r"^T-\d{6}$")
 
 
 class State:
@@ -86,8 +95,10 @@ class State:
 state = State()
 
 
-def load_model(path: Path) -> TriageModel:
-    model = TriageModel.load(path)
+def load_model(path: Path, expected_sha256: str | None = None) -> TriageModel:
+    """`expected_sha256` is the registry's hash of the model file when the platform injected
+    one; without it the load checks the hash the training run wrote into the metadata."""
+    model = TriageModel.load(path, expected_sha256=expected_sha256)
     # Probe once so readiness means "can actually score", not "file was found".
     model.predict([{"subject": "probe", "body": "readiness probe"}])
     return model
@@ -103,7 +114,7 @@ async def lifespan(app: FastAPI):
         fallback=Path(os.environ.get("NW_TRIAGE_MODEL", "artifacts/triage/latest"))
     )
     path = state.source.path
-    state.model, state.ready = load_model(path), True  # Step 6: and if it fails?
+    state.model, state.ready = load_model(path), True  # readiness: if it fails?
     _configure_mlops(path)
     yield
     state.model, state.ready = None, False
@@ -119,7 +130,7 @@ def _configure_mlops(path: Path) -> None:
     state.monitor = DriftMonitor(
         profile,
         window=int(os.environ.get("NW_TRIAGE_DRIFT_WINDOW", "500")),
-        min_window=int(os.environ.get("NW_TRIAGE_DRIFT_MIN", "50")),
+        min_window=int(os.environ.get("NW_TRIAGE_DRIFT_MIN", "200")),
     )
     state.drift_every = int(os.environ.get("NW_TRIAGE_DRIFT_EVERY", "50"))
     state.seen = 0
@@ -240,6 +251,8 @@ def _capture(ticket: TicketIn, result: TriageResult, shadow: str | None) -> None
         return
     record = {
         "ts": time.time(),
+        "ticket_id": ticket.ticket_id,
+        "correlation_id": correlation_id(),
         "subject": ticket.subject,
         "body": ticket.body,
         "priority": result.priority,
@@ -266,7 +279,10 @@ def score(ticket: TicketIn) -> TriageResult:
     REQUESTS.labels(outcome="ok").inc()
     PREDICTIONS.labels(priority=result.priority, rule=result.rule).inc()
     _observe(ticket, result)
-    _capture(ticket, result, _shadow(ticket, result))
+    shadow = _shadow(ticket, result)
+    if shadow is not None:
+        state.monitor.observe_shadow(shadow == result.priority)
+    _capture(ticket, result, shadow)
     log.info(
         "triage",
         extra=log_fields(

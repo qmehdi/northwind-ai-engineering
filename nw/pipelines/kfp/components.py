@@ -4,6 +4,12 @@ The bodies are deliberately self-contained: the SDK serialises a lightweight com
 source and runs it in `base_image`, so a body can import only what that image has, and
 nothing from this module. Each body runs the step module as a subprocess with the pipeline's
 parameters as flags, then reads `steps/<name>.json` for what the next component needs.
+
+The subprocess is the launcher `python -m nw.pipelines.source run --source <source_uri> --
+<module>`: with a `source_uri` (every Vertex submit sets one) the step runs the learner's `nw/`
+from the bundle, not the image's copy; `platform_env` (a JSON object of `NW_*` settings the
+Vertex submit sets) tells the gate's champion lookup and the register step which platform
+they are on. On the Local track both are empty and the steps run the checkout.
 An `output_root` of `gs://<bucket>/...` means `/gcs/<bucket>/...`, where Vertex AI Pipelines
 mounts the bucket, so every step of a Vertex run shares one artifact tree.
 
@@ -19,16 +25,27 @@ def build(image: str) -> dict[str, Callable]:
     """The components for `image`, keyed by step name."""
 
     @dsl.component(base_image=image, install_kfp_package=False)
-    def triage_data_check(data_uri: str, output_root: str, profile: dsl.Output[dsl.Metrics]) -> str:
+    def triage_data_check(
+        data_uri: str,
+        output_root: str,
+        profile: dsl.Output[dsl.Metrics],
+        source_uri: str = "",
+        platform_env: str = "",
+    ) -> str:
         import json
         import pathlib
         import subprocess
         import sys
 
         out = f"{output_root.replace('gs://', '/gcs/', 1)}/triage"
+        _launch = [sys.executable, "-m", "nw.pipelines.source", "run"]
+        if source_uri:
+            _launch += ["--source", source_uri]
+        if platform_env:
+            _launch += ["--env", platform_env]
+        _launch += ["--"]
         subprocess.run(
-            [sys.executable, "-m", "nw.pipelines.steps.triage_data_check"]
-            + ["--data", data_uri, "--out", out],
+            _launch + ["nw.pipelines.steps.triage_data_check"] + ["--data", data_uri, "--out", out],
             check=True,
         )
         result = json.loads(pathlib.Path(out, "steps", "triage_data_check.json").read_text())
@@ -45,6 +62,8 @@ def build(image: str) -> dict[str, Callable]:
         target_recall: float = 0.90,
         min_precision: float = 0.25,
         seed: int = 0,
+        source_uri: str = "",
+        platform_env: str = "",
     ) -> str:
         import json
         import pathlib
@@ -52,8 +71,15 @@ def build(image: str) -> dict[str, Callable]:
         import sys
 
         out = f"{output_root.replace('gs://', '/gcs/', 1)}/triage"
+        _launch = [sys.executable, "-m", "nw.pipelines.source", "run"]
+        if source_uri:
+            _launch += ["--source", source_uri]
+        if platform_env:
+            _launch += ["--env", platform_env]
+        _launch += ["--"]
         subprocess.run(
-            [sys.executable, "-m", "nw.pipelines.steps.triage_train"]
+            _launch
+            + ["nw.pipelines.steps.triage_train"]
             + ["--data", data_uri, "--out", out]
             + ["--target-recall", str(target_recall), "--min-precision", str(min_precision)]
             + ["--seed", str(seed)],
@@ -77,6 +103,11 @@ def build(image: str) -> dict[str, Callable]:
         max_brier_increase: float = 0.01,
         max_p0_recall_drop: float = 0.03,
         force: bool = False,
+        champion: str = "registry",
+        tenant: str = "solo",
+        environment: str = "northwind",
+        source_uri: str = "",
+        platform_env: str = "",
     ) -> bool:
         import json
         import pathlib
@@ -84,14 +115,22 @@ def build(image: str) -> dict[str, Callable]:
         import sys
 
         out = f"{output_root.replace('gs://', '/gcs/', 1)}/triage"
+        _launch = [sys.executable, "-m", "nw.pipelines.source", "run"]
+        if source_uri:
+            _launch += ["--source", source_uri]
+        if platform_env:
+            _launch += ["--env", platform_env]
+        _launch += ["--"]
         subprocess.run(
-            [sys.executable, "-m", "nw.pipelines.steps.triage_evaluate"]
+            _launch
+            + ["nw.pipelines.steps.triage_evaluate"]
             + ["--out", out, "--version", version, "--production-summary", production_summary]
             + ["--min-p0-recall", str(min_p0_recall), "--max-ece", str(max_ece)]
             + ["--max-macro-f1-drop", str(max_macro_f1_drop)]
             + ["--max-brier-increase", str(max_brier_increase)]
             + ["--max-p0-recall-drop", str(max_p0_recall_drop)]
-            + ["--force", "true" if force else "false"],
+            + ["--force", "true" if force else "false"]
+            + ["--champion", champion, "--tenant", tenant, "--environment", environment],
             check=True,
         )
         result = json.loads(pathlib.Path(out, "steps", "triage_evaluate.json").read_text())
@@ -102,7 +141,11 @@ def build(image: str) -> dict[str, Callable]:
 
     @dsl.component(base_image=image, install_kfp_package=False)
     def semantic_data_prep(
-        data_uri: str, output_root: str, profile: dsl.Output[dsl.Metrics]
+        data_uri: str,
+        output_root: str,
+        profile: dsl.Output[dsl.Metrics],
+        source_uri: str = "",
+        platform_env: str = "",
     ) -> str:
         import json
         import pathlib
@@ -110,8 +153,15 @@ def build(image: str) -> dict[str, Callable]:
         import sys
 
         out = f"{output_root.replace('gs://', '/gcs/', 1)}/semantic"
+        _launch = [sys.executable, "-m", "nw.pipelines.source", "run"]
+        if source_uri:
+            _launch += ["--source", source_uri]
+        if platform_env:
+            _launch += ["--env", platform_env]
+        _launch += ["--"]
         subprocess.run(
-            [sys.executable, "-m", "nw.pipelines.steps.semantic_data_prep"]
+            _launch
+            + ["nw.pipelines.steps.semantic_data_prep"]
             + ["--data", data_uri, "--out", out],
             check=True,
         )
@@ -132,6 +182,8 @@ def build(image: str) -> dict[str, Callable]:
         seed: int = 0,
         base: str = "",
         max_length: int = 0,
+        source_uri: str = "",
+        platform_env: str = "",
     ) -> str:
         import json
         import pathlib
@@ -139,7 +191,13 @@ def build(image: str) -> dict[str, Callable]:
         import sys
 
         out = f"{output_root.replace('gs://', '/gcs/', 1)}/semantic"
-        cmd = [sys.executable, "-m", "nw.pipelines.steps.semantic_train"]
+        _launch = [sys.executable, "-m", "nw.pipelines.source", "run"]
+        if source_uri:
+            _launch += ["--source", source_uri]
+        if platform_env:
+            _launch += ["--env", platform_env]
+        _launch += ["--"]
+        cmd = _launch + ["nw.pipelines.steps.semantic_train"]
         cmd += ["--data", data_uri, "--out", out, "--epochs", str(epochs)]
         cmd += ["--subset", str(subset), "--lr", str(lr), "--batch-size", str(batch_size)]
         cmd += ["--seed", str(seed)]
@@ -155,15 +213,29 @@ def build(image: str) -> dict[str, Callable]:
         return str(result["version"])
 
     @dsl.component(base_image=image, install_kfp_package=False)
-    def semantic_export(data_uri: str, output_root: str, version: str, parity_n: int = 20) -> float:
+    def semantic_export(
+        data_uri: str,
+        output_root: str,
+        version: str,
+        parity_n: int = 20,
+        source_uri: str = "",
+        platform_env: str = "",
+    ) -> float:
         import json
         import pathlib
         import subprocess
         import sys
 
         out = f"{output_root.replace('gs://', '/gcs/', 1)}/semantic"
+        _launch = [sys.executable, "-m", "nw.pipelines.source", "run"]
+        if source_uri:
+            _launch += ["--source", source_uri]
+        if platform_env:
+            _launch += ["--env", platform_env]
+        _launch += ["--"]
         subprocess.run(
-            [sys.executable, "-m", "nw.pipelines.steps.semantic_export"]
+            _launch
+            + ["nw.pipelines.steps.semantic_export"]
             + ["--out", out, "--version", version, "--data", data_uri, "--n", str(parity_n)],
             check=True,
         )
@@ -178,6 +250,8 @@ def build(image: str) -> dict[str, Callable]:
         table: dsl.Output[dsl.Metrics],
         triage_artifact: str = "",
         latency_n: int = 100,
+        source_uri: str = "",
+        platform_env: str = "",
     ) -> str:
         import json
         import pathlib
@@ -185,7 +259,13 @@ def build(image: str) -> dict[str, Callable]:
         import sys
 
         out = f"{output_root.replace('gs://', '/gcs/', 1)}/semantic"
-        cmd = [sys.executable, "-m", "nw.pipelines.steps.semantic_benchmark"]
+        _launch = [sys.executable, "-m", "nw.pipelines.source", "run"]
+        if source_uri:
+            _launch += ["--source", source_uri]
+        if platform_env:
+            _launch += ["--env", platform_env]
+        _launch += ["--"]
+        cmd = _launch + ["nw.pipelines.steps.semantic_benchmark"]
         cmd += ["--out", out, "--version", version, "--data", data_uri]
         cmd += ["--latency-n", str(latency_n)]
         if triage_artifact:
@@ -209,6 +289,11 @@ def build(image: str) -> dict[str, Callable]:
         max_tag_micro_f1_drop: float = 0.02,
         max_priority_macro_f1_drop: float = 0.02,
         force: bool = False,
+        champion: str = "registry",
+        tenant: str = "solo",
+        environment: str = "northwind",
+        source_uri: str = "",
+        platform_env: str = "",
     ) -> bool:
         import json
         import pathlib
@@ -216,15 +301,23 @@ def build(image: str) -> dict[str, Callable]:
         import sys
 
         out = f"{output_root.replace('gs://', '/gcs/', 1)}/semantic"
+        _launch = [sys.executable, "-m", "nw.pipelines.source", "run"]
+        if source_uri:
+            _launch += ["--source", source_uri]
+        if platform_env:
+            _launch += ["--env", platform_env]
+        _launch += ["--"]
         subprocess.run(
-            [sys.executable, "-m", "nw.pipelines.steps.semantic_gate"]
+            _launch
+            + ["nw.pipelines.steps.semantic_gate"]
             + ["--out", out, "--version", version, "--production-summary", production_summary]
             + ["--min-p0-recall", str(min_p0_recall)]
             + ["--min-tag-micro-f1", str(min_tag_micro_f1)]
             + ["--max-int8-p95-ms", str(max_int8_p95_ms)]
             + ["--max-tag-micro-f1-drop", str(max_tag_micro_f1_drop)]
             + ["--max-priority-macro-f1-drop", str(max_priority_macro_f1_drop)]
-            + ["--force", "true" if force else "false"],
+            + ["--force", "true" if force else "false"]
+            + ["--champion", champion, "--tenant", tenant, "--environment", environment],
             check=True,
         )
         result = json.loads(pathlib.Path(out, "steps", "semantic_gate.json").read_text())
@@ -243,6 +336,8 @@ def build(image: str) -> dict[str, Callable]:
         environment: str = "northwind",
         enabled: bool = True,
         trigger: str = "manual",
+        source_uri: str = "",
+        platform_env: str = "",
     ) -> str:
         import json
         import pathlib
@@ -250,6 +345,12 @@ def build(image: str) -> dict[str, Callable]:
         import sys
 
         out = f"{output_root.replace('gs://', '/gcs/', 1)}/{pipeline}"
+        _launch = [sys.executable, "-m", "nw.pipelines.source", "run"]
+        if source_uri:
+            _launch += ["--source", source_uri]
+        if platform_env:
+            _launch += ["--env", platform_env]
+        _launch += ["--"]
         gate_step = {"triage": "triage_evaluate", "semantic": "semantic_gate"}[pipeline]
         decision = json.loads(pathlib.Path(out, "steps", f"{gate_step}.json").read_text())
         if not passed:
@@ -257,7 +358,8 @@ def build(image: str) -> dict[str, Callable]:
         if not enabled:
             return f"not registered: registration disabled for this run ({version})"
         subprocess.run(
-            [sys.executable, "-m", "nw.pipelines.steps.register"]
+            _launch
+            + ["nw.pipelines.steps.register"]
             + ["--pipeline", pipeline, "--out", out, "--version", version]
             + ["--tenant", tenant, "--environment", environment, "--trigger", trigger],
             check=True,

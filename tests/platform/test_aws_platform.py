@@ -6,6 +6,7 @@ model fails here before it fails in an account."""
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import tarfile
@@ -147,6 +148,9 @@ def test_registry_register_uploads_and_creates_a_pending_package(cfg, tenant, tm
                     "commit": "abc",
                     "metric:f1_macro": "0.91",
                     "nw:tenant": "alice",
+                    "nw:stage": "candidate",
+                    # the deployer injects it as NW_MODEL_SHA256 and the handler checks it
+                    "model_sha256": hashlib.sha256(b"model").hexdigest(),
                 },
                 "ModelMetrics": ANY,
                 "Tags": [
@@ -190,6 +194,15 @@ def test_registry_register_falls_back_to_the_prebuilt_image():
 def test_registry_set_stage_approves_and_live_promotes_into_the_live_group(cfg, tenant):
     sm = client("sagemaker")
     with Stubber(sm) as st:
+        # the step-back rule reads who holds `live` first: nobody else here
+        st.add_response(
+            "list_model_packages",
+            {"ModelPackageSummaryList": [summary(PKG_ARN, 3)]},
+            listed("northwind-alice-triage"),
+        )
+        st.add_response(
+            "describe_model_package", described_package(), {"ModelPackageName": PKG_ARN}
+        )
         st.add_response(
             "describe_model_package", described_package(), {"ModelPackageName": PKG_ARN}
         )
@@ -242,66 +255,99 @@ def test_registry_set_stage_approves_and_live_promotes_into_the_live_group(cfg, 
     assert v.stage == Stage.LIVE and v.metrics == {"f1_macro": 0.91}
 
 
+def summary(arn, version):
+    return {
+        "ModelPackageName": "n",
+        "ModelPackageArn": arn,
+        "ModelPackageVersion": version,
+        "CreationTime": 1,
+        "ModelPackageStatus": "Completed",
+    }
+
+
+def listed(group):
+    return {"ModelPackageGroupName": group, "SortBy": "CreationTime", "SortOrder": "Ascending"}
+
+
 def test_registry_versions_and_live_read_approval_status(cfg, tenant):
+    """Oldest first; `Rejected` is retired; `live()` is the `nw:stage=live` package only,
+    never an approved one (the contract's rules)."""
     sm = client("sagemaker")
+    pkg2 = PKG_ARN[:-1] + "2"
     with Stubber(sm) as st:
         st.add_response(
             "list_model_packages",
-            {
-                "ModelPackageSummaryList": [
-                    {
-                        "ModelPackageName": "n",
-                        "ModelPackageArn": PKG_ARN,
-                        "ModelPackageVersion": 3,
-                        "CreationTime": 1,
-                        "ModelPackageStatus": "Completed",
-                    },
-                    {
-                        "ModelPackageName": "n",
-                        "ModelPackageArn": PKG_ARN[:-1] + "2",
-                        "ModelPackageVersion": 2,
-                        "CreationTime": 1,
-                        "ModelPackageStatus": "Completed",
-                    },
-                ]
-            },
-            {
-                "ModelPackageGroupName": "northwind-alice-triage",
-                "SortBy": "CreationTime",
-                "SortOrder": "Descending",
-            },
+            {"ModelPackageSummaryList": [summary(pkg2, 2), summary(PKG_ARN, 3)]},
+            listed("northwind-alice-triage"),
+        )
+        st.add_response(
+            "describe_model_package",
+            described_package(arn=pkg2, status="Approved", version=2),
+            {"ModelPackageName": pkg2},
         )
         st.add_response(
             "describe_model_package",
             described_package(status="Rejected"),
             {"ModelPackageName": PKG_ARN},
         )
-        st.add_response(
-            "describe_model_package",
-            described_package(arn=PKG_ARN[:-1] + "2", status="Approved", version=2),
-            {"ModelPackageName": PKG_ARN[:-1] + "2"},
-        )
         registry = platform.SageMakerRegistry(sm, client("s3"), cfg)
         versions = registry.versions(tenant, "triage")
-        assert [v.stage for v in versions] == [Stage.RETIRED, Stage.APPROVED]
+        assert [v.version for v in versions] == ["2", "3"]
+        assert [v.stage for v in versions] == [Stage.APPROVED, Stage.RETIRED]
     with Stubber(sm) as st:
-        st.add_response(
-            "list_model_packages",
-            {
-                "ModelPackageSummaryList": [
-                    {
-                        "ModelPackageName": "n",
-                        "ModelPackageArn": PKG_ARN,
-                        "ModelPackageVersion": 3,
-                        "CreationTime": 1,
-                        "ModelPackageStatus": "Completed",
-                    }
-                ]
-            },
-        )
+        st.add_response("list_model_packages", {"ModelPackageSummaryList": [summary(PKG_ARN, 3)]})
         st.add_response("describe_model_package", described_package(status="Approved"))
+        assert registry.live(tenant, "triage") is None, "approved is not live"
+    with Stubber(sm) as st:
+        st.add_response("list_model_packages", {"ModelPackageSummaryList": [summary(PKG_ARN, 3)]})
+        st.add_response(
+            "describe_model_package",
+            described_package(status="Approved", metadata={"nw:stage": "live"}),
+        )
         live = registry.live(tenant, "triage")
-    assert live is not None and live.version == "3"
+    assert live is not None and live.version == "3" and live.stage == Stage.LIVE
+
+
+def test_registry_of_a_group_that_does_not_exist_is_empty(cfg, tenant):
+    sm = client("sagemaker")
+    with Stubber(sm) as st:
+        st.add_client_error("list_model_packages", service_error_code="ValidationException")
+        assert platform.SageMakerRegistry(sm, client("s3"), cfg).versions(tenant, "triage") == []
+
+
+def test_one_registration_path_the_pipeline_step_uses_the_registry(cfg):
+    """The SageMaker pipeline's Register step runs `nw.pipelines.steps.register` under this
+    registry, so a pipeline package and a bootstrap package carry the same metadata."""
+    pytest.importorskip("sagemaker.mlops.workflow.pipeline")
+    from nw.pipelines.sagemaker import SageMakerConfig, fake_session
+    from nw.pipelines.sagemaker.definitions import definition
+
+    config = SageMakerConfig(
+        tenant=Tenant("alice"), role_arn="arn:aws:iam::1:role/r", image_uri="img", bucket="b"
+    )
+    d = definition("triage", config, fake_session())
+    [register] = d["Steps"][-1]["Arguments"]["IfSteps"]
+    assert register["Type"] == "Processing", "no RegisterModel step with its own metadata"
+    assert register["Arguments"]["AppSpecification"]["ContainerEntrypoint"][-1] == (
+        "nw.pipelines.steps.register"
+    )
+
+
+def test_a_packaging_error_is_not_swallowed(tmp_path, monkeypatch):
+    """Only the kind check may say 'not servable'; a missing file while packaging a triage
+    artifact propagates instead of shipping a tarball without inference.py."""
+    from nw.serving.sagemaker import package as pkg
+
+    d = tmp_path / "m"
+    d.mkdir()
+    (d / "model.joblib").write_bytes(b"m")
+
+    def broken(*a, **k):
+        raise FileNotFoundError("inference.py source missing")
+
+    monkeypatch.setattr(pkg, "package", broken)
+    with pytest.raises(FileNotFoundError, match="inference.py"):
+        platform._tarball(d)
 
 
 def test_registry_download_extracts_the_tarball(cfg, tenant, tmp_path):
@@ -371,6 +417,7 @@ def test_pipelines_submit_status_wait_and_logs(cfg, tenant):
                 "PipelineExecutionDisplayName": ANY,
                 "PipelineParameters": [
                     {"Name": "Epochs", "Value": "3"},
+                    {"Name": "SourceUri", "Value": SOURCE_URI},
                     {"Name": "DataUri", "Value": "s3://northwind-data/data/tickets/"},
                     {
                         "Name": "OutputRoot",
@@ -413,11 +460,21 @@ def test_pipelines_submit_status_wait_and_logs(cfg, tenant):
                 "limit": 1000,
             },
         )
+        s3 = source_s3()
         runner = platform.SageMakerPipelines(
-            sm, logs, pipeline_cfg(cfg), sleep=naps.append, poll_s=5, definitions=fake_definition
+            sm,
+            logs,
+            pipeline_cfg(cfg),
+            sleep=naps.append,
+            poll_s=5,
+            definitions=fake_definition,
+            s3=s3,
+            bundler=lambda: BUNDLE,
         )
         assert isinstance(runner, PipelineRunner)
         run = runner.submit(tenant, "triage", {"Epochs": 3})
+        # the learner's code was uploaded once and handed to the run
+        assert s3.objects[("northwind-artifacts", SOURCE_KEY)] == b"bundle"
         assert (
             run.status == RunStatus.QUEUED
             and run.run_id == EXEC_ARN
@@ -433,6 +490,28 @@ def test_pipelines_submit_status_wait_and_logs(cfg, tenant):
 PIPELINE_ARN = f"arn:aws:sagemaker:{REGION}:{ACCOUNT}:pipeline/northwind-alice-triage"
 PIPELINE_IMAGE = f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/nw-pipelines:test"
 DEFINITION = '{"Version": "2020-12-01", "Steps": []}'
+SOURCE_KEY = "tenants/alice/source/nw-source-0123456789ab.tar.gz"
+SOURCE_URI = f"s3://northwind-artifacts/{SOURCE_KEY}"
+
+
+def _bundle():
+    import tempfile
+    from pathlib import Path
+
+    from nw.pipelines.source import Bundle
+
+    path = Path(tempfile.mkdtemp()) / "nw-source-0123456789ab.tar.gz"
+    path.write_bytes(b"bundle")
+    return Bundle(path=path, sha256_12="0123456789ab", git_sha="abc", files=1)
+
+
+BUNDLE = _bundle()
+
+
+def source_s3():
+    from tests.platform.aws_fakes import FakeS3
+
+    return FakeS3()
 
 
 def pipeline_cfg(cfg):
@@ -492,6 +571,7 @@ def test_submit_on_a_missing_pipeline_creates_it_then_starts_it(cfg, tenant):
                 "PipelineParameters": [
                     {"Name": "Force", "Value": "true"},
                     {"Name": "MinP0Recall", "Value": "0.9"},
+                    {"Name": "SourceUri", "Value": SOURCE_URI},
                     {"Name": "DataUri", "Value": "s3://northwind-data/data/tickets/"},
                     {
                         "Name": "OutputRoot",
@@ -506,7 +586,12 @@ def test_submit_on_a_missing_pipeline_creates_it_then_starts_it(cfg, tenant):
             },
         )
         runner = platform.SageMakerPipelines(
-            sm, client("logs"), pipeline_cfg(cfg), definitions=fake_definition
+            sm,
+            client("logs"),
+            pipeline_cfg(cfg),
+            definitions=fake_definition,
+            s3=source_s3(),
+            bundler=lambda: BUNDLE,
         )
         run = runner.submit(
             tenant,
@@ -521,10 +606,13 @@ def test_submit_on_a_missing_pipeline_creates_it_then_starts_it(cfg, tenant):
     assert config.bucket == "northwind-artifacts" and config.region == REGION
     # The definition's defaults are the deployed locations, so a scheduled run that passes
     # nothing still reads the S3 tickets and the production summary the deploy uploaded.
+    # The definition's `SourceUri` defaults to the bundle, so the weekly schedule runs the last
+    # submitted code, not the image's.
     assert config.defaults == {
         "data_uri": "s3://northwind-data/data/tickets/",
         "output_root": "s3://northwind-artifacts/tenants/alice/pipelines",
         "production_summary": "s3://northwind-artifacts/baselines/triage_production.json",
+        "source_uri": SOURCE_URI,
     }
 
 
@@ -543,12 +631,27 @@ def test_upsert_on_an_existing_pipeline_updates_it_and_is_idempotent(cfg, tenant
                 {"PipelineArn": PIPELINE_ARN},
                 {**upserted("northwind-alice-semantic"), "RoleArn": role},
             )
+        s3 = source_s3()
         runner = platform.SageMakerPipelines(
-            sm, client("logs"), pipeline_cfg(cfg), definitions=fake_definition
+            sm,
+            client("logs"),
+            pipeline_cfg(cfg),
+            definitions=fake_definition,
+            s3=s3,
+            bundler=lambda: BUNDLE,
         )
         assert runner.upsert(tenant, "semantic", {"role_arn": role}) == PIPELINE_ARN
         assert runner.upsert(tenant, "semantic", {"role_arn": role}) == PIPELINE_ARN
         st.assert_no_pending_responses()
+    assert list(s3.objects) == [("northwind-artifacts", SOURCE_KEY)], "uploaded once"
+
+
+def test_upsert_without_s3_refuses_to_run_the_image_code(cfg, tenant):
+    runner = platform.SageMakerPipelines(
+        client("sagemaker"), client("logs"), pipeline_cfg(cfg), definitions=fake_definition
+    )
+    with pytest.raises(ValueError, match="image's code"):
+        runner.upsert(tenant, "triage")
 
 
 def test_upsert_needs_the_pipelines_image(cfg, tenant):
@@ -579,6 +682,14 @@ def test_pipelines_wait_times_out(cfg, tenant):
 def test_endpoints_deploy_in_cohort_mode_is_the_approval(cfg, tenant):
     sm = client("sagemaker")
     with Stubber(sm) as st:
+        st.add_response(
+            "list_model_packages",
+            {"ModelPackageSummaryList": [summary(PKG_ARN, 3)]},
+            listed("northwind-alice-triage"),
+        )
+        st.add_response(
+            "describe_model_package", described_package(), {"ModelPackageName": PKG_ARN}
+        )
         st.add_response(
             "describe_model_package", described_package(), {"ModelPackageName": PKG_ARN}
         )
@@ -792,119 +903,31 @@ def test_prompts_register_creates_a_prompt_and_a_version_with_the_hash(cfg, tena
 
 
 def test_prompts_get_set_stage_and_versions(cfg, tenant):
-    agent = client("bedrock-agent")
-    text = "Answer from policy."
-    sha = platform.prompt_hash(text)
-    summaries = {
-        "promptSummaries": [
-            {
-                "name": "northwind-alice-policy-answer",
-                "id": "PROMPT1234",
-                "arn": prompt_body("DRAFT")["arn"],
-                "version": "DRAFT",
-                "createdAt": "2026-09-29T00:00:00Z",
-                "updatedAt": "2026-09-29T00:00:00Z",
-            }
-        ]
-    }
-    versions = {
-        "promptSummaries": [
-            {
-                "name": "northwind-alice-policy-answer",
-                "id": "PROMPT1234",
-                "arn": prompt_body("DRAFT")["arn"],
-                "version": "DRAFT",
-                "createdAt": "2026-09-29T00:00:00Z",
-                "updatedAt": "2026-09-29T00:00:00Z",
-            },
-            {
-                "name": "northwind-alice-policy-answer",
-                "id": "PROMPT1234",
-                "arn": prompt_body("1")["arn"],
-                "version": "1",
-                "createdAt": "2026-09-29T00:00:00Z",
-                "updatedAt": "2026-09-29T00:00:00Z",
-            },
-            {
-                "name": "northwind-alice-policy-answer",
-                "id": "PROMPT1234",
-                "arn": prompt_body("2")["arn"],
-                "version": "2",
-                "createdAt": "2026-09-29T00:00:00Z",
-                "updatedAt": "2026-09-29T00:00:00Z",
-            },
-        ]
-    }
+    """On a stateful Bedrock fake: the live version wins `get`, a stage moves with the previous
+    holder stepping back, the same text registers once, versions are oldest first."""
+    from tests.platform.aws_fakes import FakeBedrockAgent
+
+    agent = FakeBedrockAgent()
     store = platform.BedrockPrompts(agent, cfg)
-    with Stubber(agent) as st:
-        # get with no version: the live tag wins over the newest number
-        st.add_response("list_prompts", summaries, {"maxResults": 100})
-        st.add_response(
-            "list_prompts", versions, {"promptIdentifier": "PROMPT1234", "maxResults": 100}
-        )
-        st.add_response(
-            "list_tags_for_resource",
-            {"tags": {"nw:live_version": "1"}},
-            {"resourceArn": prompt_body("DRAFT")["arn"]},
-        )
-        st.add_response(
-            "get_prompt",
-            prompt_body("1", text),
-            {"promptIdentifier": "PROMPT1234", "promptVersion": "1"},
-        )
-        st.add_response(
-            "list_tags_for_resource",
-            {"tags": {"nw:stage": "live", "nw:sha256_12": sha, "owner": "alice"}},
-            {"resourceArn": prompt_body("1")["arn"]},
-        )
-        v = store.get(tenant, "policy.answer")
-        assert (
-            v.version == "1"
-            and v.stage == Stage.LIVE
-            and v.tags == {"owner": "alice"}
-            and v.text == text
-        )
-        # set_stage LIVE tags the version and the prompt
-        st.add_response("list_prompts", summaries, {"maxResults": 100})
-        st.add_response(
-            "get_prompt",
-            prompt_body("2", text),
-            {"promptIdentifier": "PROMPT1234", "promptVersion": "2"},
-        )
-        st.add_response(
-            "tag_resource",
-            {},
-            {"resourceArn": prompt_body("2")["arn"], "tags": {"nw:stage": "live"}},
-        )
-        st.add_response(
-            "tag_resource",
-            {},
-            {"resourceArn": prompt_body("DRAFT")["arn"], "tags": {"nw:live_version": "2"}},
-        )
-        st.add_response(
-            "list_tags_for_resource",
-            {"tags": {"nw:stage": "live"}},
-            {"resourceArn": prompt_body("2")["arn"]},
-        )
-        assert store.set_stage(tenant, "policy.answer", "2", Stage.LIVE).stage == Stage.LIVE
-        # versions skips DRAFT
-        st.add_response("list_prompts", summaries, {"maxResults": 100})
-        st.add_response(
-            "list_prompts", versions, {"promptIdentifier": "PROMPT1234", "maxResults": 100}
-        )
-        for n in ("1", "2"):
-            st.add_response("list_prompts", summaries, {"maxResults": 100})
-            st.add_response(
-                "get_prompt",
-                prompt_body(n, text),
-                {"promptIdentifier": "PROMPT1234", "promptVersion": n},
-            )
-            st.add_response(
-                "list_tags_for_resource",
-                {"tags": {"nw:stage": "candidate"}},
-                {"resourceArn": prompt_body(n)["arn"]},
-            )
-        assert [p.version for p in store.versions(tenant, "policy.answer")] == ["1", "2"]
+    text = "Answer from policy."
+    a = store.register(tenant, "policy.answer", text, {"owner": "alice"})
+    assert store.register(tenant, "policy.answer", text, {"owner": "alice"}).version == a.version
+    assert agent.created_versions == 1, "no second Bedrock version for the same text"
+    b = store.register(tenant, "policy.answer", "Answer from policy, cite it.", {})
+    assert [v.version for v in store.versions(tenant, "policy.answer")] == ["1", "2"]
+    store.set_stage(tenant, "policy.answer", "1", Stage.LIVE)
+    got = store.get(tenant, "policy.answer")
+    assert (got.version, got.stage, got.text, got.tags) == (
+        "1",
+        Stage.LIVE,
+        text,
+        {"owner": "alice"},
+    )
+    arn = f"arn:aws:bedrock:us-east-1:123456789012:prompt/{agent.list_prompts()['promptSummaries'][0]['id']}"
+    assert agent.tags[arn]["nw:live_version"] == "1"
+    store.set_stage(tenant, "policy.answer", b.version, Stage.LIVE)
+    stages = {v.version: v.stage for v in store.versions(tenant, "policy.answer")}
+    assert stages == {"1": Stage.RETIRED, "2": Stage.LIVE}
 
 
 def test_prompts_get_unknown_raises(cfg, tenant):
@@ -1102,6 +1125,8 @@ def test_agents_deploy_creates_then_updates(cfg, tenant):
                     "NW_APP": "nw.agent.agentcore:app",
                     "NW_AGENT_ROLE": "resolver",
                     "PORT": "8080",
+                    "NW_RUNTIME_AUTH": "platform",
+                    "NW_REDACT_DETECTOR": "heuristic",
                 },
                 "description": "alice resolver, agent version v7",
                 "clientToken": ANY,
@@ -1282,7 +1307,13 @@ def test_config_reads_outputs_json_and_environment(tmp_path, monkeypatch):
                     "RegistryId": "REG1",
                     "GatewayUrl": "http://g",
                     "KnowledgeBases": "alice=KB1,live=KB2",
-                    "PipelineImage": "1.dkr.ecr.us-east-1.amazonaws.com/northwind-pipelines:latest",
+                    "PipelineImage": "/northwind/images/pipelines",
+                    "ServingRoleArns": "alice=arn:serving-alice,bob=arn:serving-bob",
+                    "RuntimeRoleArns": "alice=arn:agentcore-alice",
+                    "TenantApiKeys": "alice=arn:secret-alice",
+                    "AgentNetworkMode": "VPC",
+                    "AgentSubnets": "subnet-1,subnet-2",
+                    "AgentSecurityGroup": "sg-1",
                 }
             }
         )
@@ -1296,7 +1327,15 @@ def test_config_reads_outputs_json_and_environment(tmp_path, monkeypatch):
         and cfg.images == {"triage": "img:1"}
     )
     assert cfg.direct_deploy is True, "no tenant set means solo, which deploys directly"
-    assert cfg.pipeline_image == "1.dkr.ecr.us-east-1.amazonaws.com/northwind-pipelines:latest"
+    assert cfg.pipeline_image == "/northwind/images/pipelines", "an SSM parameter name"
+    assert cfg.serving_role_for(Tenant("alice")) == "arn:serving-alice"
+    assert cfg.serving_role_for(Tenant("carol")) == "arn:s", "the live role as the fallback"
+    assert cfg.runtime_role_for(Tenant("alice")) == "arn:agentcore-alice"
+    assert cfg.tenant_api_keys == {"alice": "arn:secret-alice"}
+    assert cfg.network_configuration() == {
+        "networkMode": "VPC",
+        "networkModeConfig": {"subnets": ["subnet-1", "subnet-2"], "securityGroups": ["sg-1"]},
+    }
     monkeypatch.setenv("NW_AWS_PIPELINE_IMAGE", "mine:1")
     assert (
         platform.AwsPlatformConfig.from_settings(
@@ -1311,3 +1350,93 @@ def test_config_reads_outputs_json_and_environment(tmp_path, monkeypatch):
         ).data_bucket
         == "override"
     )
+
+
+def test_register_uploads_the_monitor_baseline_beside_the_model(cfg, tenant, tmp_path):
+    from tests.platform.aws_fakes import FakeS3, FakeSageMaker
+
+    art = tmp_path / "triage"
+    art.mkdir()
+    (art / "metadata.json").write_text(json.dumps({"version": "v1", "model_sha256": "f00d"}))
+    (art / "data_profile.json").write_text(
+        json.dumps(
+            {
+                "n": 10,
+                "text_length_bins": [0, 50, 100],
+                "text_length_hist": [0.5, 0.5],
+                "data_sha256_12": "abc",
+            }
+        )
+    )
+    s3, sm = FakeS3(), FakeSageMaker()
+    v = platform.SageMakerRegistry(sm, s3, cfg).register(tenant, "triage", art, {}, {})
+    folder = v.uri.removeprefix("s3://northwind-artifacts/").rsplit("/", 1)[0]
+    keys = {k for _, k in s3.objects}
+    assert {f"{folder}/baseline/statistics.json", f"{folder}/baseline/constraints.json"} <= keys
+    [package] = sm.groups["northwind-alice-triage"]
+    assert package["CustomerMetadataProperties"]["model_sha256"] == "f00d"
+
+
+def test_agents_deploy_uses_the_tenants_role_its_key_and_the_vpc(cfg, tenant):
+    from dataclasses import replace
+
+    vpc = replace(
+        cfg,
+        runtime_role_arns={"alice": "arn:aws:iam::123456789012:role/northwind-alice-agentcore"},
+        tenant_api_keys={"alice": "arn:aws:secretsmanager:us-east-1:123456789012:secret:k"},
+        agent_network_mode="VPC",
+        agent_subnets=("subnet-1",),
+        agent_security_group="sg-1",
+    )
+    control = client("bedrock-agentcore-control")
+    with Stubber(control) as st:
+        st.add_response("list_agent_runtimes", {"agentRuntimes": []}, {"maxResults": 100})
+        st.add_response(
+            "create_agent_runtime",
+            {
+                "agentRuntimeArn": RUNTIME_ARN,
+                "agentRuntimeId": "northwind_alice_resolver-abc",
+                "agentRuntimeVersion": "1",
+                "createdAt": "2026-09-29T00:00:00Z",
+                "status": "CREATING",
+            },
+            {
+                "agentRuntimeName": "northwind_alice_resolver",
+                "agentRuntimeArtifact": ANY,
+                "roleArn": "arn:aws:iam::123456789012:role/northwind-alice-agentcore",
+                "networkConfiguration": {
+                    "networkMode": "VPC",
+                    "networkModeConfig": {"subnets": ["subnet-1"], "securityGroups": ["sg-1"]},
+                },
+                "protocolConfiguration": {"serverProtocol": "HTTP"},
+                "environmentVariables": ANY,
+                "description": ANY,
+                "clientToken": ANY,
+            },
+        )
+        agents = platform.AgentCoreRuntime(
+            control, client("bedrock-agentcore"), client("agent-registry-control"), vpc
+        )
+        agents.deploy(tenant, "img@sha256:abc", {}, version="v1")
+        st.assert_no_pending_responses()
+    with pytest.raises(ValueError, match="AgentSubnets"):
+        replace(vpc, agent_subnets=()).network_configuration()
+
+
+def test_the_pipelines_image_is_read_from_its_ssm_parameter(cfg, tenant):
+    from dataclasses import replace
+
+    class Ssm:
+        def get_parameter(self, Name):  # noqa: N803
+            assert Name == "/northwind/images/pipelines"
+            return {"Parameter": {"Value": f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/p@sha256:1"}}
+
+    runner = platform.SageMakerPipelines(
+        client("sagemaker"),
+        client("logs"),
+        replace(cfg, pipeline_image="/northwind/images/pipelines"),
+        ssm=Ssm(),
+    )
+    config = runner.pipeline_config(tenant, {}, "triage")
+    assert config.image_uri.endswith("/p@sha256:1")
+    assert config.role_arn == f"arn:aws:iam::{ACCOUNT}:role/northwind-alice-sagemaker"

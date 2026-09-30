@@ -79,8 +79,12 @@ def test_repository_changelog_and_docs_are_in_shape():
     ):
         text = doc.read_text()
         assert chr(0x2014) not in text and chr(0x2013) not in text, f"dash in {doc.name}"
+    # Current decisions in docs/adr, superseded ones kept in docs/archive/adr; numbers never reused.
     adrs = sorted(p.name for p in (ROOT / "docs" / "adr").glob("*.md"))
-    assert len(adrs) == 5 and adrs[0].startswith("0001-") and adrs[-1].startswith("0005-")
+    archived = sorted(p.name for p in (ROOT / "docs" / "archive" / "adr").glob("*.md"))
+    assert adrs, "no current decision records"
+    numbers = [n[:4] for n in adrs + archived]
+    assert len(numbers) == len(set(numbers)), "an ADR number is used twice"
     for p in (ROOT / "docs" / "adr").glob("*.md"):
         text = p.read_text()
         assert "## Context" in text and "## Decision" in text and "## Consequences" in text

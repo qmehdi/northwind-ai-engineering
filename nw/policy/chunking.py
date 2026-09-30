@@ -71,7 +71,8 @@ def parse_document(text: str) -> Document:
     return Document(
         doc_id=str(meta["doc_id"]),
         title=str(meta["title"]),
-        audience=str(meta.get("audience", "customer")),
+        # Fail closed: a document that does not say it is for customers is internal.
+        audience="customer" if meta.get("audience", "").strip() == "customer" else "internal",
         effective=str(meta["effective"]),
         supersedes=None if supersedes in (None, "none", "") else str(supersedes),
         body=body,
@@ -80,7 +81,7 @@ def parse_document(text: str) -> Document:
 
 def split_sections(body: str) -> list[tuple[str, str]]:
     """(heading, text) pairs. Text before the first heading is the preamble."""
-    return [("Whole document", body.strip())]  # Step 3: split on headings
+    return [("Whole document", body.strip())]  # the chunking step: split on headings
 
 
 def approx_tokens(text: str) -> int:
