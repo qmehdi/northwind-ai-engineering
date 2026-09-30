@@ -29,12 +29,13 @@ from typing import Any
 
 from nw.agent.screen import Screener
 from nw.agent.tools import ToolRegistry, untrusted
-from nw.agent.trace import Step, Termination, Trajectory
+from nw.agent.trace import ProposedAction, Step, Termination, Trajectory
 from nw.agent.version import agent_version
 from nw.config import ModelRole
 from nw.llm import LLMClient
+from nw.llm.errors import LLMError, ResidencyError, SpendCapExceeded
 from nw.llm.residency import bind_residency, residency_for_account
-from nw.llm.types import Completion, StopReason, ToolCall
+from nw.llm.types import Completion, Message, StopReason, ToolCall, ToolResult
 from nw.logging import correlation_id, get_logger, log_fields
 from nw.policy.redact import redact, redact_for_agent
 from nw.telemetry import span
@@ -206,7 +207,108 @@ async def _loop(
             )
             return t
 
-    raise NotImplementedError("The loop: the caps, the approval gate, the trace")
+    # SOLUTION BEGIN
+    messages: list[Message] = [Message.user(untrusted(task))]
+    specs = registry.specs()
+    for index in range(max_steps):
+        step = Step(index=index)
+        if run.total_usd >= budget_usd:  # this run's spend, whatever else the process does
+            t.terminated = Termination.BUDGET
+            t.final = "Stopped: the run's budget was exhausted before an answer."
+            break
+        if max_total_tokens is not None and t.tokens_total >= max_total_tokens:
+            t.terminated = Termination.BUDGET
+            t.final = (
+                f"Stopped: the run's token budget ({max_total_tokens}) was exhausted "
+                f"after {t.tokens_total} tokens, before an answer."
+            )
+            break
+        try:
+            completion = await client.complete(
+                messages, role=role, system=system, tools=specs, max_tokens=max_tokens
+            )
+            step.cost_usd = completion.cost_usd
+        except ResidencyError as exc:
+            t.terminated = Termination.ERROR
+            t.final = (
+                "Refused: this account's data must stay in its residency zone and no model "
+                f"is available there on this track ({exc})."
+            )
+            t.steps.append(step)
+            break
+        except SpendCapExceeded as exc:
+            t.terminated = Termination.BUDGET
+            t.final = f"Stopped: {exc}"
+            t.steps.append(step)
+            break
+        except LLMError as exc:
+            t.terminated = Termination.ERROR
+            t.final = f"Stopped: model error: {exc}"
+            t.steps.append(step)
+            break
+        step.input_tokens, step.output_tokens = (
+            completion.usage.input_tokens,
+            completion.usage.output_tokens,
+        )
+        step.latency_ms = completion.usage.latency_ms
+        step.thought = completion.text or None
+        t.tokens_total += step.input_tokens + step.output_tokens
+
+        if completion.stop_reason is StopReason.MAX_TOKENS:
+            t.final = "Stopped: the reply was truncated at max_tokens"
+            t.terminated = Termination.ERROR
+            t.steps.append(step)
+            break
+        if not completion.tool_calls:
+            t.final = completion.text
+            t.terminated = Termination.ANSWER
+            t.steps.append(step)
+            break
+
+        messages.append(Message.from_completion(completion))  # the model's own blocks, replayed
+        results: list[ToolResult] = []
+        for k, call in enumerate(completion.tool_calls):
+            sub = step if k == 0 else Step(index=index, input_tokens=0, output_tokens=0)
+            sub.tool, sub.arguments = call.name, call.arguments
+            approved = await _decide(approval, call, registry)
+            obs = await registry.execute(call.name, call.arguments, approved=approved)
+            obs.content = await _guard_observation(obs.content, obs.ok, screener, run_id)
+            sub.observation, sub.ok, sub.pending_approval = (
+                obs.content,
+                obs.ok,
+                obs.pending_approval,
+            )
+            sub.latency_ms += obs.latency_ms
+            t.tools_called.append(call.name)
+            if obs.pending_approval:
+                t.proposed_actions.append(
+                    ProposedAction(tool=call.name, arguments=call.arguments, step=index)
+                )
+            results.append(
+                ToolResult(
+                    tool_call_id=call.id, content=_wrap(obs.content, obs.ok), is_error=not obs.ok
+                )
+            )
+            log.info(
+                "tool",
+                extra=log_fields(
+                    run_id=run_id,
+                    step=index,
+                    tool=call.name,
+                    ok=obs.ok,
+                    pending=obs.pending_approval,
+                    latency_ms=round(obs.latency_ms, 1),
+                ),
+            )
+            if k > 0:
+                t.steps.append(sub)
+        t.steps.insert(len(t.steps) - max(0, len(completion.tool_calls) - 1), step)
+        messages.append(Message.results(results))
+    else:
+        t.terminated = Termination.MAX_STEPS
+        t.final = f"Stopped: reached the step cap of {max_steps} without an answer."
+    # STUB: raise NotImplementedError("The loop: the caps, the approval gate, the trace")
+    # SOLUTION END
 
     # The final reply is customer-facing. Sensitive values that came in with the ticket must
     # not go back out, whatever the model did: enforce it in code, the way the policy service does.

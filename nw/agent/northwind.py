@@ -202,7 +202,22 @@ def build_registry(
     )
     def check_entitlement(args: CheckEntitlement) -> dict[str, Any]:
         account_id = authorise_account(args.account_id)
-        return {"account_id": account_id, "entitled": True, "reason": "not implemented"}
+        # SOLUTION BEGIN
+        acct = accounts.get(account_id)
+        if acct is None:
+            raise KeyError(f"no account {account_id}")
+        feature = args.feature.lower().strip()
+        entitled = feature in acct["features"]
+        return {
+            "account_id": account_id,
+            "feature": feature,
+            "entitled": entitled,
+            "tier": acct["tier"],
+            "reason": f"{acct['tier']} plan {'includes' if entitled else 'does not include'} "
+            f"{feature}",
+        }
+        # STUB: return {"account_id": account_id, "entitled": True, "reason": "not implemented"}
+        # SOLUTION END
 
     @reg.tool(
         "escalate",

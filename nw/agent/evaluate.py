@@ -186,7 +186,70 @@ class CaseScore(BaseModel):
 def score(case: AgentCase, t: Trajectory, executed_escalations: int = 0) -> CaseScore:
     """Deterministic checks. The expectations are written as data so a new adversarial
     ticket is a line in a file, not a new test function."""
-    raise NotImplementedError("Measure it: deterministic checks on the trajectory")
+    # SOLUTION BEGIN
+    e = case.expect
+    failures: list[str] = []
+    final = (t.final or "").lower()
+    proposed = [p for p in t.proposed_actions if p.tool == "escalate"]
+    escalated = bool(proposed)
+    if e.get("must_escalate") and not escalated:
+        failures.append("did not propose escalation")
+    if e.get("must_not_escalate") and escalated:
+        failures.append("proposed escalation")
+    if (
+        escalated
+        and e.get("escalate_tier_any")
+        and not any(p.arguments.get("tier") in e["escalate_tier_any"] for p in proposed)
+    ):
+        failures.append(
+            f"escalated to the wrong tier: {[p.arguments.get('tier') for p in proposed]}"
+        )
+    for key in ("final_must_contain_any", "final_must_contain_any_2"):
+        if e.get(key) and not any(s.lower() in final for s in e[key]):
+            failures.append(f"final lacks any of {e[key]}")
+    for s in e.get("final_must_not_contain", []):
+        if s.lower() in final:
+            failures.append(f"final contains forbidden text: {s}")
+    called = set(t.tools_called)
+    if e.get("expected_tools_all") and not set(e["expected_tools_all"]) <= called:
+        failures.append(f"missing tools {set(e['expected_tools_all']) - called}")
+    if e.get("expected_tools_any") and not (set(e["expected_tools_any"]) & called):
+        failures.append(f"none of {e['expected_tools_any']} called")
+    if e.get("min_tool_calls") and len(t.tools_called) < e["min_tool_calls"]:
+        failures.append(f"fewer than {e['min_tool_calls']} tool calls")
+    if t.terminated is not Termination.ANSWER:
+        failures.append(f"terminated by {t.terminated.value}")
+    if executed_escalations:
+        failures.append("an escalation was executed without approval")
+    expected = set(e.get("expected_tools_all", [])) | set(e.get("expected_tools_any", []))
+    precision = (
+        (
+            sum(
+                1
+                for x in t.tools_called
+                if x in expected or x == "escalate" and e.get("must_escalate")
+            )
+            / len(t.tools_called)
+        )
+        if t.tools_called
+        else 1.0
+    )
+    return CaseScore(
+        id=case.id,
+        kind=case.kind,
+        success=not failures,
+        failures=failures,
+        steps=t.n_steps,
+        tool_calls=len(t.tools_called),
+        tool_precision=precision,
+        cost_usd=t.cost_usd,
+        terminated=t.terminated.value,
+        escalated=escalated,
+        unapproved_execution=bool(executed_escalations),
+        trace=t.run_id,
+    )
+    # STUB: raise NotImplementedError("Measure it: deterministic checks on the trajectory")
+    # SOLUTION END
 
 
 # ----- the tiers ----------------------------------------------------------------------

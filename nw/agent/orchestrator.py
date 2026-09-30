@@ -25,7 +25,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from nw.agent.loop import SYSTEM_RULES, run_agent
-from nw.agent.northwind import ACCOUNT_PATTERN
+from nw.agent.northwind import ACCOUNT_PATTERN, run_account
 from nw.agent.screen import Screener
 from nw.agent.tools import ToolRegistry
 from nw.agent.trace import Trajectory
@@ -172,7 +172,38 @@ def orchestrator_registry(
             shared.auth = auth
 
     def make(role: str) -> None:
-        raise NotImplementedError("Orchestrator: a specialist is an HTTP call")
+        # SOLUTION BEGIN
+        client = shared
+        url = urls[role]
+
+        @reg.tool(
+            f"ask_{role}",
+            SPECIALISTS[role]["description"],
+            timeout_s=SPECIALIST_TIMEOUT_S + 5,  # the HTTP timeout fires first, cleanly
+        )
+        async def ask(args: AskSpecialist) -> dict[str, Any]:
+            _, account = run_account()
+            payload: dict[str, Any] = {
+                "task": args.task,
+                "max_steps": SPECIALIST_MAX_STEPS,
+                "budget_usd": SPECIALIST_BUDGET_USD,
+            }
+            if account:
+                payload["account_id"] = account
+            r = await client.post(f"{url}/run", json=payload)
+            r.raise_for_status()
+            body = r.json()
+            return {
+                "specialist": role,
+                "run_id": body["run_id"],
+                "answer": body["final"],
+                "terminated": body["terminated"],
+                "proposed_actions": body["proposed_actions"],
+                "cost_usd": body["cost_usd"],
+            }
+
+        # STUB: raise NotImplementedError("Orchestrator: a specialist is an HTTP call")
+        # SOLUTION END
 
     for role in urls:
         make(role)

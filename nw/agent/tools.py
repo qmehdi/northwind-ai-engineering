@@ -24,7 +24,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from nw.llm.types import ToolSpec
 from nw.telemetry import span
@@ -133,7 +133,20 @@ class ToolRegistry:
         self, name: str, arguments: dict[str, Any]
     ) -> tuple[Tool, BaseModel | None, str | None]:
         """Look the tool up and validate its arguments. Returns (tool, args, error)."""
-        return self.tools[name], self.tools[name].args_model(**arguments), None  # registry
+        # SOLUTION BEGIN
+        tool = self.tools.get(name)
+        if tool is None:
+            known = ", ".join(sorted(self.tools))
+            raise KeyError(f"unknown tool '{name}'. Known tools: {known}")
+        try:
+            return tool, tool.args_model.model_validate(arguments), None
+        except ValidationError as exc:
+            problems = "; ".join(
+                f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors()
+            )
+            return tool, None, f"invalid arguments for {name}: {problems}"
+        # STUB: return self.tools[name], self.tools[name].args_model(**arguments), None  # registry
+        # SOLUTION END
 
     async def execute(
         self, name: str, arguments: dict[str, Any], *, approved: bool = False
