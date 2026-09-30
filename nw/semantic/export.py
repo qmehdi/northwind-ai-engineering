@@ -64,7 +64,34 @@ def load_finetuned(
 
 
 def export_onnx(model: TicketEncoder, tokenizer: Any, path: Path, max_length: int = 256) -> Path:
-    raise NotImplementedError("Export to ONNX: torch.onnx.export with dynamic axes")
+    # SOLUTION BEGIN
+    wrapper = ExportWrapper(model).eval()
+    sample = tokenizer(
+        ["export sample text"],
+        padding="max_length",
+        max_length=16,
+        truncation=True,
+        return_tensors="pt",
+    )
+    torch.onnx.export(
+        wrapper,
+        (sample["input_ids"], sample["attention_mask"]),
+        str(path),
+        input_names=["input_ids", "attention_mask"],
+        output_names=["tag_logits", "priority_logits", "embedding"],
+        dynamic_axes={
+            "input_ids": {0: "batch", 1: "seq"},
+            "attention_mask": {0: "batch", 1: "seq"},
+            "tag_logits": {0: "batch"},
+            "priority_logits": {0: "batch"},
+            "embedding": {0: "batch"},
+        },
+        opset_version=17,
+        dynamo=False,
+    )
+    return path
+    # STUB: raise NotImplementedError("Export to ONNX: torch.onnx.export with dynamic axes")
+    # SOLUTION END
 
 
 def quantize(src: Path, dst: Path) -> Path:

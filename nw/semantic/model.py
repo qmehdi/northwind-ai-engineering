@@ -73,7 +73,22 @@ def build_encoder(
 def apply_lora(model: TicketEncoder, spec: ModelSpec) -> TicketEncoder:
     """Freeze the encoder and inject LoRA adapters into the attention projections.
     The heads stay trainable. Returns the same module, modified in place."""
-    raise NotImplementedError("Freeze the encoder, inject LoRA")
+    # SOLUTION BEGIN
+    from peft import LoraConfig, get_peft_model
+
+    for p in model.encoder.parameters():
+        p.requires_grad = False
+    cfg = LoraConfig(
+        r=spec.lora_r,
+        lora_alpha=spec.lora_alpha,
+        lora_dropout=spec.lora_dropout,
+        target_modules=list(spec.target_modules),
+        bias="none",
+    )
+    model.encoder = get_peft_model(model.encoder, cfg)
+    return model
+    # STUB: raise NotImplementedError("Freeze the encoder, inject LoRA")
+    # SOLUTION END
 
 
 def merge_lora(model: TicketEncoder) -> TicketEncoder:

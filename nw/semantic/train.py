@@ -29,6 +29,7 @@ from typing import Any
 import numpy as np
 import torch
 from sklearn.metrics import f1_score, recall_score
+from torch import nn
 from torch.utils.data import DataLoader
 
 from nw.semantic.artifacts import newest_candidate
@@ -56,7 +57,12 @@ def loss_fn(
     """Multi-label BCE on tags plus weighted cross-entropy on priority. BCE treats each
     tag as its own yes/no question, which is what multi-label means; softmax would
     force the tags to compete."""
-    raise NotImplementedError("The loss: BCE for tags, weighted CE for priority")
+    # SOLUTION BEGIN
+    tag_loss = nn.functional.binary_cross_entropy_with_logits(tag_logits, batch["tags"])
+    prio_loss = nn.functional.cross_entropy(prio_logits, batch["priority"], weight=prio_weight)
+    return tag_loss + prio_loss
+    # STUB: raise NotImplementedError("The loss: BCE for tags, weighted CE for priority")
+    # SOLUTION END
 
 
 @torch.no_grad()
@@ -83,7 +89,17 @@ def predict(
 def tune_tag_thresholds(prob: np.ndarray, y: np.ndarray) -> np.ndarray:
     """One threshold per tag, chosen on validation for F1. A global 0.5 under-predicts
     rare tags; the per-label threshold is the cheapest large win in multi-label work."""
-    return np.full(prob.shape[1], 0.5, dtype=np.float32)  # per-tag thresholds
+    # SOLUTION BEGIN
+    thresholds = np.full(prob.shape[1], 0.5, dtype=np.float32)
+    grid = np.linspace(0.1, 0.9, 17)
+    for j in range(prob.shape[1]):
+        if y[:, j].sum() == 0:
+            continue
+        scores = [f1_score(y[:, j], prob[:, j] >= t, zero_division=0) for t in grid]
+        thresholds[j] = grid[int(np.argmax(scores))]
+    return thresholds
+    # STUB: return np.full(prob.shape[1], 0.5, dtype=np.float32)  # per-tag thresholds
+    # SOLUTION END
 
 
 def metrics(
@@ -125,7 +141,20 @@ def save_checkpoint(
 ) -> None:
     """Everything needed to resume: adapter and head weights, optimiser moments,
     scheduler position, where we were, and the best score so far."""
-    torch.save({"model": model.state_dict()}, path)  # resume: what else does it need?
+    # SOLUTION BEGIN
+    torch.save(
+        {
+            "model": {k: v for k, v in model.state_dict().items() if "lora" in k or "head" in k},
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "epoch": epoch,
+            "step": step,
+            "best": best,
+        },
+        path,
+    )
+    # STUB: torch.save({"model": model.state_dict()}, path)  # resume: what else does it need?
+    # SOLUTION END
 
 
 def load_checkpoint(
@@ -317,7 +346,38 @@ def train(
     started = time.perf_counter()
     for epoch in range(start_epoch, epochs):
         model.train()
-        raise NotImplementedError("The training step: the batch loop")
+        # SOLUTION BEGIN
+        running = 0.0
+        for i, batch in enumerate(train_loader):
+            ids, mask = batch["input_ids"].to(device), batch["attention_mask"].to(device)
+            target = {k: batch[k].to(device) for k in ("tags", "priority")}
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                tl, pl = model(ids, mask)
+                loss = loss_fn(tl, pl, target, prio_weight) / accumulate
+            scaler.scale(loss).backward()
+            running += loss.item() * accumulate
+            if (i + 1) % accumulate == 0 or i + 1 == len(train_loader):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(params, 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                scheduler.step()
+                step += 1
+                if step % log_every == 0:
+                    print(
+                        f"epoch {epoch} step {step}/{total_steps} loss {running / log_every:.4f} "
+                        f"lr {scheduler.get_last_lr()[0]:.2e} {time.perf_counter() - started:.0f}s"
+                    )
+                    running = 0.0
+                if max_steps and step >= max_steps:
+                    break
+            if not math.isfinite(loss.item()):
+                raise RuntimeError(
+                    f"loss is {loss.item()} at step {step}: lower the learning rate or check data"
+                )
+        # STUB: raise NotImplementedError("The training step: the batch loop")
+        # SOLUTION END
         tag_p, prio_p, tag_y, prio_y = predict(model, val_loader, device)
         thresholds = tune_tag_thresholds(tag_p, tag_y)
         m = metrics(tag_p, prio_p, tag_y, prio_y, thresholds)
