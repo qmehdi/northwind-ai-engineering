@@ -14,14 +14,18 @@ so the saving is a number and not a slide.
 from __future__ import annotations
 
 import re
+import uuid
 from dataclasses import dataclass, replace
 from typing import Any
 
 from nw.agent.loop import run_agent
 from nw.agent.screen import Screener
 from nw.agent.tools import ToolRegistry
-from nw.agent.trace import Trajectory
+from nw.agent.trace import ProposedAction, Step, Termination, Trajectory
+from nw.agent.version import agent_version
+from nw.config import ModelRole
 from nw.llm import LLMClient
+from nw.policy.redact import redact_for_agent
 
 
 @dataclass
@@ -115,7 +119,67 @@ async def _route(
         "account_id": account_id,
         "requested_by": requested_by,
     }
-    return await run_agent(task, registry, client, **run_kw)  # Route cheap first
+    # SOLUTION BEGIN
+    triage = await registry.execute("classify_urgency", {"subject": subject, "body": body})
+    priority, p0 = _read_triage(triage.content) if triage.ok else ("P2", 0.0)
+    if priority == "P0" and p0 >= policy.p0_confidence:
+        t = Trajectory(
+            run_id=f"route-{ticket_id}-{uuid.uuid4().hex[:6]}",
+            agent="router",
+            task=redact_for_agent(task),
+            account_id=account_id,
+            requested_by=requested_by,
+        )
+        # No prompt and no model on this branch; the version still names the tools.
+        t.agent_version = agent_version("router:p0", registry.specs(), {})
+        t.steps = [
+            Step(
+                index=0,
+                tool="classify_urgency",
+                observation=triage.content,
+                latency_ms=triage.latency_ms,
+            )
+        ]
+        t.tools_called = ["classify_urgency"]
+        t.proposed_actions = [
+            ProposedAction(
+                tool="escalate",
+                arguments={
+                    "ticket_id": ticket_id,
+                    "tier": "duty_manager",
+                    "justification": f"Triage scored P0 with probability {p0:.2f}; "
+                    "routed straight to the duty manager.",
+                },
+                step=0,
+            )
+        ]
+        t.final = "P0 by triage: escalation proposed to the duty manager without a model call."
+        t.terminated = Termination.ANSWER
+        t.cost_usd = 0.0
+        return t
+    if priority in policy.economy_priorities:
+        return await run_agent(
+            task,
+            registry,
+            client,
+            role=ModelRole.ECONOMY,
+            max_steps=policy.economy_max_steps,
+            budget_usd=policy.economy_budget_usd,
+            agent_name="resolver-economy",
+            **run_kw,
+        )
+    return await run_agent(
+        task,
+        registry,
+        client,
+        role=ModelRole.WORKHORSE,
+        max_steps=policy.workhorse_max_steps,
+        budget_usd=policy.workhorse_budget_usd,
+        agent_name="resolver",
+        **run_kw,
+    )
+    # STUB: return await run_agent(task, registry, client, **run_kw)  # Route cheap first
+    # SOLUTION END
 
 
 def _read_triage(content: str) -> tuple[str, float]:
