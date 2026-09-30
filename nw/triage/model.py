@@ -49,7 +49,13 @@ class TriageModel:
 
     def decide(self, proba: np.ndarray) -> tuple[str, str]:
         """The decision rule. Returns (priority, rule name)."""
-        return PRIORITIES[int(np.argmax(proba))], "argmax"  # threshold step: protect P0
+        # SOLUTION BEGIN
+        p0 = float(proba[PRIORITIES.index("P0")])
+        if p0 >= self.p0_threshold:
+            return "P0", f"p0>={self.p0_threshold:.2f}"
+        return PRIORITIES[int(np.argmax(proba))], "argmax"
+        # STUB: return PRIORITIES[int(np.argmax(proba))], "argmax"  # threshold step: protect P0
+        # SOLUTION END
 
     def predict(self, tickets: list[dict[str, Any]]) -> list[TriageResult]:
         out = []

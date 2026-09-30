@@ -27,6 +27,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.frozen import FrozenEstimator
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     brier_score_loss,
@@ -71,7 +73,10 @@ def labels(rows: list[dict[str, Any]]) -> np.ndarray:
 def build_pipeline(class_weight: str | dict | None = "balanced", C: float = 4.0) -> Pipeline:
     """Features, then a linear classifier. Linear is deliberate: it trains in seconds on a
     laptop, its coefficients are readable, and on short texts it is hard to beat by much."""
-    clf = LogisticRegression(max_iter=2000, C=C)  # Class weights: what about the 4 percent?
+    # SOLUTION BEGIN
+    clf = LogisticRegression(max_iter=2000, C=C, class_weight=class_weight)
+    # STUB: clf = LogisticRegression(max_iter=2000, C=C)  # Class weights: what about the 4 percent?
+    # SOLUTION END
     return Pipeline([("features", build_features()), ("clf", clf)])
 
 
@@ -82,7 +87,23 @@ def choose_p0_threshold(
     precision above the floor, scanning `THRESHOLD_GRID` from 0.95 down to 0.01; if no
     threshold does both, the one with the best F1. The highest passing threshold is the one
     with the fewest false alarms at the recall the business asked for."""
-    return 0.5  # threshold on its own half of validation
+    # SOLUTION BEGIN
+    is_p0 = y == "P0"
+    best_t, best_f1 = 0.5, -1.0
+    for t in THRESHOLD_GRID:
+        pred = proba_p0 >= t
+        if pred.sum() == 0:
+            continue
+        rec = recall_score(is_p0, pred, zero_division=0)
+        prec = precision_score(is_p0, pred, zero_division=0)
+        f1 = f1_score(is_p0, pred, zero_division=0)
+        if rec >= target_recall and prec >= min_precision:
+            return float(t)
+        if f1 > best_f1:
+            best_t, best_f1 = float(t), f1
+    return best_t
+    # STUB: return 0.5  # threshold on its own half of validation
+    # SOLUTION END
 
 
 def threshold_report(
@@ -269,7 +290,22 @@ def train(
     pipeline = build_pipeline(class_weight=class_weight)
     pipeline.fit(train_rows, labels(train_rows))
 
-    final, classes = pipeline, list(pipeline.named_steps["clf"].classes_)  # calibrate
+    # SOLUTION BEGIN
+    if calibrate:
+        # Calibrate on the calibration half of validation with the pipeline frozen: the classifier's
+        # scores are mapped to probabilities that mean what they say. Isotonic needs
+        # more data than sigmoid; sigmoid is the safe default at this size.
+        features = pipeline.named_steps["features"]
+        clf = pipeline.named_steps["clf"]
+        calibrated = CalibratedClassifierCV(FrozenEstimator(clf), method="sigmoid")
+        calibrated.fit(features.transform(cal_rows), labels(cal_rows))
+        final = Pipeline([("features", features), ("clf", calibrated)])
+        classes = list(calibrated.classes_)
+    else:
+        final = pipeline
+        classes = list(pipeline.named_steps["clf"].classes_)
+    # STUB: final, classes = pipeline, list(pipeline.named_steps["clf"].classes_)  # calibrate
+    # SOLUTION END
 
     provisional = TriageModel(pipeline=final, classes=classes, p0_threshold=0.5, metadata={})
     thr_proba = provisional.predict_proba(thr_rows)

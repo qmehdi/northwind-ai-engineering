@@ -114,7 +114,21 @@ async def lifespan(app: FastAPI):
         fallback=Path(os.environ.get("NW_TRIAGE_MODEL", "artifacts/triage/latest"))
     )
     path = state.source.path
-    state.model, state.ready = load_model(path), True  # readiness: if it fails?
+    # SOLUTION BEGIN
+    try:
+        state.model = load_model(path, state.source.expected_sha256)
+        state.ready = True
+        MODEL_LOADED.set(1)
+        MODEL_INFO.labels(version=state.model.version).set(1)
+        log.info("model loaded", extra=log_fields(path=str(path), version=state.model.version))
+    except Exception as exc:  # noqa: BLE001
+        # Stay up but not ready: liveness passes, readiness fails, the platform does not
+        # route traffic here, and the log says why. Crashing would loop the restart.
+        state.model, state.ready = None, False
+        MODEL_LOADED.set(0)
+        log.error("model failed to load", extra=log_fields(path=str(path), error=str(exc)))
+    # STUB: state.model, state.ready = load_model(path), True  # readiness: if it fails?
+    # SOLUTION END
     _configure_mlops(path)
     yield
     state.model, state.ready = None, False
