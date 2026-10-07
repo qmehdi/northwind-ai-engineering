@@ -72,6 +72,9 @@ PRICES: dict[str, Price] = {
     # in-region id above; a geo premium, if Bedrock charges one, is not modelled.
     "eu.anthropic.claude-opus-5": _OPUS,
     "us.anthropic.claude-opus-5": _OPUS,
+    # Opus 4.5, the AWS Judge (nw/config.py): the same Opus rate.
+    "eu.anthropic.claude-opus-4-5-20251101-v1:0": _OPUS,
+    "us.anthropic.claude-opus-4-5-20251101-v1:0": _OPUS,
     # Bedrock open-weight and Nova ids, plain and under the geo profiles
     "openai.gpt-oss-120b-1:0": _GPT_OSS_120B_BEDROCK,
     "us-gov.openai.gpt-oss-120b-1:0": _GPT_OSS_120B_BEDROCK,

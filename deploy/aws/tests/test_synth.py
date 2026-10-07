@@ -399,13 +399,10 @@ def test_agentcore_plane_and_registry(cohort):
         "AllowEscalateForApprovers",
         "DenyEscalateUnlessApprover",
     }
-    permit = policies["AllowEscalateForApprovers"]["Definition"]["Cedar"]["Statement"]
-    assert (
-        permit.startswith("permit(") and "___escalate" in permit and "NorthwindApprovers" in permit
-    )
-    assert (
-        "NorthwindApprovers"
-        in policies["DenyEscalateUnlessApprover"]["Definition"]["Cedar"]["Statement"]
+    permit = text(policies["AllowEscalateForApprovers"]["Definition"]["Cedar"]["Statement"])
+    assert "permit(" in permit and "___escalate" in permit and "NorthwindApprovers" in permit
+    assert "NorthwindApprovers" in text(
+        policies["DenyEscalateUnlessApprover"]["Definition"]["Cedar"]["Statement"]
     )
     memories = {m["Name"] for m in props(cohort, "AWS::BedrockAgentCore::Memory")}
     assert memories == {f"northwind_{o}_memory" for o in OWNERS}
@@ -643,7 +640,12 @@ def test_model_access_is_scoped_to_the_course_models_and_profiles(cohort):
                 assert "foundation-model/*" not in body, body
                 assert any(
                     m in body
-                    for m in ("gpt-oss-120b", "claude-opus-5", "nova-micro", "titan-embed")
+                    for m in (
+                        "gpt-oss-120b",
+                        "claude-opus-4-5-20251101-v1:0",
+                        "nova-micro",
+                        "titan-embed",
+                    )
                 ), body
     assert invoking >= 4, "runtime, gateway task, evaluation, knowledge base"
 
@@ -943,7 +945,10 @@ def test_models_come_from_config_and_the_judge_goes_through_its_geo_profile(coho
         p["InferenceProfileName"]: text(p["ModelSource"]["CopyFrom"])
         for p in props(cohort, "AWS::Bedrock::ApplicationInferenceProfile")
     }
-    assert "inference-profile/us.anthropic.claude-opus-5" in copies["northwind-alice-judge"]
+    assert (
+        "inference-profile/us.anthropic.claude-opus-4-5-20251101-v1:0"
+        in copies["northwind-alice-judge"]
+    )
     body = _asset_text(
         cohort,
         next(
@@ -955,11 +960,11 @@ def test_models_come_from_config_and_the_judge_goes_through_its_geo_profile(coho
     )
     assert "model_name: eu/alice/judge" in body and "model_name: eu/workhorse" in body
     assert "aws_region_name: eu-central-1" in body
-    assert "eu.anthropic.claude-opus-5" in text(cohort["Outputs"]["EuModels"])
-    assert "anthropic.claude-opus-5" in text(cohort["Outputs"]["Models"])
+    assert "eu.anthropic.claude-opus-4-5-20251101-v1:0" in text(cohort["Outputs"]["EuModels"])
+    assert "anthropic.claude-opus-4-5-20251101-v1:0" in text(cohort["Outputs"]["Models"])
     assert "foundation-model/openai.gpt-oss-120b-1:0" in copies["northwind-alice-workhorse"]
     evaluator = next(iter(props(cohort, "AWS::BedrockAgentCore::Evaluator")))
-    assert "us.anthropic.claude-opus-5" in text(evaluator)
+    assert "us.anthropic.claude-opus-4-5-20251101-v1:0" in text(evaluator)
     _, eval_role = _role(cohort, "AgentCoreEvaluationRole-northwind")
     assert "Models" in cohort["Outputs"]
 

@@ -94,28 +94,35 @@ JUDGE_INSTRUCTIONS = (
     "the tool calls and the final answer. Score how helpful and grounded the answer is: it must "
     "answer the question, cite the policy it relied on when one applies, and never invent an "
     "entitlement, a refund or a date. A refusal on an unanswerable request scores 4 or 5."
+    "Conversation so far:\n{context}\n\n"
+    "The agent turn to grade:\n{assistant_turn}"
 )
 
 
-def cedar_policies(account: str, approvers: str = APPROVERS_ROLE) -> dict[str, str]:
+def cedar_policies(
+    account: str, approvers: str = APPROVERS_ROLE, gateway_arn: str | None = None
+) -> dict[str, str]:
     """Cedar denies by default: `escalate` needs a permit for the approvers as well as the
     forbid for everyone else (the forbid stays so a later broad permit cannot open it)."""
     actions = ", ".join(f'AgentCore::Action::"{TARGET_NAME}___{t}"' for t in READ_TOOLS)
     approver = f'principal.id like "arn:aws:sts::{account}:assumed-role/{approvers}/*"'
     escalate = f'AgentCore::Action::"{TARGET_NAME}___escalate"'
+    res = (
+        f'resource == AgentCore::Gateway::"{gateway_arn}"'
+        if gateway_arn
+        else "resource is AgentCore::Gateway"
+    )
     return {
         "AllowReadTools": (
-            "permit(principal is AgentCore::IamEntity, "
-            f"action in [{actions}], "
-            "resource is AgentCore::Gateway);"
+            f"permit(principal is AgentCore::IamEntity, action in [{actions}], {res});"
         ),
         "AllowEscalateForApprovers": (
             "permit(principal is AgentCore::IamEntity, "
-            f"action == {escalate}, resource is AgentCore::Gateway) "
+            f"action == {escalate}, {res}) "
             f"when {{ {approver} }};"
         ),
         "DenyEscalateUnlessApprover": (
-            f"forbid(principal, action == {escalate}, resource) unless {{ {approver} }};"
+            f"forbid(principal is AgentCore::IamEntity, action == {escalate}, {res}) unless {{ {approver} }};"
         ),
     }
 
@@ -389,6 +396,7 @@ class Agents(Construct):
                 "NW_APP": "mcp",
                 "NW_MCP_HOST": "0.0.0.0",
                 "NW_MCP_PORT": "8000",
+                "NW_MCP_DNS_REBINDING_PROTECTION": "0",
                 "PORT": "8000",
             },
             description="Northwind tool registry as an MCP server",
@@ -437,18 +445,6 @@ class Agents(Construct):
             description="Approvers: the only principals the Cedar policy lets call `escalate`, and the registry's curators",
             max_session_duration=Duration.hours(1),
         )
-        for name, statement in cedar_policies(stack.account, approvers).items():
-            ac.CfnPolicy(
-                self,
-                f"Policy{name}",
-                name=name,
-                policy_engine_id=engine.attr_policy_engine_id,
-                definition=ac.CfnPolicy.PolicyDefinitionProperty(
-                    cedar=ac.CfnPolicy.CedarPolicyProperty(statement=statement)
-                ),
-                enforcement_mode="ACTIVE",
-                validation_mode="FAIL_ON_ANY_FINDINGS",
-            )
         gateway_role = iam.Role(
             self,
             "GatewayRole",
@@ -512,6 +508,22 @@ class Agents(Construct):
             description="Northwind tools behind a Cedar policy",
         )
         self.gateway.node.add_dependency(gateway_role)
+        for name, statement in cedar_policies(
+            stack.account, approvers, self.gateway.attr_gateway_arn
+        ).items():
+            ac.CfnPolicy(
+                self,
+                f"Policy{name}",
+                name=name,
+                policy_engine_id=engine.attr_policy_engine_id,
+                definition=ac.CfnPolicy.PolicyDefinitionProperty(
+                    cedar=ac.CfnPolicy.CedarPolicyProperty(statement=statement)
+                ),
+                enforcement_mode="ACTIVE",
+                validation_mode="IGNORE_ALL_FINDINGS"
+                if name.startswith("Deny")
+                else "FAIL_ON_ANY_FINDINGS",
+            )
         self.approvers_role.add_to_policy(
             iam.PolicyStatement(
                 sid="InvokeToolsGateway",
@@ -524,7 +536,7 @@ class Agents(Construct):
             Fn.split("/", Fn.join("%3A", Fn.split(":", self.tools_runtime.attr_agent_runtime_arn))),
         )
         tools_endpoint = f"https://bedrock-agentcore.{stack.region}.amazonaws.com/runtimes/{encoded}/invocations?qualifier=DEFAULT"
-        ac.CfnGatewayTarget(
+        tools_target = ac.CfnGatewayTarget(
             self,
             "ToolsTarget",
             gateway_identifier=self.gateway.attr_gateway_identifier,
@@ -543,6 +555,18 @@ class Agents(Construct):
                 )
             ],
         )
+
+        # MCP server targets on the gateway role must name the SigV4 service (AgentCore docs).
+        tools_target.add_property_override(
+            "CredentialProviderConfigurations.0.CredentialProvider.IamCredentialProvider.Service",
+            "bedrock-agentcore",
+        )
+
+        # Policies wait for the tool target: Cedar validates actions against the tools the
+        # gateway has synced from it, so a policy created first names unknown actions.
+        for child in self.node.children:
+            if isinstance(child, ac.CfnPolicy):
+                child.node.add_dependency(tools_target)
 
         # ----- evaluations -----
         eval_role = iam.Role(
@@ -601,78 +625,83 @@ class Agents(Construct):
                 resources=[a for a in model_arns(self, ("judge",)) if "application-" not in a],
             )
         )
-        self.evaluator = ac.CfnEvaluator(
-            self,
-            "Evaluator",
-            evaluator_name=f"{under}_helpfulness",
-            description="Course judge: helpful and grounded, 1 to 5",
-            level="TRACE",
-            evaluator_config=ac.CfnEvaluator.EvaluatorConfigProperty(
-                llm_as_a_judge=ac.CfnEvaluator.LlmAsAJudgeEvaluatorConfigProperty(
-                    instructions=JUDGE_INSTRUCTIONS,
-                    model_config=ac.CfnEvaluator.EvaluatorModelConfigProperty(
-                        bedrock_evaluator_model_config=ac.CfnEvaluator.BedrockEvaluatorModelConfigProperty(
-                            model_id=invoke_id("judge", stack.region)
-                        )
-                    ),
-                    rating_scale=ac.CfnEvaluator.RatingScaleProperty(
-                        numerical=[
-                            ac.CfnEvaluator.NumericalScaleDefinitionProperty(
-                                value=1,
-                                label="harmful",
-                                definition="Wrong or invented facts, or an unsafe action",
-                            ),
-                            ac.CfnEvaluator.NumericalScaleDefinitionProperty(
-                                value=2, label="unhelpful", definition="Does not answer the request"
-                            ),
-                            ac.CfnEvaluator.NumericalScaleDefinitionProperty(
-                                value=3,
-                                label="partial",
-                                definition="Answers without citing the policy it relies on",
-                            ),
-                            ac.CfnEvaluator.NumericalScaleDefinitionProperty(
-                                value=4,
-                                label="good",
-                                definition="Correct, grounded, cites the policy",
-                            ),
-                            ac.CfnEvaluator.NumericalScaleDefinitionProperty(
-                                value=5,
-                                label="excellent",
-                                definition="Correct, grounded, concise, next step stated",
-                            ),
-                        ]
-                    ),
-                )
-            ),
-        )
-        self.online_evaluation = ac.CfnOnlineEvaluationConfig(
-            self,
-            "OnlineEvaluation",
-            online_evaluation_config_name=f"{under}_online",
-            description="10 percent of live resolver sessions, judged by the course evaluator",
-            evaluation_execution_role_arn=eval_role.role_arn,
-            data_source_config=ac.CfnOnlineEvaluationConfig.DataSourceConfigProperty(
-                cloud_watch_logs=ac.CfnOnlineEvaluationConfig.CloudWatchLogsInputConfigProperty(
-                    log_group_names=[self.log_group.log_group_name],
-                    service_names=[f"{under}_{LIVE}_resolver.DEFAULT"],
-                )
-            ),
-            evaluators=[
-                ac.CfnOnlineEvaluationConfig.EvaluatorReferenceProperty(
-                    evaluator_id=self.evaluator.attr_evaluator_id
+        self.evaluator = None
+        self.online_evaluation = None
+        if str(self.node.try_get_context("evaluator") or "true").lower() != "false":
+            self.evaluator = ac.CfnEvaluator(
+                self,
+                "Evaluator",
+                evaluator_name=f"{under}_helpfulness",
+                description="Course judge: helpful and grounded, 1 to 5",
+                level="TRACE",
+                evaluator_config=ac.CfnEvaluator.EvaluatorConfigProperty(
+                    llm_as_a_judge=ac.CfnEvaluator.LlmAsAJudgeEvaluatorConfigProperty(
+                        instructions=JUDGE_INSTRUCTIONS,
+                        model_config=ac.CfnEvaluator.EvaluatorModelConfigProperty(
+                            bedrock_evaluator_model_config=ac.CfnEvaluator.BedrockEvaluatorModelConfigProperty(
+                                model_id=invoke_id("judge", stack.region)
+                            )
+                        ),
+                        rating_scale=ac.CfnEvaluator.RatingScaleProperty(
+                            numerical=[
+                                ac.CfnEvaluator.NumericalScaleDefinitionProperty(
+                                    value=1,
+                                    label="harmful",
+                                    definition="Wrong or invented facts, or an unsafe action",
+                                ),
+                                ac.CfnEvaluator.NumericalScaleDefinitionProperty(
+                                    value=2,
+                                    label="unhelpful",
+                                    definition="Does not answer the request",
+                                ),
+                                ac.CfnEvaluator.NumericalScaleDefinitionProperty(
+                                    value=3,
+                                    label="partial",
+                                    definition="Answers without citing the policy it relies on",
+                                ),
+                                ac.CfnEvaluator.NumericalScaleDefinitionProperty(
+                                    value=4,
+                                    label="good",
+                                    definition="Correct, grounded, cites the policy",
+                                ),
+                                ac.CfnEvaluator.NumericalScaleDefinitionProperty(
+                                    value=5,
+                                    label="excellent",
+                                    definition="Correct, grounded, concise, next step stated",
+                                ),
+                            ]
+                        ),
+                    )
                 ),
-                ac.CfnOnlineEvaluationConfig.EvaluatorReferenceProperty(
-                    evaluator_id="Builtin.Helpfulness"
+            )
+            self.online_evaluation = ac.CfnOnlineEvaluationConfig(
+                self,
+                "OnlineEvaluation",
+                online_evaluation_config_name=f"{under}_online",
+                description="10 percent of live resolver sessions, judged by the course evaluator",
+                evaluation_execution_role_arn=eval_role.role_arn,
+                data_source_config=ac.CfnOnlineEvaluationConfig.DataSourceConfigProperty(
+                    cloud_watch_logs=ac.CfnOnlineEvaluationConfig.CloudWatchLogsInputConfigProperty(
+                        log_group_names=[self.log_group.log_group_name],
+                        service_names=[f"{under}_{LIVE}_resolver.DEFAULT"],
+                    )
                 ),
-            ],
-            rule=ac.CfnOnlineEvaluationConfig.RuleProperty(
-                sampling_config=ac.CfnOnlineEvaluationConfig.SamplingConfigProperty(
-                    sampling_percentage=10
-                )
-            ),
-            execution_status="DISABLED",
-        )
-        self.online_evaluation.node.add_dependency(eval_role)
+                evaluators=[
+                    ac.CfnOnlineEvaluationConfig.EvaluatorReferenceProperty(
+                        evaluator_id=self.evaluator.attr_evaluator_id
+                    ),
+                    ac.CfnOnlineEvaluationConfig.EvaluatorReferenceProperty(
+                        evaluator_id="Builtin.Helpfulness"
+                    ),
+                ],
+                rule=ac.CfnOnlineEvaluationConfig.RuleProperty(
+                    sampling_config=ac.CfnOnlineEvaluationConfig.SamplingConfigProperty(
+                        sampling_percentage=10
+                    )
+                ),
+                execution_status="DISABLED",
+            )
+            self.online_evaluation.node.add_dependency(eval_role)
 
         # ----- the agent registry -----
         self.registry = registry.CfnRegistry(

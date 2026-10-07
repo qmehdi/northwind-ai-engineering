@@ -32,7 +32,7 @@ def test_accounts_resolve_to_their_residency():
     ("track", "role", "expected"),
     [
         (Track.AWS, ModelRole.WORKHORSE, "openai.gpt-oss-120b-1:0"),
-        (Track.AWS, ModelRole.JUDGE, "eu.anthropic.claude-opus-5"),
+        (Track.AWS, ModelRole.JUDGE, "eu.anthropic.claude-opus-4-5-20251101-v1:0"),
         (Track.AWS, ModelRole.ECONOMY, "eu.amazon.nova-micro-v1:0"),
         (Track.GCP, ModelRole.JUDGE, "claude-opus-5"),
         (Track.AZURE, ModelRole.WORKHORSE, "Mistral-Large-3"),

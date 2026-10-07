@@ -205,7 +205,8 @@ class Observability(Construct):
             enable_file_validation=True,
         )
         self.trail.node.add_dependency(self.trail_key)
-        self._invocation_logging(prefix)
+        if str(self.node.try_get_context("invocationLogging") or "true").lower() != "false":
+            self._invocation_logging(prefix)
 
         alb_5xx = cw.Alarm(
             self,

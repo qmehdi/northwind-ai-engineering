@@ -70,7 +70,7 @@ if [ ! -x deploy/aws/.venv/bin/python ] || [ ! -x deploy/aws/node_modules/.bin/c
 fi
 context() {
   local tenants="${1:-${NW_TENANTS:-}}"
-  CTX=(-c "env=$ENV_NAME" -c "alertEmail=${NW_ALERT_EMAIL:-}" -c "budgetUsd=${NW_BUDGET_USD:-200}" -c "connectionArn=${NW_CONNECTION_ARN:-}" -c "lakeFormation=${NW_LAKE_FORMATION:-false}" -c "agentEgress=${NW_AGENT_EGRESS:-vpc}")
+  CTX=(-c "env=$ENV_NAME" -c "alertEmail=${NW_ALERT_EMAIL:-}" -c "budgetUsd=${NW_BUDGET_USD:-200}" -c "connectionArn=${NW_CONNECTION_ARN:-}" -c "lakeFormation=${NW_LAKE_FORMATION:-false}" -c "agentEgress=${NW_AGENT_EGRESS:-vpc}" -c "evaluator=${NW_AGENT_EVALUATOR:-false}" -c "invocationLogging=${NW_INVOCATION_LOGGING:-false}")
   if [ -n "$tenants" ]; then CTX+=(-c "tenants=$tenants"); else CTX+=(-c "mode=${NW_MODE:-solo}"); fi
 }
 # The promoted images live in SSM (delivery/deploy.sh writes the digest); the stack reads them
@@ -96,7 +96,7 @@ clear_scheduled_secrets() {
 cdk_deploy() {
   ensure_image_params
   uv run python -m nw.platform.aws prompts-catalog >/dev/null
-  (cd deploy/aws && .venv/bin/python -m pytest -q tests)
+  (cd deploy/aws && CDK_DEFAULT_ACCOUNT=123456789012 .venv/bin/python -m pytest -q tests)
   echo "Read deploy/COSTS-platform.md. Deploying $STACK to account $CDK_DEFAULT_ACCOUNT in $CDK_DEFAULT_REGION."
   echo "The first deploy creates IAM roles, so cdk asks y/n once; the SageMaker domain and the database take about 15 minutes."
   (cd deploy/aws && npx --yes cdk bootstrap "aws://$CDK_DEFAULT_ACCOUNT/$CDK_DEFAULT_REGION" -q && npx --yes cdk deploy "${CTX[@]}" --require-approval broadening --outputs-file outputs.json)
@@ -104,7 +104,7 @@ cdk_deploy() {
 case "$ACTION" in
   synth)
     context; uv run python -m nw.platform.aws prompts-catalog >/dev/null
-    (cd deploy/aws && .venv/bin/python -m pytest -q tests && npx --yes cdk synth "${CTX[@]}" -q) ;;
+    (cd deploy/aws && CDK_DEFAULT_ACCOUNT=123456789012 .venv/bin/python -m pytest -q tests && npx --yes cdk synth "${CTX[@]}" -q) ;;
   diff)    context; (cd deploy/aws && npx --yes cdk diff "${CTX[@]}") ;;
   deploy)
     context; enable_transaction_search; span_retention; cdk_deploy; mint_keys; publish_corpus

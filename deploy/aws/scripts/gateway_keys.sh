@@ -41,6 +41,9 @@ if [ -n "$OLD" ]; then
   curl -sS -X POST "$URL/key/delete" -H "Authorization: Bearer $MASTER" -H "Content-Type: application/json" \
     -d "{\"keys\":[\"$OLD\"]}" >/dev/null || echo "note: the previous key was not revoked (it may be gone already)"
 fi
+# The key carries team_id=$OWNER; LiteLLM rejects every request if that team does not exist.
+curl -sS -X POST "$URL/team/new" -H "Authorization: Bearer $MASTER" -H "Content-Type: application/json" \
+  -d "{\"team_id\":\"$OWNER\",\"team_alias\":\"$OWNER\"}" >/dev/null || true
 KEY="$(curl -sS --fail -X POST "$URL/key/generate" -H "Authorization: Bearer $MASTER" -H "Content-Type: application/json" \
   -d "{\"key_alias\":\"$ENVIRONMENT-$OWNER\",\"team_id\":\"$OWNER\",\"models\":$models,\"aliases\":$aliases,\"max_budget\":$BUDGET,\"budget_duration\":\"30d\",\"metadata\":{\"nw_tenant\":\"$OWNER\"}}" \
   | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["key"])')"

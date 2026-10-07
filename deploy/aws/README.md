@@ -263,3 +263,24 @@ the full-configuration runtime update, signing and immutable tags, the budget st
 domain cleanup ordering, model access scoped to the course models, no secret value in the
 template, reserved tenant names refused, zero non-compliant nag rows and no unused suppression
 in `stacks/nag.py`.
+
+## Running the tests on the AWS track
+
+`make test` also runs the Google Cloud and Azure platform tests, which depend on those tracks'
+tool versions (a newer Terraform, for example, breaks `tests/platform/test_gcp_terraform.py`).
+On the AWS track, run the same list without them:
+
+```bash
+AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null \
+  uv run pytest -q @tests/skeleton-green.txt -k "not gcp_terraform and not azure_bicep"
+```
+
+The course's tests never need an AWS account. Hiding the AWS config matters if your default
+profile uses `aws login` (a `login_session` profile): boto3 then needs `botocore[crt]`, which
+the course does not install, and two `session01` provider tests fail.
+
+The stack's own tests run before every `make synth-aws` and `make deploy-aws`; to run them alone:
+
+```bash
+(cd deploy/aws && CDK_DEFAULT_ACCOUNT=123456789012 .venv/bin/python -m pytest -q tests)
+```

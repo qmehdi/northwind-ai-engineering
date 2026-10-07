@@ -100,7 +100,8 @@ DEFAULT_MODELS: dict[Track, dict[ModelRole, str]] = {
         ModelRole.WORKHORSE: "openai.gpt-oss-120b-1:0",
         # Opus 5 has no in-region on-demand row in us-east-1 (model card, 2026-09-30): the US geo
         # profile serves it, the same one deploy/aws grants.
-        ModelRole.JUDGE: "us.anthropic.claude-opus-5",
+        # Opus 5 is restricted on new accounts; Opus 4.5 is generally available.
+        ModelRole.JUDGE: "us.anthropic.claude-opus-4-5-20251101-v1:0",
         ModelRole.ECONOMY: "us.amazon.nova-micro-v1:0",
     },
     Track.GCP: {
@@ -152,7 +153,7 @@ DEFAULT_MODELS: dict[Track, dict[ModelRole, str]] = {
 EU_MODELS: dict[Track, dict[ModelRole, str | None]] = {
     Track.AWS: {
         ModelRole.WORKHORSE: "openai.gpt-oss-120b-1:0",
-        ModelRole.JUDGE: "eu.anthropic.claude-opus-5",
+        ModelRole.JUDGE: "eu.anthropic.claude-opus-4-5-20251101-v1:0",
         ModelRole.ECONOMY: "eu.amazon.nova-micro-v1:0",
     },
     Track.GCP: {

@@ -151,7 +151,7 @@ class ModelGateway(Construct):
             "KeysDb",
             cluster_identifier=f"{prefix}-gateway",
             engine=rds.DatabaseClusterEngine.aurora_postgres(
-                version=rds.AuroraPostgresEngineVersion.VER_16_6
+                version=rds.AuroraPostgresEngineVersion.of("16.15", "16")
             ),
             writer=rds.ClusterInstance.serverless_v2("writer", publicly_accessible=False),
             serverless_v2_min_capacity=0,

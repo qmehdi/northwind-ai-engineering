@@ -415,7 +415,7 @@ class Serving(Construct):
                 iam.ManagedPolicy.from_aws_managed_policy_name(
                     "service-role/AWSLambdaBasicExecutionRole"
                 ),
-                iam.ManagedPolicy.from_aws_managed_policy_name("AWSXrayWriteOnlyPolicy"),
+                iam.ManagedPolicy.from_aws_managed_policy_name("AWSXrayWriteOnlyAccess"),
             ],
         )
         api_key.grant_read(role)

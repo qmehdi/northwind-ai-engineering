@@ -367,7 +367,7 @@ tests/session01/test_residency.py::test_a_role_without_an_eu_model_is_refused[gc
 tests/session01/test_residency.py::test_accounts_resolve_to_their_residency
 tests/session01/test_residency.py::test_cloud_tracks_send_eu_calls_to_eu_endpoints
 tests/session01/test_residency.py::test_eu_ids_per_track[aws-economy-eu.amazon.nova-micro-v1:0]
-tests/session01/test_residency.py::test_eu_ids_per_track[aws-judge-eu.anthropic.claude-opus-5]
+tests/session01/test_residency.py::test_eu_ids_per_track[aws-judge-eu.anthropic.claude-opus-4-5-20251101-v1:0]
 tests/session01/test_residency.py::test_eu_ids_per_track[aws-workhorse-openai.gpt-oss-120b-1:0]
 tests/session01/test_residency.py::test_eu_ids_per_track[azure-economy-Mistral-Large-3]
 tests/session01/test_residency.py::test_eu_ids_per_track[azure-workhorse-Mistral-Large-3]

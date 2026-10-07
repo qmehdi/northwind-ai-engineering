@@ -44,7 +44,7 @@ def test_defaults_follow_adr_0010():
     )
     assert aws[ModelRole.WORKHORSE] == "openai.gpt-oss-120b-1:0"
     assert aws[ModelRole.ECONOMY] == "us.amazon.nova-micro-v1:0"
-    assert aws[ModelRole.JUDGE] == "us.anthropic.claude-opus-5"
+    assert aws[ModelRole.JUDGE] == "us.anthropic.claude-opus-4-5-20251101-v1:0"
     assert gcp[ModelRole.WORKHORSE] == "openai/gpt-oss-120b-maas"
     assert (
         gcp[ModelRole.ECONOMY] == "openai/gpt-oss-120b-maas"

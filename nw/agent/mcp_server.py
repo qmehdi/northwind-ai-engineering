@@ -46,7 +46,8 @@ def allowed_hosts(value: str | None = None) -> list[str]:
 def transport_security(hosts: list[str] | None = None) -> TransportSecuritySettings:
     hosts = hosts if hosts is not None else allowed_hosts()
     return TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
+        enable_dns_rebinding_protection=os.environ.get("NW_MCP_DNS_REBINDING_PROTECTION", "1")
+        != "0",
         allowed_hosts=hosts,
         allowed_origins=[f"{scheme}://{h}" for h in hosts for scheme in ("http", "https")],
     )
